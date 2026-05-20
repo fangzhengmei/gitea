@@ -15,18 +15,23 @@ SignInOAuth() → 重定向到第三方提供商
         ↓
 第三方回调到 SignInOAuthCallback()
         ├─→ 情况1: 找到匹配用户 → handleOAuth2SignIn()
-        │                           ├─ 先调用 EnsureLinkExternalToUser() [2FA前执行]
+        │                           ├─ oauth2SignInSync 同步信息
+        │                           ├─ 检查 2FA 状态（不验证）
+        │                           ├─ ⚠️ EnsureLinkExternalToUser() [在2FA验证之前执行]
         │                           ├─ 无2FA → updateSession 写入登录态
         │                           └─ 有2FA → 存 twofaUid → 跳转2FA页面 → 验证后登录
-        ├─→ 情况2: 已登录用户 → LinkAccountToUser() 直接绑定
+        ├─→ 情况2: 已登录用户 → LinkAccountToUser() 直接绑定 → 跳转设置页
         ├─→ 情况3: 自动注册 → createAndHandleCreatedUser()
-        │                           ├─ 成功 → handleUserCreated() → EnsureLinkExternalToUser()
+        │                           ├─ 成功 → handleUserCreated()
+        │                           │               ├─ AccountLinking != disabled → EnsureLinkExternalToUser()
+        │                           │               └─ AccountLinking = disabled → ⚠️ 不绑定
         │                           └─ 重名/邮箱冲突 → 按 AccountLinking 配置回落
         │                                               ├─ auto → 自动绑定已有用户
         │                                               ├─ login → 跳转绑定页面
         │                                               └─ disabled → 直接报错
         └─→ 情况4: 需手动绑定 → 存 LinkAccountData → 跳转 link_account 页面
                                                         ├─ 登录已有账号 → oauth2LinkAccount()
+                                                        │                           ├─ oauth2SignInSync 同步信息
                                                         │                           ├─ 无2FA → LinkAccountToUser() + 登录
                                                         │                           └─ 有2FA → 存 twofaUid+linkAccount → 跳转2FA
                                                         │                                                                   ↓
@@ -36,7 +41,8 @@ SignInOAuth() → 重定向到第三方提供商
                                                         │                                                           备用码: ⚠️ 不执行绑定
                                                         │                                                                   ↓
                                                         │                                                           登录
-                                                        └─ 注册新账号 → 创建用户 → EnsureLinkExternalToUser() → 登录
+                                                        └─ 注册新账号 → 创建用户 → handleUserCreated()
+                                                                                └─ linkAccountData != nil → EnsureLinkExternalToUser()
 ```
 
 ---
@@ -135,7 +141,7 @@ func oAuth2UserLoginCallback(...) (*user_model.User, goth.User, error) {
 
 ---
 
-## 2. 外部账号关联的触发时机（三种模式）
+## 2. 外部账号关联的触发时机与模式
 
 ### 2.1 LinkExternalToUser vs EnsureLinkExternalToUser
 
@@ -165,31 +171,34 @@ func EnsureLinkExternalToUser(ctx context.Context, external *ExternalLoginUser) 
 }
 ```
 
-### 2.2 模式 A：已有匹配用户登录
+### 2.2 模式 A：已有匹配用户 OAuth2 登录
 
 **文件**: `routers/web/auth/oauth.go:344-389`
 
 ```go
 func handleOAuth2SignIn(ctx *context.Context, authSource *auth.Source, u *user_model.User, gothUser goth.User) {
+    // 1. 同步用户信息（头像、SSH Key 等）
     oauth2SignInSync(ctx, authSource.ID, u, gothUser)
     if ctx.Written() { return }
 
-    // 检查是否需要 2FA
+    // 2. 检查是否需要 2FA（仅检查是否已启用，不验证）
     needs2FA := false
     if !authSource.TwoFactorShouldSkip() {
         _, err := auth.GetTwoFactorByUID(ctx, u.ID)
         needs2FA = err == nil
     }
 
-    // ... 同步组声明、团队映射 ...
+    // 3. 同步组声明和团队映射
+    // ...
 
-    // ⚠️ 重要：EnsureLinkExternalToUser 在 2FA 检查之前执行！
-    // 即使用户还没通过 2FA，外部账号关联已经建立/更新
+    // ⚠️ 4. 外部账号关联在 2FA 验证之前执行！
+    // 即使用户最终没有通过 2FA，外部账号信息也已经建立/更新
     if err := externalaccount.EnsureLinkExternalToUser(ctx, authSource.ID, u, gothUser); err != nil {
         ctx.ServerError("EnsureLinkExternalToUser", err)
         return
     }
 
+    // 5. 分支处理
     if !needs2FA {
         // 无 2FA：写入登录态
         updateSession(ctx, nil, map[string]any{
@@ -201,7 +210,7 @@ func handleOAuth2SignIn(ctx *context.Context, authSource *auth.Source, u *user_m
         return
     }
 
-    // 有 2FA：保存 twofaUid，跳转验证页面
+    // 有 2FA：保存 twofaUid，跳转验证页面（此时绑定已经完成）
     updateSession(ctx, nil, map[string]any{
         "twofaUid":      u.ID,
         "twofaRemember": false,
@@ -210,17 +219,19 @@ func handleOAuth2SignIn(ctx *context.Context, authSource *auth.Source, u *user_m
 }
 ```
 
-**关键点**: 已有用户 OAuth2 登录时，`EnsureLinkExternalToUser` 在 **2FA 验证之前** 就执行了。
+**关键点**: 已有用户 OAuth2 登录时，`EnsureLinkExternalToUser` 在 **2FA 验证之前** 就执行了。这是因为这个用户已经是系统的合法用户，之前已经完成了账号绑定，这里只是更新外部账号信息。
 
-### 2.3 模式 B：新账号绑定流程
+### 2.3 模式 B：新账号绑定流程（通过 link_account 页面）
 
 **文件**: `routers/web/auth/linkaccount.go:141-185`
 
 ```go
 func oauth2LinkAccount(ctx *context.Context, u *user_model.User, linkAccountData *LinkAccountData, remember bool) {
+    // 1. 同步用户信息
     oauth2SignInSync(ctx, linkAccountData.AuthSourceID, u, linkAccountData.GothUser)
     if ctx.Written() { return }
 
+    // 2. 检查 2FA 状态
     _, err := auth.GetTwoFactorByUID(ctx, u.ID)
     if err != nil {
         if !auth.IsErrTwoFactorNotEnrolled(err) { ... }
@@ -233,6 +244,7 @@ func oauth2LinkAccount(ctx *context.Context, u *user_model.User, linkAccountData
 
     // === 有 2FA：延迟绑定，只保存状态到 session ===
     // 注意：这里不调用 LinkAccountToUser！
+    // 因为绑定是敏感操作，必须在 2FA 验证通过后才能执行
     if err := updateSession(ctx, nil, map[string]any{
         "twofaUid":      u.ID,
         "twofaRemember": remember,
@@ -243,6 +255,8 @@ func oauth2LinkAccount(ctx *context.Context, u *user_model.User, linkAccountData
 }
 ```
 
+**设计意图**: 新账号绑定是敏感操作（将第三方账号关联到本地账号），必须在用户通过密码 + 2FA 双重验证后才能执行。
+
 ### 2.4 模式 C：新用户注册后绑定
 
 **文件**: `routers/web/auth/auth.go:691-716`
@@ -252,6 +266,8 @@ func handleUserCreated(ctx *context.Context, u *user_model.User, possibleLinkAcc
     // ... 设置首个用户为管理员 ...
 
     // update external user information
+    // ⚠️ 只有当 possibleLinkAccountData != nil 时才执行绑定
+    // 当 AccountLinking = disabled 时，possibleLinkAccountData 为 nil，跳过绑定
     if possibleLinkAccountData != nil {
         if err := externalaccount.EnsureLinkExternalToUser(ctx, possibleLinkAccountData.AuthSourceID, u, possibleLinkAccountData.GothUser); err != nil {
             log.Error("EnsureLinkExternalToUser failed: %v", err)
@@ -268,12 +284,13 @@ func handleUserCreated(ctx *context.Context, u *user_model.User, possibleLinkAcc
 
 ### 3.1 各分支绑定操作一致性对比
 
-| 2FA 验证方式 | 文件 | 检查 `linkAccount` | 调用 `linkAccountFromContext` | 绑定是否执行 |
-|-------------|------|-------------------|-----------------------------|-------------|
-| **TOTP 验证码** | `2fa.go:76-82` | ✓ | ✓ | ✓ |
-| **WebAuthn 硬件密钥** | `webauthn.go:264-270` | ✓ | ✓ | ✓ |
-| **Passkey 登录** | `webauthn.go:151-156` | ✓ | ✓ | ✓ |
-| **备用码 (Scratch Code)** | `2fa.go:116-161` | ✗ | **✗** | **✗ 不执行！** |
+| 2FA 验证方式 | 文件 | 检查 `linkAccount` | 调用 `linkAccountFromContext` | 绑定是否执行 | 适用场景 |
+|-------------|------|-------------------|-----------------------------|-------------|---------|
+| **TOTP 验证码** | `2fa.go:76-82` | ✓ | ✓ | ✓ | 新账号绑定流程 |
+| **WebAuthn 硬件密钥** | `webauthn.go:264-270` | ✓ | ✓ | ✓ | 新账号绑定流程 |
+| **Passkey 登录** | `webauthn.go:151-156` | ✓ | ✓ | ✓ | 新账号绑定流程 |
+| **备用码 (Scratch Code)** | `2fa.go:116-161` | ✗ | ✗ | **✗ 不执行！** | 新账号绑定流程 |
+| **已有用户登录** | `oauth.go:386` | - | - | ✓（在2FA前执行） | 已有用户 OAuth2 登录 |
 
 ### 3.2 TOTP 验证后的绑定
 
@@ -286,7 +303,7 @@ func TwoFactorPost(ctx *context.Context) {
         remember := ctx.Session.Get("twofaRemember").(bool)
         u, err := user_model.GetUserByID(ctx, id)
 
-        // === 关键：检查 linkAccount 标记 ===
+        // === 关键：检查 linkAccount 标记（仅新账号绑定流程使用）===
         if ctx.Session.Get("linkAccount") != nil {
             // 从 session 读取 LinkAccountData，执行绑定
             err = linkAccountFromContext(ctx, u)
@@ -310,7 +327,7 @@ func TwoFactorPost(ctx *context.Context) {
 func WebAuthnLoginAssertionPost(ctx *context.Context) {
     // ... WebAuthn 验证 ...
 
-    // === 关键：检查 linkAccount 标记 ===
+    // === 关键：检查 linkAccount 标记（仅新账号绑定流程使用）===
     if ctx.Session.Get("linkAccount") != nil {
         if err := linkAccountFromContext(ctx, user); err != nil {
             ctx.ServerError("LinkAccountFromStore", err)
@@ -333,7 +350,7 @@ func WebAuthnLoginAssertionPost(ctx *context.Context) {
 func WebAuthnPasskeyLogin(ctx *context.Context) {
     // ... Passkey 验证 ...
 
-    // === 关键：检查 linkAccount 标记 ===
+    // === 关键：检查 linkAccount 标记（仅新账号绑定流程使用）===
     if ctx.Session.Get("linkAccount") != nil {
         if err := linkAccountFromContext(ctx, user); err != nil {
             ctx.ServerError("LinkAccountFromStore", err)
@@ -361,7 +378,7 @@ func TwoFactorScratchPost(ctx *context.Context) {
         u, err := user_model.GetUserByID(ctx, id)
 
         // ⚠️ 注意：这里没有检查 linkAccount 标记！
-        // 不会执行绑定操作
+        // 如果是新账号绑定流程，绑定操作不会执行
 
         handleSignInFull(ctx, u, remember)
         ctx.Redirect(setting.AppSubURL + "/user/settings/security")
@@ -370,7 +387,7 @@ func TwoFactorScratchPost(ctx *context.Context) {
 }
 ```
 
-**⚠️ 重要发现**: 如果用户使用备用码进行 2FA 验证，绑定操作不会执行！这是一个不一致性。
+**⚠️ 重要发现**: 如果用户使用备用码进行 2FA 验证，新账号绑定操作不会执行！这是一个不一致性。
 
 ### 3.6 linkAccountFromContext 辅助函数
 
@@ -385,8 +402,6 @@ func linkAccountFromContext(ctx *context.Context, user *user_model.User) error {
     return externalaccount.LinkAccountToUser(ctx, linkAccountData.AuthSourceID, user, linkAccountData.GothUser)
 }
 ```
-
-**设计意图**: 绑定操作是敏感操作，必须在 2FA 验证通过后才能执行，防止攻击者绕过密码验证直接绑定账号。
 
 ---
 
@@ -535,10 +550,10 @@ if !createAndHandleCreatedUser(ctx, "", nil, u, overwriteDefault, linkAccountDat
 | 场景 | AccountLinking = disabled |
 |------|--------------------------|
 | 自动注册遇重名 | ✗ 不回落，直接报错（因为 linkAccountData 是 nil，不会进入 switch） |
-| 已有 OAuth2 用户登录 | ✓ 允许，正常调用 `EnsureLinkExternalToUser` |
+| 已有 OAuth2 用户登录 | ✓ 允许，正常调用 `EnsureLinkExternalToUser`（在 handleOAuth2SignIn 中，不依赖 linkAccountData） |
 | 已登录用户主动绑定 | ✓ 允许，`SignInOAuthCallback` 中直接调用 `LinkAccountToUser` |
 | link_account 页面手动绑定 | ✓ 允许，`linkaccount.go` 不检查 AccountLinking 设置 |
-| 新用户注册后绑定 | ✗ 不绑定（因为 linkAccountData 是 nil，`handleUserCreated` 中跳过） |
+| 新用户注册后自动绑定 | ✗ 不绑定（因为 linkAccountData 是 nil，`handleUserCreated` 中跳过） |
 
 **AccountLinking 配置说明** (定义于 `modules/setting/oauth2.go`):
 - `OAuth2AccountLinkingDisabled` (disabled): 仅禁止**自动注册流程中的重名回落**和**新用户自动绑定**，不影响已有用户登录和主动绑定
@@ -694,28 +709,28 @@ func handleSignInFull(ctx *context.Context, u *user_model.User, remember bool) {
 ### 5.4 2FA 场景下的会话流转
 
 ```
-OAuth2 回调找到用户
+已有用户 OAuth2 登录
         ↓
-handleOAuth2SignIn() 检查 2FA
+handleOAuth2SignIn()
+        ├─ oauth2SignInSync 同步信息
+        ├─ 检查 2FA 状态
+        ├─ EnsureLinkExternalToUser() [绑定在 2FA 验证之前完成]
+        ├─ 无2FA → updateSession 写入登录态
+        └─ 有2FA → updateSession 写入 twofaUid → 跳转2FA页面 → 验证后登录
+
+新账号绑定流程（通过 link_account 页面）
         ↓
-needs2FA = true
-        ↓
-updateSession(nil, {"twofaUid": u.ID, "twofaRemember": false})
-        ↓
-跳转到 /user/two_factor 或 /user/webauthn
-        ↓
-用户输入 2FA 码 / 使用 WebAuthn / Passkey / 备用码
-        ↓
-TwoFactorPost() / WebAuthnLoginAssertionPost() / WebAuthnPasskeyLogin() / TwoFactorScratchPost()
-        ├─ 验证通过
-        ├─ TOTP/WebAuthn/Passkey: 检查 session["linkAccount"] → 如有则执行绑定
-        │                                                               ↓
-        │                                                           handleSignInFull()
-        │                                                               ↓
-        │                                                           updateSession([8个键], {"uid", "uname", ...}) → 清理所有中间状态
-        │                                                               ↓
-        │                                                           登录完成
-        └─ 备用码: 不检查 linkAccount → 直接 handleSignInFull() → ⚠️ 绑定被跳过
+oauth2LinkAccount()
+        ├─ oauth2SignInSync 同步信息
+        ├─ 无2FA → LinkAccountToUser() + 登录
+        └─ 有2FA → updateSession 写入 twofaUid + linkAccount=true → 跳转2FA
+                                                                ↓
+                                                        2FA 验证通过
+                                                                ↓
+                                                        TOTP/WebAuthn/Passkey: linkAccountFromContext()
+                                                        备用码: ⚠️ 跳过绑定
+                                                                ↓
+                                                        handleSignInFull() → 清理所有中间状态
 ```
 
 ---
@@ -728,7 +743,9 @@ SignInOAuthCallback()
     ↓
 oAuth2UserLoginCallback() → 返回 (user, gothUser, error)
     ├─ 找到 user → handleOAuth2SignIn()
-    │                   ├─ EnsureLinkExternalToUser() [在2FA检查前执行!]
+    │                   ├─ oauth2SignInSync 同步信息
+    │                   ├─ 检查 2FA 状态
+    │                   ├─ EnsureLinkExternalToUser() [在2FA验证前执行!]
     │                   ├─ 无2FA → updateSession 写入登录态
     │                   └─ 有2FA → updateSession 写入 twofaUid → 跳转2FA
     └─ 未找到 user → 进入绑定/注册流程
@@ -740,6 +757,7 @@ showLinkingLogin() → 保存 LinkAccountData 到 session
     ↓
 用户跳转到 /user/link_account
     ├─ 登录 → LinkAccountPostSignIn() → oauth2LinkAccount()
+    │                                       ├─ 同步信息
     │                                       ├─ 无2FA → LinkAccountToUser() + handleSignIn()
     │                                       └─ 有2FA → updateSession(linkAccount=true) → 跳转2FA
     │                                                                   ↓
@@ -750,7 +768,8 @@ showLinkingLogin() → 保存 LinkAccountData 到 session
     │                                                                   ↓
     │                                                           handleSignIn()
     └─ 注册 → LinkAccountPostRegister() → createAndHandleCreatedUser()
-                                                    ├─ 成功 → handleUserCreated() → EnsureLinkExternalToUser()
+                                                    ├─ 成功 → handleUserCreated()
+                                                    │               └─ linkAccountData != nil → EnsureLinkExternalToUser()
                                                     └─ 重名 → 按 AccountLinking 回落
 ```
 
@@ -789,8 +808,8 @@ updateSession() 执行：
 |------|------|------|
 | OAuth2 回调入口 | `routers/web/auth/oauth.go` | `SignInOAuthCallback` |
 | 用户查找逻辑 | `routers/web/auth/oauth.go` | `oAuth2UserLoginCallback` |
-| 登录处理（含 2FA 分支） | `routers/web/auth/oauth.go` | `handleOAuth2SignIn` |
-| 已有用户外部账号关联 | `routers/web/auth/oauth.go` | `EnsureLinkExternalToUser` 调用 |
+| 已有用户登录处理（含 2FA 分支） | `routers/web/auth/oauth.go` | `handleOAuth2SignIn` |
+| 已有用户外部账号关联 | `routers/web/auth/oauth.go:386` | `EnsureLinkExternalToUser` 调用 |
 | 绑定已有账号（分阶段） | `routers/web/auth/linkaccount.go` | `oauth2LinkAccount` |
 | TOTP 2FA 验证后绑定 | `routers/web/auth/2fa.go` | `TwoFactorPost` |
 | WebAuthn 验证后绑定 | `routers/web/auth/webauthn.go` | `WebAuthnLoginAssertionPost` |
@@ -815,13 +834,21 @@ updateSession() 执行：
 ## 8. 重要发现与注意事项
 
 ### ⚠️ 备用码绑定不一致
-使用备用码（Scratch Code）进行 2FA 验证时，**不会执行账号绑定操作**。这是因为 `TwoFactorScratchPost` 没有检查 `linkAccount` 标记。
+使用备用码（Scratch Code）进行 2FA 验证时，**不会执行新账号绑定操作**。这是因为 `TwoFactorScratchPost` (`routers/web/auth/2fa.go:116`) 没有检查 `linkAccount` 标记，与 TOTP、WebAuthn、Passkey 三个分支不一致。
 
 ### ⚠️ 已有用户登录时绑定时机
-已有 OAuth2 用户登录时，`EnsureLinkExternalToUser` 在 **2FA 验证之前** 就执行了。这意味着即使用户最终没有通过 2FA，外部账号信息也已经被更新。
+已有 OAuth2 用户登录时，`EnsureLinkExternalToUser` 在 **2FA 验证之前** 就执行了（`oauth.go:386`）。这意味着即使用户最终没有通过 2FA，外部账号信息也已经被更新。这是合理的，因为这个用户已经是系统的合法用户，之前已经完成了账号绑定，这里只是更新外部账号信息。
 
 ### ⚠️ AccountLinking = disabled 边界有限
-`AccountLinking = disabled` **仅**影响自动注册流程中的重名回落和新用户自动绑定，不限制：
-- 已有 OAuth2 用户正常登录
-- 已登录用户主动绑定新的 OAuth2 账号
-- 用户通过 link_account 页面手动绑定
+`AccountLinking = disabled` **仅**影响：
+- 自动注册流程中的重名回落（不回落，直接报错）
+- 新用户注册后自动绑定（不执行绑定）
+
+但**不限制**：
+- 已有 OAuth2 用户正常登录（仍然调用 `EnsureLinkExternalToUser`）
+- 已登录用户主动绑定新的 OAuth2 账号（`SignInOAuthCallback` 中直接绑定）
+- 用户通过 link_account 页面手动绑定（`linkaccount.go` 不检查此设置）
+
+### 绑定时机区分原则
+- **已有用户登录**：绑定在 2FA 验证前执行（更新已有绑定关系）
+- **新账号绑定**：绑定在 2FA 验证后执行（建立新的绑定关系，敏感操作）

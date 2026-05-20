@@ -170,7 +170,112 @@ func (g *GithubDownloaderV3) waitAndPickClient(ctx context.Context) {
 | `GetAllComments` | 批量获取评论 | `GET /repos/{owner}/{repo}/issues/comments` |
 | `GetReviews` | 获取 PR 评审 | `GET /repos/{owner}/{repo}/pulls/{n}/reviews` |
 
-### 3.3 安全检查
+### 3.3 安全防护体系
+
+Gitea 构建了多层安全防护体系，确保迁移过程的安全性。
+
+#### 3.3.1 第一层：URL 白名单校验
+
+迁移开始前，首先通过 `IsMigrateURLAllowed` 函数（`services/migrations/migrate.go:44-87`）对克隆地址进行严格校验：
+
+```go
+func IsMigrateURLAllowed(remoteURL string, doer *user_model.User) error {
+    u, err := url.Parse(remoteURL)
+    
+    // 1. 本地文件系统访问控制
+    if u.Scheme == "file" || u.Scheme == "" {
+        if !doer.CanImportLocal() {  // 检查用户是否有权限导入本地路径
+            return &git.ErrInvalidCloneAddr{IsPermissionDenied: true}
+        }
+        // 验证是绝对路径且为目录
+        isAbs := filepath.IsAbs(u.Host + u.Path)
+        isDir, _ := util.IsDir(u.Host + u.Path)
+        if !isAbs || !isDir {
+            return &git.ErrInvalidCloneAddr{IsInvalidPath: true}
+        }
+        return nil
+    }
+    
+    // 2. 协议校验：只允许 http/https/git
+    if u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "git" {
+        return &git.ErrInvalidCloneAddr{IsProtocolInvalid: true}
+    }
+    
+    // 3. Git 协议注入防护：阻止 CRLF 注入
+    if u.Scheme == "git" && u.Port() != "" && 
+       (strings.Contains(remoteURL, "%0d") || strings.Contains(remoteURL, "%0a")) {
+        return &git.ErrInvalidCloneAddr{IsURLError: true}
+    }
+    
+    // 4. 主机名 + IP 白名单/黑名单校验
+    hostName, _, _ := net.SplitHostPort(u.Host)
+    addrList, _ := net.LookupIP(hostName)  // 解析 IP 进行双重校验
+    return checkByAllowBlockList(hostName, addrList)
+}
+```
+
+**黑白名单校验逻辑**（`services/migrations/migrate.go:89-108`）：
+```go
+func checkByAllowBlockList(hostName string, addrList []net.IP) error {
+    // 1. 检查 IP 是否在白/黑名单中
+    for _, addr := range addrList {
+        ipAllowed = ipAllowed || allowList.MatchIPAddr(addr)
+        ipBlocked = ipBlocked || blockList.MatchIPAddr(addr)
+    }
+    
+    // 2. 黑名单优先：主机名或 IP 任一被阻止即拒绝
+    if blockList.MatchHostName(hostName) || ipBlocked {
+        blockedError = &git.ErrInvalidCloneAddr{IsPermissionDenied: true}
+    }
+    
+    // 3. 白名单校验（如果配置了白名单）
+    if !allowList.IsEmpty() {
+        if !allowList.MatchHostName(hostName) && !ipAllowed {
+            return &git.ErrInvalidCloneAddr{IsPermissionDenied: true}
+        }
+    }
+    return blockedError
+}
+```
+
+**白名单初始化**（`services/migrations/migrate.go:514-531`）：
+```go
+func Init() error {
+    blockList = hostmatcher.ParseSimpleMatchList("migrations.BLOCKED_DOMAINS", setting.Migrations.BlockedDomains)
+    allowList = hostmatcher.ParseSimpleMatchList("migrations.ALLOWED_DOMAINS/ALLOW_LOCALNETWORKS", setting.Migrations.AllowedDomains)
+    
+    if allowList.IsEmpty() {
+        allowList.AppendBuiltin(hostmatcher.MatchBuiltinExternal)  // 默认允许外部网络
+    }
+    if setting.Migrations.AllowLocalNetworks {
+        allowList.AppendBuiltin(hostmatcher.MatchBuiltinPrivate)   // 允许私有网络
+        allowList.AppendBuiltin(hostmatcher.MatchBuiltinLoopback)  // 允许回环地址
+    }
+    return nil
+}
+```
+
+#### 3.3.2 第二层：克隆 URL 二次校验
+
+在获取仓库信息后，还会对 Downloader 返回的 CloneURL 进行二次校验（`services/migrations/migrate.go:200-219`）：
+```go
+// SECURITY: 如果不是从本地恢复，需要重新检查 CloneURL
+if _, ok := downloader.(*RepositoryRestorer); !ok {
+    // 重新校验 CloneURL（Downloader 可能重写了 URL）
+    if err := IsMigrateURLAllowed(repo.CloneURL, doer); err != nil {
+        return err
+    }
+    
+    // 防止从外部 URL 重定向到本地文件系统
+    cloneAddrURL, _ := url.Parse(opts.CloneAddr)
+    cloneURL, _ := url.Parse(repo.CloneURL)
+    if cloneURL.Scheme == "file" && cloneAddrURL.Scheme != "file" {
+        return errors.New("repo info has changed from external to local filesystem")
+    }
+}
+```
+
+#### 3.3.3 第三层：PR 数据安全校验
 
 在 `services/migrations/common.go:32-83` 中对 PR 数据进行安全校验：
 

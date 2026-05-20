@@ -23,9 +23,9 @@
 
 ## 二、后台任务推进（第一棒：任务调度）
 
-### 2.1 任务入口
+### 2.1 任务入口与失败收敛全链路
 
-迁移任务由 `services/task/migrate.go` 中的 `runMigrateTask` 函数驱动。
+迁移任务由 `services/task/migrate.go` 中的 `runMigrateTask` 函数驱动，该函数构建了完整的**失败收敛闭环**。
 
 **任务状态流转**：
 ```
@@ -34,23 +34,49 @@ TaskStatusQueued → TaskStatusRunning → TaskStatusSuccess
                      TaskStatusFailed
 ```
 
-**关键代码**（`services/task/migrate.go:44-154`）：
+#### 2.1.1 核心执行流程
 
 ```go
 func runMigrateTask(ctx context.Context, t *admin_model.Task) (err error) {
-    // 1. 加载关联数据：仓库、执行者、所有者
+    // ========== 【第一关：Panic 恢复 + 失败兜底】 ==========
+    defer func(ctx context.Context) {
+        // 1. Panic 捕获与恢复
+        if e := recover(); e != nil {
+            err = fmt.Errorf("PANIC whilst trying to do migrate task: %v", e)
+            log.Error("PANIC during runMigrateTask[%d] ... Stacktrace: %v", t.ID, e, log.Stack(2))
+        }
+        
+        // 2. 成功路径
+        if err == nil {
+            err = admin_model.FinishMigrateTask(ctx, t)
+            if err == nil {
+                notify_service.MigrateRepository(ctx, t.Doer, t.Owner, t.Repo)
+                return
+            }
+        }
+        
+        // ========== 【失败状态回写】 ==========
+        log.Error("runMigrateTask[%d] failed: %v", t.ID, err)
+        
+        t.EndTime = timeutil.TimeStampNow()
+        t.Status = structs.TaskStatusFailed
+        t.Message = err.Error()  // 此时 err 已经过脱敏处理
+        t.UpdateCols(ctx, "status", "message", "end_time")
+        
+        // 关键注释：do not delete the repository, otherwise the users won't be able to see the last error
+    }(graceful.GetManager().ShutdownContext())
+    
+    // 加载关联数据
     t.LoadRepo(ctx)
     t.LoadDoer(ctx)
     t.LoadOwner(ctx)
-    
-    // 2. 解析迁移配置
     opts, _ := t.MigrateConfig()
     
-    // 3. 更新任务状态为运行中
+    // 更新任务状态为运行中
     t.Status = structs.TaskStatusRunning
     t.UpdateCols(ctx, "start_time", "status")
     
-    // 4. 启动取消监听协程（每2秒检查一次任务状态）
+    // 启动取消监听协程（每2秒检查一次任务状态）
     go func() {
         for {
             select {
@@ -66,21 +92,51 @@ func runMigrateTask(ctx context.Context, t *admin_model.Task) (err error) {
         }
     }()
     
-    // 5. 调用核心迁移函数
+    // ========== 【调用核心迁移函数】 ==========
     t.Repo, err = migrations.MigrateRepository(ctx, t.Doer, t.Owner.Name, *opts, messenger)
     
-    // 6. 完成或失败处理
     if err == nil {
-        admin_model.FinishMigrateTask(ctx, t)
-        notify_service.MigrateRepository(ctx, t.Doer, t.Owner, t.Repo)
+        return nil  // 成功路径，defer 中完成收尾
     }
+    
+    // ========== 【第二关：错误脱敏与归一化】 ==========
+    
+    // 1. 错误脱敏：移除 URL 中的凭证信息
+    err = util.SanitizeErrorCredentialURLs(err)
+    
+    // 2. 鉴权失败归一
+    if strings.Contains(err.Error(), "Authentication failed") ||
+       strings.Contains(err.Error(), "could not read Username") {
+        return fmt.Errorf("authentication failed: %w", err)
+    }
+    
+    // 3. Git 致命错误归一
+    if strings.Contains(err.Error(), "fatal:") {
+        return fmt.Errorf("migration failed: %w", err)
+    }
+    
+    // 4. 仓库创建相关错误归一
+    err = handleCreateError(t.Owner, err)
+    
+    return err  // 最终 err 会被 defer 函数写入 Task.Message
 }
 ```
 
-**设计要点**：
-- 独立的取消监听协程，支持用户主动取消迁移
-- 迁移过程中的进度通过 `messenger` 回调实时更新任务消息
-- 失败时保留仓库记录，用户可查看错误信息
+#### 2.1.2 失败收敛四层防御
+
+| 层级 | 机制 | 代码位置 | 作用 |
+|------|------|---------|------|
+| **第一层** | Panic 恢复 | `defer` 中的 `recover()` | 捕获代码 panic，避免进程崩溃，转为普通 error |
+| **第二层** | 错误脱敏 | `util.SanitizeErrorCredentialURLs(err)` | 移除错误信息中的密码、token 等敏感信息 |
+| **第三层** | 错误归一 | 鉴权失败 / Git fatal / 创建错误匹配 | 将底层错误转换为用户友好的统一格式 |
+| **第四层** | 状态兜底 | `defer` 中的状态回写 | 无论何种退出路径（正常 return / panic），都保证任务状态被更新 |
+
+#### 2.1.3 关键设计要点
+
+- **独立的取消监听协程**：支持用户主动取消迁移，通过 context 取消信号终止迁移
+- **进度实时更新**：迁移过程中的进度通过 `messenger` 回调实时更新任务消息
+- **失败保留仓库**：注释明确说明 `do not delete the repository`，用户总能看到最后一条错误信息
+- **ShutdownContext 保证**：即使服务关闭，defer 函数仍能执行，确保任务状态不丢失
 
 ---
 
@@ -108,16 +164,20 @@ func newDownloader(ctx context.Context, ownerName string, opts base.MigrateOptio
         }
     }
     
-    // 无匹配工厂时，回退到纯 Git 克隆（只迁移代码）
+    // 无匹配工厂时，回退到纯 Git 克隆（只迁移代码 + Wiki）
     if downloader == nil {
-        opts.Wiki = true
-        opts.Milestones = false
-        opts.Labels = false
-        opts.Releases = false
-        opts.Comments = false
-        opts.Issues = false
-        opts.PullRequests = false
+        // ========== Plain-Git 降级：被关闭的对象迁移范围 ==========
+        opts.Wiki = true              // ✅ 保留：Wiki 迁移
+        opts.Milestones = false       // ❌ 关闭：里程碑
+        opts.Labels = false           // ❌ 关闭：标签
+        opts.Releases = false         // ❌ 关闭：发布版本
+        opts.Comments = false         // ❌ 关闭：评论
+        opts.Issues = false           // ❌ 关闭：Issues
+        opts.PullRequests = false     // ❌ 关闭：Pull Requests
+        // =========================================================
+        
         downloader = NewPlainGitDownloader(ownerName, opts.RepoName, opts.CloneAddr)
+        log.Trace("Will migrate from git: %s", opts.OriginalURL)
     }
     
     // 包装重试装饰器
@@ -258,8 +318,9 @@ func Init() error {
 #### 3.3.2 第二层：克隆 URL 二次校验
 
 在获取仓库信息后，还会对 Downloader 返回的 CloneURL 进行二次校验（`services/migrations/migrate.go:200-219`）：
+
 ```go
-// SECURITY: 如果不是从本地恢复，需要重新检查 CloneURL
+// SECURITY: If the downloader is not a RepositoryRestorer then we need to recheck the CloneURL
 if _, ok := downloader.(*RepositoryRestorer); !ok {
     // 重新校验 CloneURL（Downloader 可能重写了 URL）
     if err := IsMigrateURLAllowed(repo.CloneURL, doer); err != nil {
@@ -274,6 +335,14 @@ if _, ok := downloader.(*RepositoryRestorer); !ok {
     }
 }
 ```
+
+**RepositoryRestorer 例外的因果关系**：
+
+| 问题 | 说明 |
+|------|------|
+| **为什么 RepositoryRestorer 不需要二次校验？** | `RepositoryRestorer` 是从**本地备份目录**恢复仓库（`services/migrations/restore.go:19-39`），它返回的 `CloneURL` 是本地路径：`filepath.Join(r.baseDir, "git")`。这个路径已经在创建时验证过，且不涉及外部网络请求，不存在被重定向或篡改的风险。 |
+| **为什么其他 Downloader 需要二次校验？** | 外部 Downloader（如 GitHub/GitLab）的 `GetRepoInfo()` 可能返回被源站重写的 CloneURL。例如：<br>1. 用户输入 `https://github.com/user/repo` <br>2. GitHub API 可能返回 `https://oauth2:xxx@github.com/user/repo.git` <br>3. 甚至可能被恶意源站重定向到 `file:///etc/passwd` <br>因此必须重新校验最终的 CloneURL |
+| **校验了什么？** | 1. 通过 `IsMigrateURLAllowed` 再次走完整的白名单校验流程<br>2. 防止协议降级：从 http/https 变为 file 协议（SSRF 防护） |
 
 #### 3.3.3 第三层：PR 数据安全校验
 
@@ -610,26 +679,84 @@ func (g *GiteaLocalUploader) remapExternalUser(ctx context.Context, source user_
 
 | 阶段 | 执行者 | 核心职责 | 关键文件 |
 |------|--------|----------|----------|
-| **第一棒** | `runMigrateTask` | 任务生命周期管理、状态流转、取消监听 | `services/task/migrate.go` |
-| **第二棒** | `newDownloader` + 具体 Downloader | 工厂选择、源站 API 抓取、速率控制、安全校验 | `services/migrations/migrate.go`<br>`services/migrations/github.go` |
-| **第三棒** | `migrateRepository` | 流程编排、分批处理、去重、进度通知 | `services/migrations/migrate.go` |
-| **第四棒** | `GiteaLocalUploader` | 对象转写、缓存维护、分批写入 | `services/migrations/gitea_uploader.go` |
-| **第五棒** | `remapUser` | 用户身份映射、权限关联、回退策略 | `services/migrations/gitea_uploader.go:972-1022` |
+| **第一棒** | `runMigrateTask` | 任务生命周期管理、Panic 恢复、错误脱敏归一、状态兜底 | `services/task/migrate.go` |
+| **第二棒** | `newDownloader` + 具体 Downloader | 工厂选择、Plain-Git 降级、源站 API 抓取、速率控制 | `services/migrations/migrate.go`<br>`services/migrations/github.go` |
+| **第三棒** | `migrateRepository` | 流程编排、URL 二次校验（RepositoryRestorer 例外）、分批处理、去重 | `services/migrations/migrate.go` |
+| **第四棒** | `GiteaLocalUploader` | 对象转写、缓存维护、分批写入、Rollback（仅关闭句柄） | `services/migrations/gitea_uploader.go` |
+| **第五棒** | `remapUser` | 用户身份映射、权限关联、失败回退 doer | `services/migrations/gitea_uploader.go:972-1022` |
 
 ### 7.1 关键设计亮点
 
 1. **接口抽象**：Downloader/Uploader 接口使新增源站类型只需实现对应工厂
 2. **分批处理**：所有批量操作都支持分批，避免大仓库内存溢出
 3. **缓存机制**：Uploader 内部维护多级缓存，减少数据库查询
-4. **安全防护**：URL 白名单、SHA 校验、Ref 格式校验多层安全
-5. **优雅降级**：用户映射失败时回退到 doer，保证迁移不中断
-6. **可观测性**：进度通过 messenger 实时更新，错误保留在任务记录中
+4. **多层安全防护**：
+   - URL 白名单校验（协议、主机名、IP 双重校验）
+   - CloneURL 二次校验（防止重定向攻击，RepositoryRestorer 例外）
+   - PR 数据校验（PatchURL/HeadCloneURL 同域、SHA/Ref 格式）
+5. **优雅降级**：
+   - 无匹配 Downloader 时降级为 Plain-Git 模式（仅代码 + Wiki）
+   - 用户映射失败时回退到 doer，保证迁移不中断
+6. **失败收敛闭环**：
+   - Panic 捕获恢复，避免进程崩溃
+   - 错误脱敏（移除凭证）+ 归一化（统一错误格式）
+   - defer 兜底，无论何种退出路径都更新任务状态
+7. **失败不删库**：Rollback() 仅关闭 Git 句柄，不删除任何数据，确保用户可见错误信息
+8. **可观测性**：进度通过 messenger 实时更新，错误保留在任务记录中
 
 ### 7.2 失败处理
 
-- 迁移失败时，仓库记录保留，状态为失败，用户可见错误信息
-- `uploader.Rollback()` 尝试清理不完整的仓库数据
-- `system_model.CreateRepositoryNotice` 记录系统级通知
+#### 7.2.1 核心原则：失败不删库
+
+代码中有两处关键注释明确了这一设计决策：
+1. `services/task/migrate.go:69`: `// then, do not delete the repository, otherwise the users won't be able to see the last error`
+2. `services/migrations/gitea_uploader.go:948`: `// do not delete the repository, otherwise the end users won't be able to see the last error message`
+
+#### 7.2.2 Rollback() 的真实行为
+
+**重要更正**：`uploader.Rollback()` **并不会清理仓库数据**。让我们看实际代码（`services/migrations/gitea_uploader.go:944-951`）：
+
+```go
+func (g *GiteaLocalUploader) Rollback() error {
+    if g.repo != nil && g.repo.ID > 0 {
+        g.gitRepo.Close()  // 仅关闭 Git 仓库句柄，不删除任何数据
+        
+        // 明确注释：do not delete the repository
+    }
+    return nil  // 永远返回 nil，不做任何清理
+}
+```
+
+**Rollback() 实际只做了一件事**：关闭 `gitRepo` 文件句柄，释放资源。仓库目录、数据库记录、已写入的 Issue/PR 等数据都会被完整保留。
+
+#### 7.2.3 完整失败处理链路
+
+```
+迁移失败
+    ↓
+1. MigrateRepository 中调用 uploader.Rollback() → 仅关闭 Git 句柄
+    ↓
+2. 创建系统通知：system_model.CreateRepositoryNotice(...)
+    ↓
+3. 错误向上返回给 runMigrateTask
+    ↓
+4. runMigrateTask 的 defer 函数：
+   - 错误脱敏（SanitizeErrorCredentialURLs）
+   - 错误归一（鉴权失败 / Git fatal 等）
+   - 更新 Task 状态为 Failed，写入错误信息
+   - 不删除仓库
+    ↓
+5. 用户在界面看到：仓库存在 + 状态为失败 + 可查看具体错误信息
+```
+
+#### 7.2.4 设计意图
+
+这种设计的好处是：
+- **可追溯**：用户总能看到最后一条错误信息，便于排查问题
+- **可恢复**：已迁移的部分数据不会丢失，理论上可以基于已写入的数据继续迁移
+- **避免误删**：防止因临时网络波动等原因导致已迁移的大量数据被误删
+
+代价是可能留下不完整的仓库，需要用户手动判断是否删除。
 
 ---
 
@@ -641,28 +768,49 @@ func (g *GiteaLocalUploader) remapExternalUser(ctx context.Context, source user_
 [Web/API] 创建 admin.Task（Status=Queued）
     ↓
 [任务调度器] 拉取任务 → runMigrateTask
+    │
+    ├─► defer 注册 Panic 恢复 + 状态兜底
+    ├─► 加载 Repo/Doer/Owner 数据
+    ├─► 启动取消监听协程（每 2s 轮询）
+    ↓
+┌───────────────────────────────────────────────────────────┐
+│  migrations.MigrateRepository                             │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ newDownloader                                       │  │
+│  │  ├─ 匹配 GitServiceType → GithubDownloader          │  │
+│  │  └─ 无匹配 → Plain-Git 降级（仅代码+Wiki，关闭其他） │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                           ↓                               │
+│  1. GetRepoInfo → CloneURL 二次校验（RepositoryRestorer 跳过）│
+│  2. CreateRepo → 克隆 Git 数据                            │
+│  3. CreateTopics / Milestones / Labels / Releases        │
+│  4. CreateIssues + Comments（每批 remapUser）             │
+│  5. CreatePullRequests + Reviews（SHA/Ref 格式校验）      │
+│                           ↓                               │
+│  成功 → uploader.Finish() / 失败 → Rollback（仅关闭句柄）  │
+└───────────────────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────────┐
-│  migrations.MigrateRepository           │
-│  ┌─────────┐    ┌──────────────────┐    │
-│  │ newDownloader ─→ GithubDownloader │    │
-│  └─────────┘    └──────────────────┘    │
-│         ↓ 调用 GetXXX 方法               │
-│  ┌──────────────────────────────────┐   │
-│  │ GiteaLocalUploader               │   │
-│  │  CreateRepo → 克隆 Git 数据       │   │
-│  │  CreateMilestones                │   │
-│  │  CreateLabels                    │   │
-│  │  CreateIssues + remapUser        │   │
-│  │  CreateComments                  │   │
-│  │  CreatePullRequests              │   │
-│  │  CreateReviews                   │   │
-│  └──────────────────────────────────┘   │
+│ runMigrateTask defer 执行               │
+│  ├─ 成功：FinishMigrateTask + 通知       │
+│  └─ 失败：                               │
+│      ├─ SanitizeErrorCredentialURLs     │
+│      ├─ 错误归一（鉴权/Git fatal/创建）  │
+│      ├─ 更新 Task.Status = Failed       │
+│      └─ 不删除仓库（用户可见错误）        │
 └─────────────────────────────────────────┘
-    ↓
-更新 Task 状态（Success/Failed）
-    ↓
-发送通知事件
 ```
+
+## 九、关键事实速查表
+
+| 说法 | 事实 | 代码依据 |
+|------|------|---------|
+| ❌ Rollback() 会清理仓库数据 | ✅ Rollback() 仅关闭 Git 句柄，不删除任何数据 | `gitea_uploader.go:944-951` |
+| ❌ RepositoryRestorer 也需要 CloneURL 校验 | ✅ 本地恢复场景跳过二次校验（路径已验证） | `migrate.go:201` |
+| ❌ Plain-Git 降级只迁移代码 | ✅ 保留 Wiki，关闭 Milestones/Labels/Issues/PRs/Comments/Releases | `migrate.go:169-176` |
+| ✅ 失败时保留仓库 | ✅ 两处代码注释明确：do not delete the repository | `task/migrate.go:69`<br>`gitea_uploader.go:948` |
+| ✅ 用户映射失败回退 doer | ✅ 未匹配用户时，操作人用 doer ID，保留原始名称 | `gitea_uploader.go:984-987` |
+| ✅ Panic 会被捕获 | ✅ defer 中 recover()，转为 error 写入任务 | `task/migrate.go:45-49` |
+| ✅ 错误信息会脱敏 | ✅ SanitizeErrorCredentialURLs 移除 URL 中的凭证 | `task/migrate.go:143` |
 
 通过以上五棒接力，Gitea 实现了从外部站点到本地的完整仓库迁移，兼顾了灵活性、安全性和可靠性。

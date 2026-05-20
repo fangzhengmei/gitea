@@ -2,6 +2,8 @@
 
 本文档分析 Gitea 中第三方 OAuth2 登录后的授权回调、账号绑定和会话写入的接续关系。
 
+---
+
 ## 整体流程概览
 
 ```
@@ -12,12 +14,24 @@ SignInOAuth() → 重定向到第三方提供商
 用户在第三方授权
         ↓
 第三方回调到 SignInOAuthCallback()
-        ├─→ 情况1: 找到匹配用户 → 直接登录
-        ├─→ 情况2: 已登录用户 → 绑定账号
-        ├─→ 情况3: 自动注册 → 创建新用户 → 登录
-        └─→ 情况4: 需手动绑定 → 跳转到 link_account 页面
-                                                        ├─→ 用户登录已有账号 → 绑定后登录
-                                                        └─→ 用户注册新账号 → 创建后登录
+        ├─→ 情况1: 找到匹配用户 → handleOAuth2SignIn()
+        │                           ├─ 无2FA → 直接登录
+        │                           └─ 有2FA → 存 twofaUid → 跳转2FA页面 → 验证后登录
+        ├─→ 情况2: 已登录用户 → LinkAccountToUser() 直接绑定
+        ├─→ 情况3: 自动注册 → createAndHandleCreatedUser()
+        │                           ├─ 成功 → 登录
+        │                           └─ 重名/邮箱冲突 → 按 AccountLinking 配置回落
+        │                                               ├─ auto → 自动绑定已有用户
+        │                                               └─ login → 跳转绑定页面
+        └─→ 情况4: 需手动绑定 → 存 LinkAccountData → 跳转 link_account 页面
+                                                        ├─ 登录已有账号 → oauth2LinkAccount()
+                                                        │                           ├─ 无2FA → 绑定+登录
+                                                        │                           └─ 有2FA → 存 twofaUid+linkAccount → 跳转2FA
+                                                        │                                                                   ↓
+                                                        │                                                           2FA验证通过
+                                                        │                                                                   ↓
+                                                        │                                                           linkAccountFromContext() → 真正绑定 → 登录
+                                                        └─ 注册新账号 → 创建用户 → 绑定 → 登录
 ```
 
 ---
@@ -44,12 +58,27 @@ func SignInOAuthCallback(ctx *context.Context) {
         if ctx.Doer != nil {
             // 已登录用户：绑定外部账号
             externalaccount.LinkAccountToUser(ctx, authSource.ID, ctx.Doer, gothUser)
+            ctx.Redirect(setting.AppSubURL + "/user/settings/security")
+            return
         } else if autoRegistrationEnabled {
             // 自动注册：创建新用户
-            createAndHandleCreatedUser(...)
+            var missingFields []string
+            // ... 检查必填字段 ...
+            if len(missingFields) > 0 {
+                // 字段缺失：仍然跳转到绑定页面
+                showLinkingLogin(ctx, authSource.ID, gothUser)
+                return
+            }
+            u = &user_model.User{...}
+            linkAccountData := &LinkAccountData{authSource.ID, gothUser}
+            if !createAndHandleCreatedUser(ctx, "", nil, u, overwriteDefault, linkAccountData) {
+                return // 内部已处理回落逻辑
+            }
+            syncGroupsToTeams(...)
         } else {
             // 需要手动绑定：跳转到 link_account 页面
             showLinkingLogin(ctx, authSource.ID, gothUser)
+            return
         }
     }
 
@@ -95,7 +124,7 @@ func oAuth2UserLoginCallback(...) (*user_model.User, goth.User, error) {
 }
 ```
 
-**注意**: 这里有两级用户查找：
+**注意**: 两级用户查找：
 - 第一级：通过 `LoginName` + `LoginSource` 直接匹配用户表
 - 第二级：通过 `ExternalLoginUser` 关联表查找（支持多 OAuth 源绑定到同一用户）
 
@@ -135,7 +164,7 @@ func oauth2GetLinkAccountData(ctx *context.Context) *LinkAccountData {
 1. **登录已有账号** → 调用 `LinkAccountPostSignIn`
 2. **注册新账号** → 调用 `LinkAccountPostRegister`
 
-### 2.3 绑定已有账号
+### 2.3 绑定已有账号 (分阶段落地)
 
 **文件**: `routers/web/auth/linkaccount.go:114-185`
 
@@ -147,29 +176,106 @@ func LinkAccountPostSignIn(ctx *context.Context) {
     // 2. 执行绑定和登录
     oauth2LinkAccount(ctx, u, linkAccountData, signInForm.Remember)
 }
+```
 
+#### 关键：oauth2LinkAccount 的分阶段逻辑
+
+```go
 func oauth2LinkAccount(ctx *context.Context, u *user_model.User, linkAccountData *LinkAccountData, remember bool) {
-    // 1. 同步用户信息（头像、SSH Key 等）
+    // 第一阶段：同步用户信息（头像、SSH Key 等）
     oauth2SignInSync(ctx, linkAccountData.AuthSourceID, u, linkAccountData.GothUser)
+    if ctx.Written() { return }
 
-    // 2. 检查 2FA
+    // 第二阶段：检查 2FA
     _, err := auth.GetTwoFactorByUID(ctx, u.ID)
-    if err != nil && auth.IsErrTwoFactorNotEnrolled(err) {
-        // 无 2FA：直接绑定并登录
-        externalaccount.LinkAccountToUser(ctx, linkAccountData.AuthSourceID, u, linkAccountData.GothUser)
+    if err != nil {
+        if !auth.IsErrTwoFactorNotEnrolled(err) {
+            ctx.ServerError("UserLinkAccount", err)
+            return
+        }
+
+        // === 无 2FA：立即绑定并登录 ===
+        err = externalaccount.LinkAccountToUser(ctx, linkAccountData.AuthSourceID, u, linkAccountData.GothUser)
+        if err != nil { ... }
         handleSignIn(ctx, u, remember)
         return
     }
 
-    // 有 2FA：保存会话，跳转到 2FA 页面
-    updateSession(ctx, nil, map[string]any{
+    // === 有 2FA：延迟绑定，只保存状态到 session ===
+    // 注意：这里不调用 LinkAccountToUser！
+    if err := updateSession(ctx, nil, map[string]any{
         "twofaUid":      u.ID,
         "twofaRemember": remember,
-        "linkAccount":   true,
-    })
+        "linkAccount":   true,  // 标记：2FA 通过后需要执行绑定
+    }); err != nil { ... }
+
     // 跳转到 2FA 或 WebAuthn 页面
+    regs, err := auth.GetWebAuthnCredentialsByUID(ctx, u.ID)
+    if err == nil && len(regs) > 0 {
+        ctx.Redirect(setting.AppSubURL + "/user/webauthn")
+    } else {
+        ctx.Redirect(setting.AppSubURL + "/user/two_factor")
+    }
 }
 ```
+
+#### 第三阶段：2FA 验证通过后真正执行绑定
+
+**文件**: `routers/web/auth/2fa.go:76-82` (TwoFactorPost)
+
+```go
+func TwoFactorPost(ctx *context.Context) {
+    // ... 验证 TOTP 密码 ...
+    if ok && twofa.LastUsedPasscode != form.Passcode {
+        remember := ctx.Session.Get("twofaRemember").(bool)
+        u, err := user_model.GetUserByID(ctx, id)
+
+        // === 关键：检查 linkAccount 标记 ===
+        if ctx.Session.Get("linkAccount") != nil {
+            // 从 session 读取 LinkAccountData，执行绑定
+            err = linkAccountFromContext(ctx, u)
+            if err != nil { ... }
+        }
+
+        twofa.LastUsedPasscode = form.Passcode
+        auth.UpdateTwoFactor(ctx, twofa)
+
+        handleSignIn(ctx, u, remember)
+        return
+    }
+}
+```
+
+**文件**: `routers/web/auth/webauthn.go:264-270` (WebAuthnLoginAssertionPost)
+
+```go
+// WebAuthn 验证通过后同样检查 linkAccount 标记
+if ctx.Session.Get("linkAccount") != nil {
+    if err := linkAccountFromContext(ctx, user); err != nil {
+        ctx.ServerError("LinkAccountFromStore", err)
+        return
+    }
+}
+
+remember := ctx.Session.Get("twofaRemember").(bool)
+handleSignInFull(ctx, user, remember)
+```
+
+#### linkAccountFromContext 辅助函数
+
+**文件**: `routers/web/auth/linkaccount.go:275-281`
+
+```go
+func linkAccountFromContext(ctx *context.Context, user *user_model.User) error {
+    linkAccountData := oauth2GetLinkAccountData(ctx)
+    if linkAccountData == nil {
+        return errors.New("not in LinkAccount session")
+    }
+    return externalaccount.LinkAccountToUser(ctx, linkAccountData.AuthSourceID, user, linkAccountData.GothUser)
+}
+```
+
+**设计意图**: 绑定操作是敏感操作，必须在 2FA 验证通过后才能执行，防止攻击者绕过密码验证直接绑定账号。
 
 ### 2.4 创建新账号并绑定
 
@@ -187,8 +293,10 @@ func LinkAccountPostRegister(ctx *context.Context) {
         LoginName:   linkAccountData.GothUser.UserID,
     }
 
-    // 2. 创建用户并处理绑定
-    createAndHandleCreatedUser(ctx, tplLinkAccount, form, u, nil, linkAccountData)
+    // 2. 创建用户并处理绑定（内部会处理重名回落）
+    if !createAndHandleCreatedUser(ctx, tplLinkAccount, form, u, nil, linkAccountData) {
+        return
+    }
 
     // 3. 同步信息
     oauth2SignInSync(ctx, linkAccountData.AuthSourceID, u, linkAccountData.GothUser)
@@ -201,7 +309,58 @@ func LinkAccountPostRegister(ctx *context.Context) {
 }
 ```
 
-### 2.5 自动注册流程
+### 2.5 自动注册遇重名的回落机制
+
+**文件**: `routers/web/auth/auth.go:621-647` (createUserInContext)
+
+```go
+func createUserInContext(ctx *context.Context, tpl templates.TplName, form any, u *user_model.User,
+    overwrites *user_model.CreateUserOverwriteOptions, possibleLinkAccountData *LinkAccountData) (ok bool) {
+
+    meta := &user_model.Meta{...}
+    if err := user_model.CreateUser(ctx, u, meta, overwrites); err != nil {
+        // === 关键：如果创建失败是因为用户名/邮箱已存在，且有 LinkAccountData ===
+        if possibleLinkAccountData != nil &&
+            (user_model.IsErrUserAlreadyExist(err) || user_model.IsErrEmailAlreadyUsed(err)) {
+
+            switch setting.OAuth2Client.AccountLinking {
+            case setting.OAuth2AccountLinkingAuto:
+                // === 自动模式：自动查找已有用户并绑定 ===
+                var user *user_model.User
+                user = &user_model.User{Name: u.Name}
+                hasUser, err := user_model.GetIndividualUser(ctx, user)
+                if !hasUser || err != nil {
+                    user = &user_model.User{Email: u.Email}
+                    hasUser, err = user_model.GetIndividualUser(ctx, user)
+                    if !hasUser || err != nil {
+                        ctx.ServerError("UserLinkAccount", err)
+                        return false
+                    }
+                }
+                // 直接走绑定流程
+                oauth2LinkAccount(ctx, user, possibleLinkAccountData, true)
+                return false // user is already created here, all redirects are handled
+
+            case setting.OAuth2AccountLinkingLogin:
+                // === 登录模式：跳转到绑定页面，让用户手动确认 ===
+                showLinkingLogin(ctx, possibleLinkAccountData.AuthSourceID, possibleLinkAccountData.GothUser)
+                return false // user will be created only after linking login
+            }
+        }
+
+        // ... 其他错误处理 ...
+    }
+    log.Trace("Account created: %s", u.Name)
+    return true
+}
+```
+
+**AccountLinking 配置说明** (定义于 `modules/setting/oauth2.go`):
+- `OAuth2AccountLinkingDisabled` (disabled): 不允许账号关联，直接报错
+- `OAuth2AccountLinkingLogin` (login, **默认**): 跳转到登录页面，让用户手动登录已有账号进行绑定
+- `OAuth2AccountLinkingAuto` (auto): 自动查找匹配的用户（按用户名或邮箱），直接执行绑定流程
+
+### 2.6 自动注册流程
 
 **文件**: `routers/web/auth/oauth.go:141-207`
 
@@ -209,6 +368,19 @@ func LinkAccountPostRegister(ctx *context.Context) {
 if !setting.Service.AllowOnlyInternalRegistration && setting.OAuth2Client.EnableAutoRegistration {
     // 提取用户名和邮箱
     uname, err := extractUserNameFromOAuth2(&gothUser)
+
+    // 检查必填字段
+    var missingFields []string
+    if gothUser.UserID == "" { missingFields = append(missingFields, "sub") }
+    if gothUser.Email == "" { missingFields = append(missingFields, "email") }
+    if uname == "" { /* 根据配置检查 nickname 或 preferred_username */ }
+
+    if len(missingFields) > 0 {
+        // 字段缺失：跳转到绑定页面
+        gothUser.RawData["__giteaAutoRegMissingFields"] = missingFields
+        showLinkingLogin(ctx, authSource.ID, gothUser)
+        return
+    }
 
     // 创建用户
     u := &user_model.User{
@@ -222,16 +394,21 @@ if !setting.Service.AllowOnlyInternalRegistration && setting.OAuth2Client.Enable
     // 根据组声明设置管理员/受限用户
     isAdmin, isRestricted := getUserAdminAndRestrictedFromGroupClaims(source, &gothUser)
 
-    // 创建并处理
+    // 创建并处理（内部处理重名回落）
     linkAccountData := &LinkAccountData{authSource.ID, gothUser}
-    createAndHandleCreatedUser(ctx, "", nil, u, overwriteDefault, linkAccountData)
+    if setting.OAuth2Client.AccountLinking == setting.OAuth2AccountLinkingDisabled {
+        linkAccountData = nil
+    }
+    if !createAndHandleCreatedUser(ctx, "", nil, u, overwriteDefault, linkAccountData) {
+        return // 内部已处理回落
+    }
 
     // 同步团队
     syncGroupsToTeams(ctx, source, &gothUser, u)
 }
 ```
 
-### 2.6 外部账号关联核心函数
+### 2.7 外部账号关联核心函数
 
 **文件**: `services/externalaccount/user.go`
 
@@ -251,7 +428,7 @@ func EnsureLinkExternalToUser(ctx context.Context, authSourceID int64, user *use
 
 ---
 
-## 3. 会话写入机制
+## 3. 会话写入机制与状态清理
 
 ### 3.1 updateSession 核心函数
 
@@ -269,63 +446,42 @@ func updateSession(ctx *context.Context, deletes []string, updates map[string]an
 
     // 2. 删除指定的 session 键
     for _, k := range deletes {
-        if err := sess.Delete(k); err != nil { ... }
+        if err := sess.Delete(k); err != nil {
+            return fmt.Errorf("delete %v in session[%s]: %w", k, sessID, err)
+        }
     }
 
     // 3. 设置新的 session 键值
     for k, v := range updates {
-        if err := sess.Set(k, v); err != nil { ... }
+        if err := sess.Set(k, v); err != nil {
+            return fmt.Errorf("set %v in session[%s]: %w", k, sessID, err)
+        }
     }
 
     // 4. 持久化 session
-    if err := sess.Release(); err != nil { ... }
-
+    if err := sess.Release(); err != nil {
+        return fmt.Errorf("store session[%s]: %w", sessID, err)
+    }
     return nil
 }
 ```
 
-### 3.2 正常登录时的会话写入
+### 3.2 各分支的会话状态清理对比
 
-**文件**: `routers/web/auth/oauth.go:407-414`
+| 场景 | 调用位置 | 删除的 session 键 | 写入的 session 键 |
+|------|---------|------------------|------------------|
+| **正常登录（无2FA）** | `oauth.go:407` | 无（nil） | `uid`, `uname`, `userHasTwoFactorAuth` |
+| **需2FA的登录** | `oauth.go:432` | 无（nil） | `twofaUid`, `twofaRemember` |
+| **绑定流程需2FA** | `linkaccount.go:167` | 无（nil） | `twofaUid`, `twofaRemember`, `linkAccount=true` |
+| **最终登录完成** | `auth.go:401` | `openid_verified_uri`, `openid_signin_remember`, `openid_determined_email`, `openid_determined_username`, `twofaUid`, `twofaRemember`, `linkAccount`, `linkAccountData` | `uid`, `uname`, `userHasTwoFactorAuth` |
+| **自动登录（remember）** | `auth.go:121` | 无（nil） | `uid`, `uname`, `userHasTwoFactorAuth` |
+| **存储绑定数据** | `oauth.go:292` | 无（nil） | `linkAccountData` |
 
-```go
-func handleOAuth2SignIn(...) {
-    // ... 2FA 检查 ...
+### 3.3 handleSignInFull 的完整清理
 
-    if !needs2FA {
-        // 更新用户最后登录时间
-        opts.SetLastLogin = true
-        user_service.UpdateUser(ctx, u, opts)
-
-        // 写入会话
-        updateSession(ctx, nil, map[string]any{
-            session.KeyUID:                  u.ID,      // "uid"
-            session.KeyUname:                u.Name,    // "uname"
-            session.KeyUserHasTwoFactorAuth: userHasTwoFactorAuth,
-        })
-
-        resetLocale(ctx, u)
-        redirectAfterAuth(ctx)
-        return
-    }
-}
-```
-
-**会话键说明** (定义于 `modules/session/key.go`):
-- `KeyUID = "uid"`: 用户 ID
-- `KeyUname = "uname"`: 用户名
-- `KeyUserHasTwoFactorAuth`: 用户是否启用了双因素认证
-
-### 3.3 通用登录 handleSignIn
-
-**文件**: `routers/web/auth/auth.go:376-425`
+**文件**: `routers/web/auth/auth.go:384-442`
 
 ```go
-func handleSignIn(ctx *context.Context, u *user_model.User, remember bool) {
-    handleSignInFull(ctx, u, remember)
-    redirectAfterAuth(ctx)
-}
-
 func handleSignInFull(ctx *context.Context, u *user_model.User, remember bool) {
     // 1. 设置 remember me cookie（如果勾选）
     if remember {
@@ -336,95 +492,123 @@ func handleSignInFull(ctx *context.Context, u *user_model.User, remember bool) {
     // 2. 检查 2FA 状态
     userHasTwoFactorAuth, err := auth.HasTwoFactorOrWebAuthn(ctx, u.ID)
 
-    // 3. 清除旧的认证相关 session，写入新的
-    updateSession(ctx, []string{
+    // 3. 完整清理所有认证中间状态，写入最终登录态
+    if err := updateSession(ctx, []string{
+        // OpenID 相关
         "openid_verified_uri",
         "openid_signin_remember",
+        "openid_determined_email",
+        "openid_determined_username",
+        // 2FA 相关
         "twofaUid",
         "twofaRemember",
+        // 账号绑定相关
         "linkAccount",
-        "linkAccountData",  // 清除绑定数据
+        "linkAccountData",
     }, map[string]any{
         session.KeyUID:                  u.ID,
         session.KeyUname:                u.Name,
         session.KeyUserHasTwoFactorAuth: userHasTwoFactorAuth,
-    })
+    }); err != nil { ... }
 
     // 4. 设置语言
     resetLocale(ctx, u)
+
+    // 5. 更新最后登录时间
+    user_service.UpdateUser(ctx, u, &user_service.UpdateOptions{SetLastLogin: true})
 }
 ```
 
-### 3.4 2FA 场景下的会话
+**会话键说明** (定义于 `modules/session/key.go`):
+- `KeyUID = "uid"`: 用户 ID
+- `KeyUname = "uname"`: 用户名
+- `KeyUserHasTwoFactorAuth`: 用户是否启用了双因素认证
 
-**文件**: `routers/web/auth/oauth.go:432-448`
+### 3.4 2FA 场景下的会话流转
 
-```go
-if needs2FA {
-    // 保存用户 ID 和 remember 选项到 session
-    updateSession(ctx, nil, map[string]any{
-        "twofaUid":      u.ID,
-        "twofaRemember": false,
-    })
-
-    // 跳转到 2FA 或 WebAuthn 页面
-    regs, err := auth.GetWebAuthnCredentialsByUID(ctx, u.ID)
-    if err == nil && len(regs) > 0 {
-        ctx.Redirect(setting.AppSubURL + "/user/webauthn")
-    } else {
-        ctx.Redirect(setting.AppSubURL + "/user/two_factor")
-    }
-}
 ```
-
-2FA 验证通过后，会从 session 读取 `twofaUid`，完成最终登录。
+OAuth2 回调找到用户
+        ↓
+handleOAuth2SignIn() 检查 2FA
+        ↓
+needs2FA = true
+        ↓
+updateSession(nil, {"twofaUid": u.ID, "twofaRemember": false})
+        ↓
+跳转到 /user/two_factor 或 /user/webauthn
+        ↓
+用户输入 2FA 码 / 使用 WebAuthn
+        ↓
+TwoFactorPost() / WebAuthnLoginAssertionPost()
+        ├─ 验证通过
+        ├─ 检查 session["linkAccount"] → 如有则执行绑定
+        └─ 调用 handleSignIn()
+                ↓
+        handleSignInFull()
+                ↓
+        updateSession([8个键], {"uid", "uname", ...})  → 清理所有中间状态
+                ↓
+        登录完成
+```
 
 ---
 
-## 4. 关键接续点总结
+## 4. 关键接续点总结（修正版）
 
 ### 4.1 回调 → 查找用户
 ```
 SignInOAuthCallback()
     ↓
 oAuth2UserLoginCallback() → 返回 (user, gothUser, error)
-    ├─ 找到 user → handleOAuth2SignIn() → 登录
+    ├─ 找到 user → handleOAuth2SignIn()
+    │                   ├─ 无2FA → updateSession 写入登录态
+    │                   └─ 有2FA → updateSession 写入 twofaUid → 跳转2FA
     └─ 未找到 user → 进入绑定/注册流程
 ```
 
-### 4.2 绑定流程接续
+### 4.2 绑定流程接续（含 2FA 分阶段）
 ```
-showLinkingLogin() 保存 LinkAccountData 到 session
+showLinkingLogin() → 保存 LinkAccountData 到 session
     ↓
 用户跳转到 /user/link_account
-    ├─ 登录 → LinkAccountPostSignIn() → 从 session 读回 LinkAccountData
-    └─ 注册 → LinkAccountPostRegister() → 从 session 读回 LinkAccountData
+    ├─ 登录 → LinkAccountPostSignIn() → oauth2LinkAccount()
+    │                                       ├─ 无2FA → LinkAccountToUser() + handleSignIn()
+    │                                       └─ 有2FA → updateSession(linkAccount=true) → 跳转2FA
+    │                                                                   ↓
+    │                                                           2FA 验证通过
+    │                                                                   ↓
+    │                                                           linkAccountFromContext() → 真正绑定
+    │                                                                   ↓
+    │                                                           handleSignIn()
+    └─ 注册 → LinkAccountPostRegister() → createAndHandleCreatedUser()
+                                                    ├─ 成功 → handleSignIn()
+                                                    └─ 重名 → 按 AccountLinking 回落
 ```
 
-### 4.3 登录会话接续
+### 4.3 自动注册回落接续
 ```
-认证通过
+createUserInContext() 尝试创建用户
+    ↓
+创建失败（用户名/邮箱已存在）
+    ↓
+检查 possibleLinkAccountData != nil
+    ↓
+AccountLinking 配置
+    ├─ auto → 按用户名/邮箱查找已有用户 → oauth2LinkAccount()
+    └─ login → showLinkingLogin() → 跳转绑定页面
+```
+
+### 4.4 登录会话接续
+```
+认证通过（密码/2FA/WebAuthn）
     ↓
 updateSession() 执行：
-    1. RegenerateSession()  - 重新生成 session ID
-    2. 清理旧的认证数据     - 删除 linkAccountData 等
-    3. 写入 uid / uname     - 建立登录态
-    4. Release()            - 持久化
+    1. RegenerateSession()       - 重新生成 session ID（防固定攻击）
+    2. 清理 8 个认证中间状态键    - 防止状态残留
+    3. 写入 uid / uname 等        - 建立最终登录态
+    4. Release()                  - 持久化
     ↓
 后续请求通过 session 中的 uid 识别用户
-```
-
-### 4.4 2FA 接续
-```
-需要 2FA
-    ↓
-updateSession() 写入 twofaUid
-    ↓
-跳转到 2FA 页面
-    ↓
-2FA 验证通过
-    ↓
-从 session 读 twofaUid，调用 handleSignIn() 完成登录
 ```
 
 ---
@@ -435,12 +619,19 @@ updateSession() 写入 twofaUid
 |------|------|------|
 | OAuth2 回调入口 | `routers/web/auth/oauth.go` | `SignInOAuthCallback` |
 | 用户查找逻辑 | `routers/web/auth/oauth.go` | `oAuth2UserLoginCallback` |
-| 登录处理（含会话写入） | `routers/web/auth/oauth.go` | `handleOAuth2SignIn` |
+| 登录处理（含 2FA 分支） | `routers/web/auth/oauth.go` | `handleOAuth2SignIn` |
+| 绑定已有账号（分阶段） | `routers/web/auth/linkaccount.go` | `oauth2LinkAccount` |
+| 2FA 验证后绑定 | `routers/web/auth/2fa.go` | `TwoFactorPost` |
+| WebAuthn 验证后绑定 | `routers/web/auth/webauthn.go` | `WebAuthnLoginAssertionPost` |
+| 从 session 执行绑定 | `routers/web/auth/linkaccount.go` | `linkAccountFromContext` |
 | 绑定页面展示 | `routers/web/auth/linkaccount.go` | `LinkAccount` |
-| 绑定已有账号 | `routers/web/auth/linkaccount.go` | `LinkAccountPostSignIn` |
-| 注册新账号 | `routers/web/auth/linkaccount.go` | `LinkAccountPostRegister` |
+| 绑定已有账号入口 | `routers/web/auth/linkaccount.go` | `LinkAccountPostSignIn` |
+| 注册新账号入口 | `routers/web/auth/linkaccount.go` | `LinkAccountPostRegister` |
+| 自动注册重名回落 | `routers/web/auth/auth.go` | `createUserInContext` |
+| 用户创建后处理 | `routers/web/auth/auth.go` | `handleUserCreated` |
 | 外部账号关联 | `services/externalaccount/user.go` | `LinkAccountToUser` / `EnsureLinkExternalToUser` |
 | 通用登录处理 | `routers/web/auth/auth.go` | `handleSignIn` / `handleSignInFull` |
 | 会话更新核心 | `routers/web/auth/auth.go` | `updateSession` |
 | 会话键定义 | `modules/session/key.go` | `KeyUID` / `KeyUname` |
 | 用户信息同步 | `routers/web/auth/oauth_signin_sync.go` | `oauth2SignInSync` |
+| AccountLinking 配置 | `modules/setting/oauth2.go` | `OAuth2AccountLinkingType` |

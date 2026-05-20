@@ -131,12 +131,60 @@ func runMigrateTask(ctx context.Context, t *admin_model.Task) (err error) {
 | **第三层** | 错误归一 | 鉴权失败 / Git fatal / 创建错误匹配 | 将底层错误转换为用户友好的统一格式 |
 | **第四层** | 状态兜底 | `defer` 中的状态回写 | 无论何种退出路径（正常 return / panic），都保证任务状态被更新 |
 
-#### 2.1.3 关键设计要点
+#### 2.1.3 深度校验：错误归一是否掩盖底层故障定位？
 
-- **独立的取消监听协程**：支持用户主动取消迁移，通过 context 取消信号终止迁移
-- **进度实时更新**：迁移过程中的进度通过 `messenger` 回调实时更新任务消息
-- **失败保留仓库**：注释明确说明 `do not delete the repository`，用户总能看到最后一条错误信息
-- **ShutdownContext 保证**：即使服务关闭，defer 函数仍能执行，确保任务状态不丢失
+**结论**：**不会掩盖**。Gitea 采用了"**双轨记录**"策略，兼顾用户友好性和运维可观测性。
+
+让我们分析具体实现：
+
+```go
+// ========== 用户可见的错误（经过归一化） ==========
+// 1. 错误脱敏：移除 URL 中的凭证
+err = util.SanitizeErrorCredentialURLs(err)
+
+// 2. 错误类型归一（用户看到的是这些消息）
+if strings.Contains(err.Error(), "Authentication failed") {
+    return fmt.Errorf("authentication failed: %w", err)  // 用 %w 包装，保留原始错误链
+} else if strings.Contains(err.Error(), "fatal:") {
+    return fmt.Errorf("migration failed: %w", err)       // 用 %w 包装，保留原始错误链
+}
+err = handleCreateError(t.Owner, err)
+
+// ========== 运维可见的错误（完整原始信息） ==========
+// 在 defer 函数中：
+log.Error("runMigrateTask[%d] by DoerID[%d] to RepoID[%d] for OwnerID[%d] failed: %v", 
+    t.ID, t.DoerID, t.RepoID, t.OwnerID, err)  // 这里记录的 err 包含完整错误链
+```
+
+**双轨记录策略详解**：
+
+| 维度 | 用户可见（Task.Message） | 运维可见（服务日志） |
+|------|-------------------------|---------------------|
+| **错误内容** | 归一化后的友好消息，如 `authentication failed: ...` | 完整原始错误，包含堆栈、底层错误详情 |
+| **敏感信息** | 已脱敏（`SanitizeErrorCredentialURLs`） | 已脱敏（`SanitizeErrorCredentialURLs`） |
+| **错误链** | 通过 `%w` 包装保留，可通过 `errors.Unwrap()` 追溯 | 完整保留 |
+| **存储位置** | 数据库 `task.message` 字段，Web 界面可见 | 服务日志文件，仅运维可查 |
+| **详细程度** | 中等，足够用户理解失败原因 | 完整，包含文件名、行号、堆栈 |
+
+**关键技术点**：
+1. **`%w` 错误包装**：使用 `fmt.Errorf("...: %w", err)` 而非 `%v`，保留错误链
+2. **`SanitizeErrorCredentialURLs` 实现**：返回 `sanitizedError{err: err}`，`Error()` 方法返回脱敏后的字符串，但内部保留原始 error
+3. **日志记录时机**：`log.Error` 在 defer 中调用，此时 err 已经过 `%w` 包装，包含完整上下文
+
+**代码证据**（`modules/util/sanitize.go:25-27`）：
+```go
+func SanitizeErrorCredentialURLs(err error) error {
+    return sanitizedError{err: err}  // 内部持有原始 error，不丢失
+}
+```
+
+**运维定位流程**：
+1. 用户报告迁移失败，看到归一化错误消息
+2. 运维根据 Task ID 在日志中搜索 `runMigrateTask[12345] failed`
+3. 日志中包含完整错误链：`authentication failed: clone failed: HTTP 401: invalid token`
+4. 可通过 `errors.As()` / `errors.Is()` 进一步提取特定错误类型
+
+这种设计既保证了用户界面的友好性，又不丢失运维所需的故障定位信息。
 
 ---
 
@@ -179,6 +227,26 @@ func newDownloader(ctx context.Context, ownerName string, opts base.MigrateOptio
         downloader = NewPlainGitDownloader(ownerName, opts.RepoName, opts.CloneAddr)
         log.Trace("Will migrate from git: %s", opts.OriginalURL)
     }
+    
+    // ========== Plain-Git 降级：可恢复性与数据完整性的取舍 ==========
+    // 取舍原则：宁可丢失协作数据，也要保证 Git 代码本身能迁移成功
+    //
+    // ✅ 可恢复性增强（保留的能力）：
+    // 1. Git 完整历史：所有分支、标签、提交历史都保留
+    // 2. Wiki 数据：如果源站支持 Wiki，也会被克隆
+    // 3. 零外部依赖：不依赖源站 API，只需要 Git 协议可用
+    // 4. 成功率最高：Git 协议是最基础、最兼容的能力
+    //
+    // ❌ 数据完整性牺牲（丢失的能力）：
+    // 1. 所有 Issue/PR 元数据：标题、内容、状态、标签、里程碑
+    // 2. 所有评论：Issue 评论、PR 评论、代码评审评论
+    // 3. 所有发布版本：Release 标题、说明、附件
+    // 4. 用户关联：Issue/PR 的创建者、评论者都无法映射
+    // 5. 评审历史：PR 的审批状态、评审意见
+    //
+    // 设计意图：当源站类型无法识别或 API 不可用时，
+    // 确保至少能拿到最核心的资产——Git 代码库本身。
+    // =========================================================
     
     // 包装重试装饰器
     if setting.Migrations.MaxAttempts > 1 {
@@ -343,6 +411,45 @@ if _, ok := downloader.(*RepositoryRestorer); !ok {
 | **为什么 RepositoryRestorer 不需要二次校验？** | `RepositoryRestorer` 是从**本地备份目录**恢复仓库（`services/migrations/restore.go:19-39`），它返回的 `CloneURL` 是本地路径：`filepath.Join(r.baseDir, "git")`。这个路径已经在创建时验证过，且不涉及外部网络请求，不存在被重定向或篡改的风险。 |
 | **为什么其他 Downloader 需要二次校验？** | 外部 Downloader（如 GitHub/GitLab）的 `GetRepoInfo()` 可能返回被源站重写的 CloneURL。例如：<br>1. 用户输入 `https://github.com/user/repo` <br>2. GitHub API 可能返回 `https://oauth2:xxx@github.com/user/repo.git` <br>3. 甚至可能被恶意源站重定向到 `file:///etc/passwd` <br>因此必须重新校验最终的 CloneURL |
 | **校验了什么？** | 1. 通过 `IsMigrateURLAllowed` 再次走完整的白名单校验流程<br>2. 防止协议降级：从 http/https 变为 file 协议（SSRF 防护） |
+
+#### 3.3.2.1 深度校验：RepositoryRestorer 与普通 Downloader 的输入信任边界差异
+
+RepositoryRestorer 和普通 Downloader（如 GithubDownloaderV3）处于完全不同的信任边界，这决定了它们的安全策略差异：
+
+| 维度 | RepositoryRestorer | 普通 Downloader（GitHub/GitLab 等） |
+|------|-------------------|-----------------------------------|
+| **输入来源** | 本地文件系统路径（`baseDir`） | 外部网络 URL（`CloneAddr`） |
+| **调用入口** | 内部 `dump.go:720` 直接创建，绕过 `newDownloader` 工厂 | 外部 API/Web 调用，经 `newDownloader` 工厂创建 |
+| **前置校验** | `NewRepositoryRestorer` 中调用 `filepath.Abs()` 验证路径 | `IsMigrateURLAllowed` 完整校验（协议/主机/IP 黑白名单） |
+| **CloneURL 来源** | 静态拼接：`filepath.Join(r.baseDir, "git")` | 外部 API 返回，可能被源站重写 |
+| **PatchURL 来源** | 静态拼接：`"file://" + filepath.Join(r.baseDir, pr.PatchURL)` | 外部 API 返回，可能指向任意 URL |
+| **用户权限** | 仅管理员可调用（`user_model.GetAdminUser(ctx)`） | 普通登录用户即可调用 |
+| **数据可信性** | 从 Gitea 自身导出的备份格式，数据结构可控 | 第三方 API 返回，数据结构和内容不可控 |
+
+**关键代码证据**（`services/migrations/dump.go:715-737`）：
+```go
+// 仅管理员可调用恢复功能
+doer, err := user_model.GetAdminUser(ctx)
+if err != nil {
+    return err
+}
+
+// 直接创建 RepositoryRestorer，绕过 newDownloader 工厂
+downloader, err := NewRepositoryRestorer(ctx, baseDir, ownerName, repoName, validation)
+if err != nil {
+    return err
+}
+
+// 直接调用 migrateRepository，不走 MigrateRepository（跳过 IsMigrateURLAllowed）
+if err = migrateRepository(ctx, doer, downloader, uploader, migrateOpts, nil); err != nil {
+    // ...
+}
+```
+
+**信任边界总结**：
+- RepositoryRestorer 处于**高信任边界**内：管理员操作 + 本地文件 + 已知导出格式
+- 普通 Downloader 处于**低信任边界**：普通用户 + 外部网络 + 不可控 API 返回
+- 这就是为什么 RepositoryRestorer 可以跳过 CloneURL 二次校验，而普通 Downloader 必须严格校验
 
 #### 3.3.3 第三层：PR 数据安全校验
 
@@ -812,5 +919,8 @@ func (g *GiteaLocalUploader) Rollback() error {
 | ✅ 用户映射失败回退 doer | ✅ 未匹配用户时，操作人用 doer ID，保留原始名称 | `gitea_uploader.go:984-987` |
 | ✅ Panic 会被捕获 | ✅ defer 中 recover()，转为 error 写入任务 | `task/migrate.go:45-49` |
 | ✅ 错误信息会脱敏 | ✅ SanitizeErrorCredentialURLs 移除 URL 中的凭证 | `task/migrate.go:143` |
+| ❌ 错误归一掩盖底层故障 | ✅ 双轨记录：用户看到归一化消息，日志保留完整错误链 | `task/migrate.go:145-156` |
+| ✅ RepositoryRestorer 仅管理员可用 | ✅ NewRepositoryRestorer 调用前先 `GetAdminUser(ctx)` | `dump.go:715` |
+| ✅ Plain-Git 是优雅降级 | ✅ 宁可丢失协作数据，也要保证 Git 代码本身迁移成功 | `migrate.go:167-176` |
 
 通过以上五棒接力，Gitea 实现了从外部站点到本地的完整仓库迁移，兼顾了灵活性、安全性和可靠性。

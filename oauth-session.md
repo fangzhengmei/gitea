@@ -18,6 +18,8 @@ SignInOAuth() → 重定向到第三方提供商
         │                           ├─ oauth2SignInSync 同步信息
         │                           ├─ 检查 2FA 状态（不验证）
         │                           ├─ ⚠️ EnsureLinkExternalToUser() [在2FA验证之前执行]
+        │                           │       ├─ 已存在映射 → 更新外部账号信息
+        │                           │       └─ 不存在映射 → 插入新映射（如 AccountLinking=disabled 自动注册的用户）
         │                           ├─ 无2FA → updateSession 写入登录态
         │                           └─ 有2FA → 存 twofaUid → 跳转2FA页面 → 验证后登录
         ├─→ 情况2: 已登录用户 → LinkAccountToUser() 直接绑定 → 跳转设置页
@@ -159,7 +161,7 @@ func LinkExternalToUser(ctx context.Context, user *User, externalLoginUser *Exte
 }
 
 // EnsureLinkExternalToUser: 确保外部账号已绑定（幂等模式）
-// 已存在则更新，不存在则插入
+// 已存在则更新，不存在则插入（不只是更新旧绑定）
 func EnsureLinkExternalToUser(ctx context.Context, external *ExternalLoginUser) error {
     has, err := db.Exist[ExternalLoginUser](ctx, ...)
     if has {
@@ -219,7 +221,11 @@ func handleOAuth2SignIn(ctx *context.Context, authSource *auth.Source, u *user_m
 }
 ```
 
-**关键点**: 已有用户 OAuth2 登录时，`EnsureLinkExternalToUser` 在 **2FA 验证之前** 就执行了。这是因为这个用户已经是系统的合法用户，之前已经完成了账号绑定，这里只是更新外部账号信息。
+**关键点**: 已有用户 OAuth2 登录时，`EnsureLinkExternalToUser` 在 **2FA 验证之前** 就执行了。它的行为是"确保绑定存在"：
+- 如果 `ExternalLoginUser` 表中已有记录 → 更新外部账号信息
+- 如果 `ExternalLoginUser` 表中没有记录 → 插入新映射
+
+**典型场景**：`AccountLinking = disabled` 时自动注册的用户。这种用户的 `user` 表中 `LoginName`/`LoginSource`/`LoginType` 已设置为 OAuth2 相关值，但 `ExternalLoginUser` 表中没有记录（因为 `handleUserCreated` 中跳过了绑定）。下次登录时 `oAuth2UserLoginCallback` 按 `user` 表找到用户，`handleOAuth2SignIn` 调用 `EnsureLinkExternalToUser` 发现没有记录，就会插入新映射。
 
 ### 2.3 模式 B：新账号绑定流程（通过 link_account 页面）
 
@@ -267,7 +273,8 @@ func handleUserCreated(ctx *context.Context, u *user_model.User, possibleLinkAcc
 
     // update external user information
     // ⚠️ 只有当 possibleLinkAccountData != nil 时才执行绑定
-    // 当 AccountLinking = disabled 时，possibleLinkAccountData 为 nil，跳过绑定
+    // 当 AccountLinking = disabled 时，possibleLinkAccountData 为 nil，跳过本次绑定
+    // 但用户下次登录时，handleOAuth2SignIn 会调用 EnsureLinkExternalToUser 插入映射
     if possibleLinkAccountData != nil {
         if err := externalaccount.EnsureLinkExternalToUser(ctx, possibleLinkAccountData.AuthSourceID, u, possibleLinkAccountData.GothUser); err != nil {
             log.Error("EnsureLinkExternalToUser failed: %v", err)
@@ -277,6 +284,8 @@ func handleUserCreated(ctx *context.Context, u *user_model.User, possibleLinkAcc
     // ... 发送激活邮件 ...
 }
 ```
+
+**注意**: `AccountLinking = disabled` 只是跳过注册时的绑定，用户第二次登录时仍然会通过 `handleOAuth2SignIn` 中的 `EnsureLinkExternalToUser` 建立外部账号映射。
 
 ---
 
@@ -290,7 +299,7 @@ func handleUserCreated(ctx *context.Context, u *user_model.User, possibleLinkAcc
 | **WebAuthn 硬件密钥** | `webauthn.go:264-270` | ✓ | ✓ | ✓ | 新账号绑定流程 |
 | **Passkey 登录** | `webauthn.go:151-156` | ✓ | ✓ | ✓ | 新账号绑定流程 |
 | **备用码 (Scratch Code)** | `2fa.go:116-161` | ✗ | ✗ | **✗ 不执行！** | 新账号绑定流程 |
-| **已有用户登录** | `oauth.go:386` | - | - | ✓（在2FA前执行） | 已有用户 OAuth2 登录 |
+| **已有用户登录** | `oauth.go:386` | - | - | ✓（在2FA前执行，更新或插入） | 已有用户 OAuth2 登录 |
 
 ### 3.2 TOTP 验证后的绑定
 
@@ -554,9 +563,10 @@ if !createAndHandleCreatedUser(ctx, "", nil, u, overwriteDefault, linkAccountDat
 | 已登录用户主动绑定 | ✓ 允许，`SignInOAuthCallback` 中直接调用 `LinkAccountToUser` |
 | link_account 页面手动绑定 | ✓ 允许，`linkaccount.go` 不检查 AccountLinking 设置 |
 | 新用户注册后自动绑定 | ✗ 不绑定（因为 linkAccountData 是 nil，`handleUserCreated` 中跳过） |
+| 新用户第二次登录 | ✓ 会绑定！`handleOAuth2SignIn` 调用 `EnsureLinkExternalToUser` 发现无记录，插入新映射 |
 
 **AccountLinking 配置说明** (定义于 `modules/setting/oauth2.go`):
-- `OAuth2AccountLinkingDisabled` (disabled): 仅禁止**自动注册流程中的重名回落**和**新用户自动绑定**，不影响已有用户登录和主动绑定
+- `OAuth2AccountLinkingDisabled` (disabled): 仅禁止**自动注册流程中的重名回落**和**新用户首次注册时自动绑定**，但用户第二次登录时 `handleOAuth2SignIn` 仍会调用 `EnsureLinkExternalToUser` 插入映射
 - `OAuth2AccountLinkingLogin` (login, **默认**): 跳转到登录页面，让用户手动登录已有账号进行绑定
 - `OAuth2AccountLinkingAuto` (auto): 自动查找匹配的用户（按用户名或邮箱），直接执行绑定流程
 
@@ -714,7 +724,9 @@ func handleSignInFull(ctx *context.Context, u *user_model.User, remember bool) {
 handleOAuth2SignIn()
         ├─ oauth2SignInSync 同步信息
         ├─ 检查 2FA 状态
-        ├─ EnsureLinkExternalToUser() [绑定在 2FA 验证之前完成]
+        ├─ EnsureLinkExternalToUser() [在 2FA 验证之前执行]
+        │       ├─ 已存在映射 → 更新外部账号信息
+        │       └─ 不存在映射 → 插入新映射
         ├─ 无2FA → updateSession 写入登录态
         └─ 有2FA → updateSession 写入 twofaUid → 跳转2FA页面 → 验证后登录
 
@@ -746,6 +758,8 @@ oAuth2UserLoginCallback() → 返回 (user, gothUser, error)
     │                   ├─ oauth2SignInSync 同步信息
     │                   ├─ 检查 2FA 状态
     │                   ├─ EnsureLinkExternalToUser() [在2FA验证前执行!]
+    │                   │       ├─ 已存在映射 → 更新外部账号信息
+    │                   │       └─ 不存在映射 → 插入新映射
     │                   ├─ 无2FA → updateSession 写入登录态
     │                   └─ 有2FA → updateSession 写入 twofaUid → 跳转2FA
     └─ 未找到 user → 进入绑定/注册流程
@@ -822,7 +836,7 @@ updateSession() 执行：
 | 自动注册重名回落 | `routers/web/auth/auth.go` | `createUserInContext` |
 | 用户创建后处理 | `routers/web/auth/auth.go` | `handleUserCreated` |
 | 严格绑定（存在则报错） | `models/user/external_login_user.go` | `LinkExternalToUser` |
-| 幂等绑定（存在则更新） | `models/user/external_login_user.go` | `EnsureLinkExternalToUser` |
+| 幂等绑定（存在则更新，不存在则插入） | `models/user/external_login_user.go` | `EnsureLinkExternalToUser` |
 | 通用登录处理 | `routers/web/auth/auth.go` | `handleSignIn` / `handleSignInFull` |
 | 会话更新核心 | `routers/web/auth/auth.go` | `updateSession` |
 | 会话键定义 | `modules/session/key.go` | `KeyUID` / `KeyUname` |
@@ -837,18 +851,27 @@ updateSession() 执行：
 使用备用码（Scratch Code）进行 2FA 验证时，**不会执行新账号绑定操作**。这是因为 `TwoFactorScratchPost` (`routers/web/auth/2fa.go:116`) 没有检查 `linkAccount` 标记，与 TOTP、WebAuthn、Passkey 三个分支不一致。
 
 ### ⚠️ 已有用户登录时绑定时机
-已有 OAuth2 用户登录时，`EnsureLinkExternalToUser` 在 **2FA 验证之前** 就执行了（`oauth.go:386`）。这意味着即使用户最终没有通过 2FA，外部账号信息也已经被更新。这是合理的，因为这个用户已经是系统的合法用户，之前已经完成了账号绑定，这里只是更新外部账号信息。
+已有 OAuth2 用户登录时，`EnsureLinkExternalToUser` 在 **2FA 验证之前** 就执行了（`oauth.go:386`）。这意味着即使用户最终没有通过 2FA，外部账号信息也已经被更新或新建。
+
+**行为边界**：
+- 如果 `ExternalLoginUser` 表中已有记录 → 更新外部账号信息
+- 如果 `ExternalLoginUser` 表中没有记录 → **插入新映射**
+
+**典型场景**：`AccountLinking = disabled` 时自动注册的用户。这类用户的 `user` 表中 `LoginName`/`LoginSource`/`LoginType` 已设置为 OAuth2 相关值，但 `ExternalLoginUser` 表中没有记录（因为 `handleUserCreated` 中 `linkAccountData` 为 nil，跳过了绑定）。下次登录时 `oAuth2UserLoginCallback` 按 `user` 表找到用户，`handleOAuth2SignIn` 调用 `EnsureLinkExternalToUser` 发现没有记录，就会插入新映射。
 
 ### ⚠️ AccountLinking = disabled 边界有限
 `AccountLinking = disabled` **仅**影响：
 - 自动注册流程中的重名回落（不回落，直接报错）
-- 新用户注册后自动绑定（不执行绑定）
+- 新用户**首次注册时**自动绑定（`handleUserCreated` 中跳过）
 
-但**不限制**：
+但**不限制**（甚至会自动发生）：
 - 已有 OAuth2 用户正常登录（仍然调用 `EnsureLinkExternalToUser`）
 - 已登录用户主动绑定新的 OAuth2 账号（`SignInOAuthCallback` 中直接绑定）
 - 用户通过 link_account 页面手动绑定（`linkaccount.go` 不检查此设置）
+- **新用户第二次登录**（`handleOAuth2SignIn` 调用 `EnsureLinkExternalToUser`，发现无记录则插入新映射）
+
+**⚠️ 重要**: `AccountLinking = disabled` 并不能阻止外部账号映射的建立，只是延迟到用户第二次登录时自动建立。
 
 ### 绑定时机区分原则
-- **已有用户登录**：绑定在 2FA 验证前执行（更新已有绑定关系）
-- **新账号绑定**：绑定在 2FA 验证后执行（建立新的绑定关系，敏感操作）
+- **已有用户登录**：`EnsureLinkExternalToUser` 在 2FA 验证前执行，行为是"确保绑定存在"——已存在则更新，不存在则插入新映射
+- **新账号绑定流程**（通过 link_account 页面）：`LinkAccountToUser` 在 2FA 验证后执行（建立新的绑定关系，敏感操作，必须双重验证）

@@ -1,0 +1,622 @@
+# Gitea 制品仓库（Package Registry）代码链路分析
+
+## 一、整体架构概览
+
+Gitea 的制品仓库系统在代码中被称为 **Package Registry**，支持 23 种包管理类型。整个系统可以划分为以下核心层次：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  协议适配层 (routers/api/packages/*)                    │
+│  每种包类型独立路由 + Handler，适配原生协议               │
+├─────────────────────────────────────────────────────────┤
+│  认证准入层 (services/packages/auth.go + auth/)         │
+│  JWT Bearer Token / Basic Auth / OAuth2 / 反向代理       │
+├─────────────────────────────────────────────────────────┤
+│  业务服务层 (services/packages/packages.go)             │
+│  包的创建/删除/下载、配额校验、通知分发                   │
+├─────────────────────────────────────────────────────────┤
+│  数据模型层 (models/packages/*.go)                      │
+│  Package / PackageVersion / PackageFile / PackageBlob   │
+├─────────────────────────────────────────────────────────┤
+│  内容存储层 (modules/packages/content_store.go)         │
+│  ContentStore → ObjectStorage → Local/MinIO/Azure       │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、路由入口与挂载
+
+### 2.1 路由注册
+
+在 `routers/init.go:189-195`，路由根据 `setting.Packages.Enabled` 配置条件挂载：
+
+```go
+// 绝大多数包管理器的路由挂载在 /api/packages 下
+r.Mount("/api/packages", packages_router.CommonRoutes())
+// OCI 容器镜像协议必须挂载在根路径 /v2（符合 OCI 分发规范）
+r.Mount("/v2", packages_router.ContainerRoutes())
+```
+
+### 2.2 CommonRoutes 与 ContainerRoutes
+
+两条路由构建函数定义在 `routers/api/packages/api.go`：
+
+- **`CommonRoutes()`** — 挂载 22 种包管理器的路由（除 Container 外），统一前缀 `/api/packages/{username}/`
+- **`ContainerRoutes()`** — OCI 容器镜像协议，挂载在 `/v2/`，支持 Docker/Containerd 等客户端
+
+两者共享相同的中间件组合模式：
+1. `context.PackageContexter()` — 创建基础 Web Context
+2. `verifyAuth()` — 执行认证，组装 `auth.Method` 组
+3. 路径分组下叠加 `reqPackageAccess(perm.AccessModeRead/Write)` — 细粒度权限校验
+
+---
+
+## 三、认证准入链路
+
+### 3.1 认证方法组合
+
+在 `routers/api/packages/api.go:96-128`，`verifyAuth` 函数通过 `auth.NewGroup` 组装多种认证方法：
+
+```go
+verifyAuth(r, []auth.Method{
+    &auth.OAuth2{},       // OAuth2 Token
+    &auth.Basic{},        // Basic Auth（用户名/密码 或 用户名/Token）
+    &nuget.Auth{},        // NuGet 专用的 API Key 认证
+    &Auth{},              // 自定义 JWT Bearer Token（conan/container 共用）
+    &chef.Auth{},         // Chef 专用认证
+}, verifyAuthOptions)
+```
+
+Container 路由使用不同的认证组：
+```go
+verifyAuth(r, []auth.Method{
+    &auth.Basic{},
+    &Auth{AllowGhostUser: true},  // 允许匿名 Ghost 用户
+}, ...)
+```
+
+### 3.2 Auth.Group 执行流程
+
+`services/auth/group.go:44-72` 定义了 `Group.Verify`：
+
+```
+for each method in methods:
+    user, err = method.Verify(req, w, store, sess)
+    if err != nil: continue（尝试下一个方法）
+    if user != nil: return user, nil（认证成功）
+return nil, retErr（全部失败）
+```
+
+关键设计：**多种方法串行尝试**，这使得 OAuth2 和 conan.Auth 都能从 `Authorization: Bearer <token>` 头部读取 token——前者先尝试解析为 OAuth2，失败后后者再尝试解析为自定义 JWT。
+
+### 3.3 自定义 JWT Token（packages.Auth）
+
+定义于 `routers/api/packages/auth.go:17-60` 和 `services/packages/auth.go:21-88`。
+
+**Token 签发** (`CreateAuthorizationToken`)：
+- Claims 结构：`{ UserID, Scope, ActionsUserTaskID }` + JWT 标准字段
+- 签名算法：HS256，密钥取自 `setting.GetGeneralTokenSigningSecret()`
+- 有效期：24 小时
+
+**Token 验证** (`ParseAuthorizationRequest`)：
+1. 从 `Authorization` 头部提取 Bearer Token
+2. 解析 JWT 得到 `PackageMeta{UserID, Scope, ActionsUserTaskID}`
+3. 根据 UserID 查找用户（支持 GhostUser、ActionsUser）
+4. 将 `Scope` 写入 `store.GetData()["ApiTokenScope"]`，供后续权限校验使用
+
+### 3.4 权限校验中间件 `reqPackageAccess`
+
+定义于 `routers/api/packages/api.go:41-90`，执行两级检查：
+
+**第一级：Token Scope 检查**（仅当 `IsApiToken == true` 时）
+```go
+case perm.AccessModeRead:
+    scopeMatched, err = scope.HasScope(auth_model.AccessTokenScopeReadPackage)
+case perm.AccessModeWrite:
+    scopeMatched, err = scope.HasScope(auth_model.AccessTokenScopeWritePackage)
+```
+- 若 scope 限制为 "仅公开资源" (`PublicOnly`)，且目标包为私有，则拒绝
+
+**第二级：访问模式检查**
+```go
+if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
+    // 返回 401 Unauthorized
+}
+```
+`ctx.Package.AccessMode` 的计算逻辑见下节。
+
+### 3.5 访问模式计算 `determineAccessMode`
+
+在 `services/context/package.go:116-170`：
+
+| 场景 | 访问模式 |
+|------|----------|
+| `RequireSignInViewStrict` 启用且用户未登录/Ghost | `AccessModeNone` |
+| 用户被禁用/禁止登录 | `AccessModeNone` |
+| 组织 + 已登录用户 | 取组织团队最高授权 + `TypePackages` 单位的最大访问模式 |
+| 组织 + 未登录/非成员 + 组织可见 | `AccessModeRead` |
+| 个人 + 本人 | `AccessModeOwner` |
+| 个人 + 公开/有限可见的他人 | `AccessModeRead` |
+| 个人 + 公开 + 未登录 | `AccessModeRead` |
+
+---
+
+## 四、协议适配层
+
+### 4.1 支持的包类型（23 种）
+
+在 `models/packages/package.go:32-56` 定义：
+
+| 常量 | 类型 | 路由前缀 |
+|------|------|----------|
+| `TypeAlpine` | Alpine Linux 包 | `/alpine` |
+| `TypeArch` | Arch Linux 包 | `/arch` |
+| `TypeCargo` | Rust Cargo | `/cargo` |
+| `TypeChef` | Chef Cookbook | `/chef` |
+| `TypeComposer` | PHP Composer | `/composer` |
+| `TypeConan` | C/C++ Conan | `/conan` |
+| `TypeConda` | Conda 包 | `/conda` |
+| `TypeContainer` | OCI 容器镜像 | `/v2`（独立） |
+| `TypeCran` | R CRAN | `/cran` |
+| `TypeDebian` | Debian 包 | `/debian` |
+| `TypeGeneric` | 通用文件 | `/generic` |
+| `TypeGo` | Go Modules | `/go` |
+| `TypeHelm` | Kubernetes Helm | `/helm` |
+| `TypeMaven` | Java Maven | `/maven` |
+| `TypeNpm` | JavaScript npm | `/npm` |
+| `TypeNuGet` | .NET NuGet | `/nuget` |
+| `TypePub` | Dart/Flutter Pub | `/pub` |
+| `TypePyPI` | Python PyPI | `/pypi` |
+| `TypeRpm` | RPM 包 | `/rpm` |
+| `TypeRubyGems` | Ruby Gems | `/rubygems` |
+| `TypeSwift` | Swift Package | `/swift` |
+| `TypeTerraformState` | Terraform State | `/terraform` |
+| `TypeVagrant` | Vagrant Box | `/vagrant` |
+
+### 4.2 Generic 包上传链路（典型示例）
+
+以 `routers/api/packages/generic/generic.go` 的 `UploadPackage` 为例，展示标准上传流程：
+
+```
+1. 参数校验（正则匹配包名/文件名/版本号）
+2. ctx.UploadStream() → 获取上传流
+3. packages_module.CreateHashedBufferFromReader(upload) → 计算多哈希 + 写入 FileBackedBuffer
+4. packages_service.CreatePackageOrAddFileToExisting() → 核心创建逻辑
+5. 返回 201 Created
+```
+
+### 4.3 Container 包上传链路（OCI 协议）
+
+容器镜像走 OCI 分发规范，分为 Blob Upload 和 Manifest Push：
+
+**Blob 上传（`routers/api/packages/container/container.go`）:**
+
+1. **POST `/v2/{image}/blobs/uploads`** — 创建上传会话
+   - `mount` 参数：尝试从另一个仓库挂载已有 blob（跨仓库复用）
+   - `digest` 参数：monolithic upload（单请求直接提交）
+   - 默认：返回 `Location` 和 `Docker-Upload-Uuid`，等待后续 PATCH/PUT
+
+2. **PATCH `/v2/{image}/blobs/uploads/{uuid}`** — 分块追加数据
+   - 通过 `container_service.NewBlobUploader` 创建上传器
+   - 支持 `Content-Range` 校验，保证顺序追加
+   - 数据写入临时文件 + 同步计算哈希
+
+3. **PUT `/v2/{image}/blobs/uploads/{uuid}?digest=...`** — 完成上传
+   - 校验客户端提供的 digest 与服务端计算的哈希一致
+   - 调用 `saveAsPackageBlob` 持久化
+   - 删除 `package_blob_upload` 记录
+
+**Manifest 推送（`PutManifest`）:**
+- 读取最多 10MB 的 manifest 内容
+- `processManifest` 解析并创建/关联包版本、文件、tag
+- 支持按 digest 和按 tag 两种引用方式
+
+### 4.4 各包类型 Handler 的共性模式
+
+每种包类型的 Handler 都遵循以下模式：
+
+```
+请求进入 → 协议特定解析 → packages_service 调用 → 协议特定响应
+```
+
+核心服务调用集中在 `services/packages/packages.go` 中，典型函数：
+
+| 函数 | 用途 |
+|------|------|
+| `CreatePackageAndAddFile` | 创建包+版本+文件（拒绝重复版本） |
+| `CreatePackageOrAddFileToExisting` | 创建或追加文件到已有版本 |
+| `AddFileToExistingPackage` | 向已存在的包版本追加文件 |
+| `RemovePackageVersionByNameAndVersion` | 按名称删除版本 |
+| `OpenFileForDownloadByPackageNameAndVersion` | 下载文件（含配额、计数、直链） |
+| `RemovePackage` | 删除整个包及其所有版本 |
+
+---
+
+## 五、业务服务层
+
+### 5.1 包创建核心流程 `createPackageAndAddFile`
+
+定义于 `services/packages/packages.go:85-127`，是所有包上传操作的最终汇聚点：
+
+```
+1. db.TxContext() → 开启数据库事务
+2. createPackageAndVersion() → 创建/获取 Package + PackageVersion
+   ├─ TryInsertPackage() → 幂等插入 Package（按 OwnerID+Type+LowerName 唯一）
+   ├─ 插入 PackageProperties
+   ├─ GetOrInsertVersion() → 幂等插入 PackageVersion（按 PackageID+LowerVersion 唯一）
+   ├─ CheckCountQuotaExceeded() → 校验版本数量配额
+   └─ 插入 VersionProperties
+3. addFileToPackageVersion() → 创建文件记录 + 存储 Blob
+   ├─ CheckSizeQuotaExceeded() → 校验大小配额
+   ├─ packages_model.GetOrInsertBlob() → 幂等插入 PackageBlob（按全部哈希唯一）
+   │   └─ 若 blob 不存在 → contentStore.Save() → 写入底层存储
+   ├─ 处理 OverwriteExisting 逻辑（删除旧文件记录）
+   └─ TryInsertFile() → 插入 PackageFile
+4. committer.Commit() → 提交事务
+5. 若新建版本 → notify_service.PackageCreate() → 发送通知
+```
+
+**关键设计：**
+- **Blob 去重**：`PackageBlob` 表通过 `(size, hash_md5, hash_sha1, hash_sha256, hash_sha512)` 联合唯一约束实现内容寻址，相同内容只存一次
+- **延迟存储删除**：删除包版本时不立即删除底层 blob，由 `cleanup_packages` 定时任务清理（参见 `services/packages/packages.go:487` 注释）
+- **事务保护**：整个创建过程在一个数据库事务中，任何步骤失败都会回滚，已写入的 blob 会被清理
+
+### 5.2 配额校验
+
+**数量配额** (`CheckCountQuotaExceeded`, `packages.go:330-350`)：
+```go
+if setting.Packages.LimitTotalOwnerCount > -1 {
+    totalCount := CountVersions(ownerID, isInternal=false)
+    if totalCount > LimitTotalOwnerCount → ErrQuotaTotalCount
+}
+```
+
+**大小配额** (`CheckSizeQuotaExceeded`, `packages.go:354-426`)：
+- 按包类型检查单独大小限制：`LimitSizeAlpine`, `LimitSizeContainer` 等
+- 检查全局总大小：`LimitTotalOwnerSize`
+- 管理员跳过所有检查
+
+### 5.3 包下载核心流程 `OpenBlobForDownload`
+
+定义于 `services/packages/packages.go:609-637`：
+
+```
+1. key = BlobHash256Key(pb.HashSHA256) → 构造存储键
+2. cs = NewContentStore()
+3. if cs.ShouldServeDirect():
+       u = cs.GetServeDirectURL(key, filename, method, opts)
+       → 生成预签名直链（仅 MinIO 实现，Local 返回 ErrURLNotSupported）
+4. if u == nil:
+       s = cs.OpenBlob(key) → 打开本地文件流
+5. if pf.IsLead && method == GET:
+       IncrementDownloadCounter() → 增加下载计数
+6. return (s, u, pf, nil)
+```
+
+**直链模式**：当存储为 MinIO 且 `ServeDirect` 启用时，生成 5 分钟有效的预签名 URL，客户端直接从对象存储下载，不经过 Gitea 服务器。
+
+### 5.4 包版本描述符 `PackageDescriptor`
+
+`models/packages/descriptor.go:56-71` 定义了完整的包版本描述结构：
+
+```go
+type PackageDescriptor struct {
+    Package           *Package
+    Owner             *user_model.User
+    Repository        *repo_model.Repository  // 可选关联仓库
+    Version           *PackageVersion
+    SemVer            *version.Version        // 语义版本解析
+    Creator           *user_model.User
+    PackageProperties PackagePropertyList
+    VersionProperties PackagePropertyList
+    Metadata          any                     // 类型特定的元数据
+    Files             []*PackageFileDescriptor
+}
+```
+
+元数据按包类型动态反序列化（`descriptor.go:172-226`），每种类型对应独立的元数据结构体，如 `alpine.VersionMetadata`、`container.Metadata` 等。
+
+---
+
+## 六、数据模型层
+
+### 6.1 ER 关系
+
+```
+Package (1) ──── (N) PackageVersion
+                      │
+                      ├─ (N) PackageFile ── (1) PackageBlob
+                      │
+                      └─ (N) PackageProperty (ref_type=version)
+
+Package (1) ──── (N) PackageProperty (ref_type=package)
+PackageFile (1) ─ (N) PackageProperty (ref_type=file)
+```
+
+### 6.2 核心表结构
+
+| 表 | 关键字段 | 说明 |
+|----|----------|------|
+| `package` | `id`, `owner_id`, `type`, `name`, `lower_name`, `semver_compatible`, `repo_id` | 包基本信息，按 `(owner_id, type, lower_name)` 唯一 |
+| `package_version` | `id`, `package_id`, `creator_id`, `version`, `lower_version`, `metadata_json`, `download_count`, `is_internal` | 版本信息，按 `(package_id, lower_version)` 唯一 |
+| `package_file` | `id`, `version_id`, `blob_id`, `name`, `lower_name`, `composite_key`, `is_lead` | 文件记录，按 `(version_id, lower_name, composite_key)` 唯一 |
+| `package_blob` | `id`, `size`, `hash_md5`, `hash_sha1`, `hash_sha256`, `hash_sha512` | 内容寻址 blob，按全部哈希联合唯一 |
+| `package_property` | `id`, `ref_type`, `ref_id`, `name`, `value` | 通用 KV 属性表，支持 package/version/file 三种引用 |
+| `package_blob_upload` | 容器 blob 分块上传的会话状态 | 仅 Container 类型使用 |
+
+### 6.3 Property 系统
+
+`models/packages/package_property.go` 中的三态引用：
+
+```go
+const (
+    PropertyTypePackage = "package"
+    PropertyTypeVersion = "version"
+    PropertyTypeFile    = "file"
+)
+```
+
+属性用于存储类型特定的元数据字段（如 npm 的 `dist-tags`、container 的 `digest`），避免为每种包类型创建独立数据表。
+
+---
+
+## 七、内容存储层
+
+### 7.1 ContentStore 抽象
+
+`modules/packages/content_store.go` 是 Package Registry 专有的存储门面：
+
+```go
+type ContentStore struct {
+    store storage.ObjectStorage  // 底层为 storage.Packages（全局单例）
+}
+```
+
+核心方法：
+- `Save(key BlobHash256Key, r io.Reader, size int64)` — 存储 blob
+- `OpenBlob(key)` — 打开 blob 读取流
+- `Delete(key)` — 删除 blob
+- `GetServeDirectURL(...)` — 生成预签名直链
+- `ShouldServeDirect()` — 检查是否启用直链模式
+
+### 7.2 存储路径映射
+
+键值 `aabb000000...` 被映射为目录结构 `aa/bb/aabb000000...`（`KeyToRelativePath`），避免单目录文件过多：
+
+```go
+func KeyToRelativePath(key BlobHash256Key) string {
+    return path.Join(string(key)[0:2], string(key)[2:4], string(key))
+}
+```
+
+### 7.3 ObjectStorage 接口
+
+`modules/storage/storage.go:75-100` 定义了统一的存储接口：
+
+```go
+type ObjectStorage interface {
+    Open(path string) (Object, error)
+    Save(path string, r io.Reader, size int64) (int64, error)
+    Stat(path string) (os.FileInfo, error)
+    Delete(path string) error
+    ServeDirectURL(path, name, method string, opt *ServeDirectOptions) (*url.URL, error)
+    IterateObjects(basePath string, iterator func(fullPath string, obj Object) error) error
+}
+```
+
+三种实现：
+
+| 实现 | 文件 | 存储类型 | 直链支持 |
+|------|------|----------|----------|
+| `LocalStorage` | `modules/storage/local.go` | 本地文件系统 | 否（返回 `ErrURLNotSupported`） |
+| `MinioStorage` | `modules/storage/minio.go` | S3 兼容对象存储 | 是（预签名 URL，5 分钟有效） |
+| `AzureBlobStorage` | `modules/storage/azureblob.go` | Azure Blob Storage | 是 |
+
+存储初始化在 `modules/storage/storage.go:235-243`：
+
+```go
+func initPackages() (err error) {
+    if !setting.Packages.Enabled {
+        Packages = discardStorage("Packages isn't enabled")
+        return nil
+    }
+    Packages, err = NewStorage(setting.Packages.Storage.Type, setting.Packages.Storage)
+    return err
+}
+```
+
+### 7.4 LocalStorage 实现要点
+
+`modules/storage/local.go`：
+- 根目录：`setting.Packages.Storage.Path`（绝对路径）
+- 临时目录：`{storage_root}/tmp`
+- `Save`：先写入临时文件 → `os.Rename` 原子替换 → 应用 umask（去除执行位）
+- `Delete`：删除文件后递归清理空父目录
+- `IterateObjects`：`filepath.WalkDir` 遍历
+
+### 7.5 MinioStorage 实现要点
+
+`modules/storage/minio.go`：
+- 使用 `minio-go/v7` SDK
+- 支持静态凭证、环境变量、IAM 角色等多种认证方式（`buildMinioCredentials`）
+- 连接测试：`GetBucketVersioning` 检查参数正确性
+- `ServeDirectURL`：`PresignedGetObject` / `PresignedHeadObject` 生成 5 分钟预签名 URL，可携带 `response-content-type` 和 `response-content-disposition` 参数
+
+### 7.6 Blob 上传期间的哈希计算
+
+`modules/packages/hashed_buffer.go` 定义 `HashedBuffer`：
+
+```go
+type HashedBuffer struct {
+    *filebuffer.FileBackedBuffer  // 内存→磁盘自动切换（默认 32MB 阈值）
+    hash *MultiHasher             // 同时计算 MD5/SHA1/SHA256/SHA512
+    combinedWriter io.Writer      // MultiWriter：同时写入 buffer 和 hasher
+}
+```
+
+这确保了上传流只需被读取一次，就能同时完成存储和哈希计算。
+
+---
+
+## 八、清理与维护机制
+
+### 8.1 延迟存储删除（Deferred Storage Delete）
+
+在 `services/packages/packages.go:487-488` 和 `services/packages/cleanup/cleanup.go:188-209`：
+
+```go
+// HINT: PACKAGE-DEFER-STORAGE-DELETE: Blobs are not deleted immediately,
+// instead they are deleted by the cleanup_packages cron task.
+```
+
+当删除包版本时：
+1. 只删除数据库中的 `package_version`、`package_file`、属性等记录
+2. **不删除** `package_blob` 和底层存储文件
+3. 由 `CleanupExpiredData` 定时任务扫描过期的无引用 blob
+
+### 8.2 清理任务 `CleanupTask`
+
+`services/packages/cleanup/cleanup.go:27-33` 定义了两阶段清理：
+
+```go
+func CleanupTask(ctx context.Context, olderThan time.Duration) error {
+    if err := ExecuteCleanupRules(ctx); err != nil {  // 阶段一：用户定义的清理规则
+        return err
+    }
+    return CleanupExpiredData(ctx, olderThan)       // 阶段二：过期数据清理
+}
+```
+
+**阶段一：清理规则** (`ExecuteCleanupRules`)
+- 遍历每个启用的 `PackageCleanupRule`
+- 按包类型过滤，应用 `KeepCount`、`KeepPattern`、`RemoveDays`、`RemovePattern` 等条件
+- 对 Debian/Alpine/RPM/Arch 类型，删除后重建仓库索引文件
+
+**阶段二：过期数据清理** (`CleanupExpiredData`)
+1. `container_service.Cleanup` — 清理容器上传会话
+2. `FindUnreferencedPackages` — 查找无版本引用的 Package 并删除
+3. `FindExpiredUnreferencedBlobs` — 查找 `olderThan` 之前创建且无文件引用的 Blob
+4. 从数据库删除 blob 记录 → 从存储中删除物理文件（`contentStore.Delete`）
+
+---
+
+## 九、完整链路时序图
+
+### 9.1 包上传时序
+
+```
+Client                    Router                Service                 Model              Storage
+  │                        │                     │                      │                   │
+  │  PUT /api/packages/    │                     │                      │                   │
+  │ {user}/generic/...     │                     │                      │                   │
+  │───────────────────────>│                     │                      │                   │
+  │                        │  verifyAuth         │                      │                   │
+  │                        │  (OAuth2/Basic/     │                      │                   │
+  │                        │   JWT Bearer)       │                      │                   │
+  │                        │────────────────────>│                      │                   │
+  │                        │                     │  user_model.GetUser  │                   │
+  │                        │                     │─────────────────────>│                   │
+  │                        │                     │                      │                   │
+  │                        │  reqPackageAccess   │                      │                   │
+  │                        │  (AccessModeWrite)  │                      │                   │
+  │                        │────────────────────>│                      │                   │
+  │                        │                     │  determineAccessMode │                   │
+  │                        │                     │                      │                   │
+  │                        │  UploadPackage      │                      │                   │
+  │                        │────────────────────>│                      │                   │
+  │                        │                     │  CreateHashedBuffer  │                   │
+  │                        │                     │  (读取+算哈希)        │                   │
+  │                        │                     │                      │                   │
+  │                        │                     │  CreatePackageOr     │                   │
+  │                        │                     │  AddFileToExisting   │                   │
+  │                        │                     │─────────────────────>│                   │
+  │                        │                     │                      │  TxContext         │
+  │                        │                     │                      │  TryInsertPackage  │
+  │                        │                     │                      │  GetOrInsertVersion│
+  │                        │                     │                      │  GetOrInsertBlob   │
+  │                        │                     │                      │                   │
+  │                        │                     │                      │  Save blob         │
+  │                        │                     │                      │──────────────────>│
+  │                        │                     │                      │  TryInsertFile     │
+  │                        │                     │                      │                   │
+  │                        │                     │                      │  Commit            │
+  │                        │                     │                      │                   │
+  │                        │                     │  PackageCreate (通知) │                   │
+  │                        │                     │─────────────────────>│                   │
+  │  201 Created           │                     │                      │                   │
+  │<───────────────────────│                     │                      │                   │
+```
+
+### 9.2 包下载时序
+
+```
+Client                    Router                Service                 Model              Storage
+  │                        │                     │                      │                   │
+  │  GET /api/packages/    │                     │                      │                   │
+  │ {user}/generic/...     │                     │                      │                   │
+  │───────────────────────>│                     │                      │                   │
+  │                        │  verifyAuth         │                      │                   │
+  │                        │  reqPackageAccess   │                      │                   │
+  │                        │  (AccessModeRead)   │                      │                   │
+  │                        │                      │                      │                   │
+  │                        │  DownloadPackageFile│                      │                   │
+  │                        │────────────────────>│                      │                   │
+  │                        │                     │  OpenFileForDownload │                   │
+  │                        │                     │─────────────────────>│                   │
+  │                        │                     │                      │ GetVersionByName   │
+  │                        │                     │                      │ GetFileForVersion  │
+  │                        │                     │                      │ GetBlobByID        │
+  │                        │                     │                      │                   │
+  │                        │                     │  OpenBlobForDownload │                   │
+  │                        │                     │─────────────────────>│                   │
+  │                        │                     │  ShouldServeDirect?  │                   │
+  │                        │                     │                      │                   │
+  │                        │                     │  [直链模式]           │                   │
+  │                        │                     │  GetServeDirectURL   │                   │
+  │                        │                     │─────────────────────────────────────────>│
+  │                        │                     │  返回预签名 URL       │                   │
+  │  307 Redirect          │                     │                      │                   │
+  │<───────────────────────│                     │                      │                   │
+  │                        │                     │                      │                   │
+  │  [或: 本地模式]         │                     │                      │                   │
+  │                        │                     │  OpenBlob            │                   │
+  │                        │                     │─────────────────────────────────────────>│
+  │                        │                     │  ServeContent        │                   │
+  │                        │                     │  IncrementDownload   │                   │
+  │                        │                     │  Counter             │                   │
+  │  200 OK + file body    │                     │                      │                   │
+  │<───────────────────────│                     │                      │                   │
+```
+
+---
+
+## 十、关键文件索引
+
+| 文件路径 | 职责 |
+|----------|------|
+| `routers/init.go` | 路由注册入口，挂载 `/api/packages` 和 `/v2` |
+| `routers/api/packages/api.go` | CommonRoutes/ContainerRoutes 路由构建 + reqPackageAccess/verifyAuth 中间件 |
+| `routers/api/packages/auth.go` | 自定义 JWT Bearer Token 认证（用于 conan/container） |
+| `routers/api/packages/helper/helper.go` | 统一错误处理 `ProcessErrorForUser` + 文件下载 `ServePackageFile` |
+| `routers/api/packages/generic/generic.go` | Generic 包类型 Handler（最简单的参考实现） |
+| `routers/api/packages/container/container.go` | OCI 容器镜像协议完整实现 |
+| `services/packages/auth.go` | JWT Token 签发/验证 (`CreateAuthorizationToken`/`ParseAuthorizationRequest`) |
+| `services/packages/packages.go` | 核心业务逻辑：包创建、删除、下载、配额校验 |
+| `services/packages/spec.go` | 包类型特化接口 `Specialization` + `SpecManager` 注册表 |
+| `services/packages/package_update.go` | 包与仓库的关联/解除关联 |
+| `services/packages/cleanup/cleanup.go` | 清理规则执行 + 过期数据清理 |
+| `services/context/package.go` | Package 上下文构建 + `determineAccessMode` 权限计算 |
+| `services/auth/group.go` | `auth.Group` 串行尝试多认证方法 |
+| `models/packages/package.go` | Package 模型 + 类型定义 + CRUD |
+| `models/packages/package_version.go` | PackageVersion 模型 + 搜索/计数 + 版本管理 |
+| `models/packages/package_file.go` | PackageFile 模型 + 文件搜索/配额计算 |
+| `models/packages/package_blob.go` | PackageBlob 模型 + 内容寻址 + 过期 blob 查找 |
+| `models/packages/package_property.go` | PackageProperty KV 属性 + 三态引用类型 |
+| `models/packages/descriptor.go` | PackageDescriptor 聚合视图 + 元数据反序列化 |
+| `modules/packages/content_store.go` | ContentStore 门面 + 键到路径映射 |
+| `modules/packages/hashed_buffer.go` | HashedBuffer + MultiHasher（流式多哈希计算） |
+| `modules/storage/storage.go` | ObjectStorage 接口定义 + 全局单例（Packages/LFS/Attachments...） |
+| `modules/storage/local.go` | LocalStorage 实现 |
+| `modules/storage/minio.go` | MinioStorage 实现（S3 兼容） |
+| `modules/storage/azureblob.go` | AzureBlobStorage 实现 |

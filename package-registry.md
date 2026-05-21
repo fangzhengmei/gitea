@@ -212,11 +212,185 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 
 ---
 
-## 四、各协议的匿名与认证例外路径
+## 四、匿名访问权限边界校准
+
+### 4.1 RequireSignInViewStrict 开关的精确影响
+
+`RequireSignInViewStrict` 是制品仓库匿名访问的总闸，配置项 `[service] REQUIRE_SIGNIN_VIEW = true/false`，定义于 `modules/setting/service.go:46,173-179`。
+
+**开关的三个检查点**：
+
+| 检查点 | 文件 | 逻辑 |
+|--------|------|------|
+| **1. determineAccessMode** | `services/context/package.go:117-119` | 若开关开启且 doer 为 nil/Ghost → `AccessModeNone` |
+| **2. ReqContainerAccess** | `routers/api/packages/container/container.go:142-145` | 若开关开启且 doer 为 nil/Ghost → 直接 401 |
+| **3. container.Authenticate** | `routers/api/packages/container/container.go:168-174` | 若开关开启且 doer 为 nil → 拒绝签发 Ghost Token |
+
+**开关前后的匿名访问差异对照表**：
+
+| 场景 | `RequireSignInViewStrict = false`（默认） | `RequireSignInViewStrict = true` |
+|------|------------------------------------------|----------------------------------|
+| **匿名用户（doer = nil）** | | |
+| CommonRoutes 公开包 | `AccessModeRead` → 可读取 | `AccessModeNone` → 401 |
+| CommonRoutes 私有包 | `AccessModeNone` → 401 | `AccessModeNone` → 401 |
+| Container 公开包 | 可通过 `/v2/token` 获取 Ghost Token → 可读取 | `/v2/token` 返回 401 → 完全无法访问 |
+| Container 私有包 | 即使获取 Ghost Token → `AccessModeNone` → 401 | `/v2/token` 返回 401 → 完全无法访问 |
+| **Ghost 用户（doer = GhostUser）** | | |
+| CommonRoutes 公开包 | `AccessModeRead` → 可读取 | `AccessModeNone` → 401 |
+| CommonRoutes 私有包 | `AccessModeNone` → 401 | `AccessModeNone` → 401 |
+| Container 公开包 | `AccessModeRead` → 可读取 | `ReqContainerAccess` 直接 401 |
+| Container 私有包 | `AccessModeNone` → 401 | `ReqContainerAccess` 直接 401 |
+| **写操作（PUT/POST/DELETE）** | 任何开关下，匿名用户/Ghost 用户均无法通过写操作的 `AccessMode >= Write` 检查 | 同左 |
+
+**关键澄清**：
+- 即使 `RequireSignInViewStrict = false`，**匿名用户也绝对无法写入任何包**（公开包也不行）。写入需要 `AccessMode >= Write`，而匿名用户最多只有 `AccessModeRead`。
+- 开关只影响**读权限**的判定。
+- `AccessMode` 枚举值：`None(0) < Read(1) < Write(2) < Admin(3) < Owner(4)`。
+
+### 4.2 公开包场景下的实际读写边界
+
+以下是匿名用户（未登录）对**公开个人包**（`pkgOwner.Visibility = Public`）的实际权限：
+
+| 操作 | CommonRoutes（22 种类型） | Container |
+|------|--------------------------|-----------|
+| **读取包元数据** | ✅ 允许（`AccessModeRead`） | ✅ 允许（需先获取 Ghost Token） |
+| **下载包文件** | ✅ 允许（`AccessModeRead`） | ✅ 允许（需先获取 Ghost Token） |
+| **搜索/列举包** | ✅ 允许（`AccessModeRead`） | ✅ 允许（`/_catalog` 可见公开包） |
+| **上传新版本** | ❌ 拒绝（`AccessModeRead < Write`） | ❌ 拒绝（`AccessModeRead < Write`） |
+| **删除包/版本** | ❌ 拒绝（`AccessModeRead < Write`） | ❌ 拒绝（`AccessModeRead < Write`） |
+| **覆盖文件** | ❌ 拒绝（`AccessModeRead < Write`） | ❌ 拒绝（`AccessModeRead < Write`） |
+| **修改元数据** | ❌ 拒绝（`AccessModeRead < Write`） | ❌ 拒绝（`AccessModeRead < Write`） |
+| **获取 NuGet 服务索引** | ✅ 允许（无保护端点） | N/A |
+| **获取 Swift 认证质询** | ✅ 允许（无保护端点） | N/A |
+| **获取 Vagrant 认证质询** | ✅ 允许（无保护端点） | N/A |
+
+**对组织包的匿名访问**：
+- 组织可见性为 Public → 匿名用户有 `AccessModeRead`（同公开个人包）
+- 组织可见性为 Limited → 未登录匿名用户有 `AccessModeRead`（同公开个人包），已登录非成员无
+- 组织可见性为 Private → 匿名用户 `AccessModeNone`
+
+### 4.3 写操作的双重限制机制
+
+写操作（PUT/POST/DELETE）受到**鉴权中间件**与**访问模式判定**的双重保护，即使访问模式计算出错，中间件仍然会拦截。
+
+**第一重限制：`determineAccessMode` 计算出的 `AccessMode` 本身就不允许写入**
+
+匿名用户对任何包（包括公开包）的 `AccessMode` 最大只能是 `Read`：
+```go
+// services/context/package.go:157-166
+if pkgOwner.IsOrganization() {
+    // ...
+} else {
+    if doer != nil && !doer.IsGhost() {
+        if doer.ID == pkgOwner.ID {
+            accessMode = perm.AccessModeOwner  // 仅本人能到 Owner
+        } else if pkgOwner.Visibility == structs.VisibleTypePublic || pkgOwner.Visibility == structs.VisibleTypeLimited {
+            accessMode = perm.AccessModeRead   // 他人最多 Read
+        }
+    } else if pkgOwner.Visibility == structs.VisibleTypePublic {
+        accessMode = perm.AccessModeRead       // 未登录 + 公开 → Read
+    }
+}
+```
+
+**第二重限制：`reqPackageAccess(Write)` 中间件强制检查**
+
+定义于 `routers/api/packages/api.go:41-90`：
+```go
+func reqPackageAccess(accessMode perm.AccessMode) func(ctx *context.Context) {
+    return func(ctx *context.Context) {
+        // ... Token Scope 检查（第一级） ...
+        
+        // 第二级：访问模式检查
+        if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
+            ctx.Resp.Header().Set("WWW-Authenticate", `Basic realm="Gitea Package API"`)
+            ctx.HTTPError(http.StatusUnauthorized, "reqPackageAccess", "user should have specific permission or be a site admin")
+            return
+        }
+    }
+}
+```
+
+**写操作的完整拦截逻辑**：
+
+```
+匿名用户发起 PUT /api/packages/alice/generic/pkg/1.0/file
+        │
+        ▼
+1. verifyAuth → ctx.Doer = nil, ctx.IsSigned = false
+        │
+        ▼
+2. UserAssignmentWeb → ctx.ContextUser = alice（公开用户）
+        │
+        ▼
+3. PackageAssignment
+   └─ determineAccessMode(base, alice, nil)
+      └─ pkgOwner.Public + doer=nil → AccessModeRead
+        │
+        ▼
+4. reqPackageAccess(perm.AccessModeWrite)
+   └─ ctx.Package.AccessMode (Read=1) < Write(2) → 401 Unauthorized
+        │
+        ▼
+   请求被拦截，Handler 永不执行
+```
+
+**双重校验的安全冗余**：
+- 即使 `determineAccessMode` 因某种 bug 错误返回了 `AccessModeWrite` 给匿名用户
+- `reqPackageAccess(Write)` 中的 Token Scope 检查仍然会拦截（因为 `ctx.IsSigned = false`，无 Token）
+- 并且在 CommonRoutes 的路由配置中，写操作路径显式叠加了 `reqPackageAccess(Write)` 中间件
+
+**各类型写操作的中间件保护情况**（从 `routers/api/packages/api.go` 提取）：
+
+| 包类型 | 写操作路径 | 中间件保护 |
+|--------|----------|-----------|
+| Alpine | `PUT /{branch}/{repository}` | `reqPackageAccess(Write)` |
+| | `DELETE /.../{filename}` | `reqPackageAccess(Write)` |
+| Arch | `PUT /*`, `PUT /<repository:*>` | `reqPackageAccess(Write)` |
+| | `DELETE /.../<architecture>` | `reqPackageAccess(Write)` |
+| Cargo | `PUT /api/v1/crates/new` | `reqPackageAccess(Write)` |
+| | `DELETE /.../yank`, `PUT /.../unyank` | `reqPackageAccess(Write)` |
+| Chef | `POST /api/v1/cookbooks` | `reqPackageAccess(Write)` |
+| | `DELETE /.../{version}` | `reqPackageAccess(Write)` |
+| Composer | `PUT /` | `reqPackageAccess(Write)` |
+| Conan | `DELETE /.../delete`, `POST /.../upload_urls` | `reqPackageAccess(Write)` |
+| | `PUT /.../upload` | `reqPackageAccess(Write)` |
+| Conda | `PUT /<channel:*>/<filename>` | `reqPackageAccess(Write)` |
+| CRAN | `PUT /src`, `PUT /bin` | `reqPackageAccess(Write)` |
+| Debian | `PUT /pool/.../upload` | `reqPackageAccess(Write)` |
+| | `DELETE /pool/.../{architecture}` | `reqPackageAccess(Write)` |
+| Generic | `PUT /{packagename}/{packageversion}/{filename}` | `reqPackageAccess(Write)` |
+| | `DELETE /.../{filename}` | `reqPackageAccess(Write)` |
+| Go | `PUT /upload` | `reqPackageAccess(Write)` |
+| Helm | `POST /api/charts` | `reqPackageAccess(Write)` |
+| Maven | `PUT /*` | `reqPackageAccess(Write)` |
+| npm | `PUT /@{scope}/{id}`, `PUT /{id}` | `reqPackageAccess(Write)` |
+| | `DELETE /.../-rev/{revision}` | `reqPackageAccess(Write)` |
+| NuGet | `PUT /`, `PUT /symbolpackage` | `reqPackageAccess(Write)` |
+| | `DELETE /{id}/{version}` | `reqPackageAccess(Write)` |
+| Pub | 整个 `/versions/new` Group | `reqPackageAccess(Write)` |
+| PyPI | `POST /` | `reqPackageAccess(Write)` |
+| RPM | `PUT /<group:*>/upload` | `reqPackageAccess(Write)` |
+| | `DELETE /.../<architecture>` | `reqPackageAccess(Write)` |
+| RubyGems | `POST /api/v1/gems`, `DELETE /.../yank` | `reqPackageAccess(Write)` |
+| Swift | `PUT /{scope}/{name}/<version>` | `reqPackageAccess(Write)` |
+| Terraform | `POST`, `DELETE /state/{name}` | `reqPackageAccess(Write)` |
+| | `POST/DELETE /lock` | `reqPackageAccess(Write)` |
+| Vagrant | `PUT /{name}/{version}/{provider}` | `reqPackageAccess(Write)` |
+| Container | `POST /.../blobs/uploads` | `reqPackageAccess(Write)` |
+| | `PATCH/PUT/DELETE /.../uploads/{uuid}` | `reqPackageAccess(Write)` |
+| | `DELETE /.../blobs/<digest>` | `reqPackageAccess(Write)` |
+| | `PUT/DELETE /.../manifests/<reference>` | `reqPackageAccess(Write)` |
+
+**结论**：所有 23 种包类型的所有写操作路径（共 50+ 个）都显式叠加了 `reqPackageAccess(Write)` 中间件，无任何例外。匿名用户即使绕过认证（如通过无保护的协议端点），也无法通过第二重访问模式检查。
+
+---
+
+## 五、各协议的匿名与认证例外路径
 
 不同包类型因协议规范差异，在认证上有各自的例外。以下从路由注册代码 (`routers/api/packages/api.go`) 中提取：
 
-### 4.1 标准模式（reqPackageAccess Read 在 Group 上）
+### 5.1 标准模式（reqPackageAccess Read 在 Group 上）
 
 22 种包类型（除 Container）的路由采用以下标准模式：
 
@@ -232,9 +406,9 @@ r.Group("/{username}", func() {
 
 这意味着：**所有读操作必须至少有 Read 权限，匿名用户仅能访问公开包（AccessMode = Read）**。
 
-### 4.2 例外协议详解
+### 5.2 例外协议详解
 
-#### NuGet — 服务发现端点无需认证
+#### 5.2.1 NuGet — 服务发现端点无需认证
 
 ```go
 r.Group("/nuget", func() {
@@ -257,7 +431,7 @@ r.Group("/nuget", func() {
 
 **原因**：NuGet 客户端需要先获取服务索引（Service Index）来发现可用的 API 端点，此步骤按协议规范无需认证。
 
-#### Swift — 认证检查端点无需认证
+#### 5.2.2 Swift — 认证检查端点无需认证
 
 ```go
 r.Group("/swift", func() {
@@ -273,7 +447,7 @@ r.Group("/swift", func() {
 
 **原因**：Swift Package Manager 的认证协议要求先 `POST` 检查认证状态，即使匿名用户也需要得到 401 响应以触发客户端认证流程。
 
-#### Container（OCI）— 独立的认证体系
+#### 5.2.3 Container（OCI）— 独立的认证体系
 
 Container 使用完全不同的认证流程：
 
@@ -308,10 +482,10 @@ r.Group("/{username}", func() { ... },
 
 | 配置 | 匿名访问结果 |
 |------|-------------|
-| `RequireSignInViewStrict = false`（默认） | 匿名用户可读写公开包 |
-| `RequireSignInViewStrict = true` | 匿名用户收到 401 + `WWW-Authenticate: Bearer` 头 |
+| `RequireSignInViewStrict = false`（默认） | 匿名用户可**读**公开包（写操作仍被拒绝） |
+| `RequireSignInViewStrict = true` | 匿名用户收到 401 + `WWW-Authenticate: Bearer` 头，完全无法访问 |
 
-#### Conan — 认证端点在 Read Group 内，但实际无保护
+#### 5.2.4 Conan — 认证端点在 Read Group 内，但实际无保护
 
 ```go
 r.Group("/conan", func() {
@@ -328,7 +502,7 @@ r.Group("/conan", func() {
 
 Conan 的 `authenticate` 端点返回用于后续请求的 Bearer Token。由于它在 `reqPackageAccess(Read)` 组内，匿名用户也能访问（公开包即可读）。首次认证通过 Basic Auth，后续请求使用返回的 JWT Token。
 
-#### Vagrant — 认证检查端点无保护
+#### 5.2.5 Vagrant — 认证检查端点无保护
 
 ```go
 r.Group("/vagrant", func() {
@@ -341,7 +515,7 @@ r.Group("/vagrant", func() {
 
 **原因**：Vagrant 客户端需要先检查认证状态，然后根据响应决定是否携带凭证。
 
-#### Terraform — 写操作在 Read Group 内单独保护
+#### 5.2.6 Terraform — 写操作在 Read Group 内单独保护
 
 ```go
 r.Group("/terraform/state/{name}", func() {
@@ -358,7 +532,7 @@ r.Group("/terraform/state/{name}", func() {
 }, reqPackageAccess(perm.AccessModeRead))
 ```
 
-#### Pub (Dart/Flutter) — 上传路径的 Write 保护在子 Group
+#### 5.2.7 Pub (Dart/Flutter) — 上传路径的 Write 保护在子 Group
 
 ```go
 r.Group("/pub", func() {
@@ -379,7 +553,7 @@ r.Group("/pub", func() {
 
 注意：Pub 的 `RequestUpload`（GET）获取上传临时 URL 也在 Write 保护下，因为获取上传凭证需要写权限。
 
-### 4.3 例外汇总表
+### 5.3 例外汇总表
 
 | 包类型 | 无认证保护的端点 | 原因 |
 |--------|-----------------|------|
@@ -395,9 +569,9 @@ r.Group("/pub", func() {
 
 ---
 
-## 五、协议适配层
+## 六、协议适配层
 
-### 5.1 支持的包类型（23 种）
+### 6.1 支持的包类型（23 种）
 
 在 `models/packages/package.go:32-56` 定义：
 
@@ -427,7 +601,7 @@ r.Group("/pub", func() {
 | `TypeTerraformState` | Terraform State | `/terraform` |
 | `TypeVagrant` | Vagrant Box | `/vagrant` |
 
-### 5.2 Generic 包上传链路（典型示例）
+### 6.2 Generic 包上传链路（典型示例）
 
 以 `routers/api/packages/generic/generic.go` 的 `UploadPackage` 为例，展示标准上传流程：
 
@@ -439,7 +613,7 @@ r.Group("/pub", func() {
 5. 返回 201 Created
 ```
 
-### 5.3 Container 包上传链路（OCI 协议）
+### 6.3 Container 包上传链路（OCI 协议）
 
 容器镜像走 OCI 分发规范，分为 Blob Upload 和 Manifest Push：
 
@@ -465,7 +639,7 @@ r.Group("/pub", func() {
 - `processManifest` 解析并创建/关联包版本、文件、tag
 - 支持按 digest 和按 tag 两种引用方式
 
-### 5.4 各包类型 Handler 的共性模式
+### 6.4 各包类型 Handler 的共性模式
 
 每种包类型的 Handler 都遵循以下模式：
 
@@ -486,9 +660,9 @@ r.Group("/pub", func() {
 
 ---
 
-## 六、业务服务层
+## 七、业务服务层
 
-### 6.1 包创建核心流程 `createPackageAndAddFile`
+### 7.1 包创建核心流程 `createPackageAndAddFile`
 
 定义于 `services/packages/packages.go:85-127`，是所有包上传操作的最终汇聚点：
 
@@ -515,7 +689,7 @@ r.Group("/pub", func() {
 - **延迟存储删除**：删除包版本时不立即删除底层 blob，由 `cleanup_packages` 定时任务清理（参见 `services/packages/packages.go:487` 注释）
 - **事务保护**：整个创建过程在一个数据库事务中，任何步骤失败都会回滚，已写入的 blob 会被清理
 
-### 6.2 配额校验
+### 7.2 配额校验
 
 **数量配额** (`CheckCountQuotaExceeded`, `packages.go:330-350`)：
 ```go
@@ -530,7 +704,7 @@ if setting.Packages.LimitTotalOwnerCount > -1 {
 - 检查全局总大小：`LimitTotalOwnerSize`
 - 管理员跳过所有检查
 
-### 6.3 包下载核心流程 `OpenBlobForDownload`
+### 7.3 包下载核心流程 `OpenBlobForDownload`
 
 定义于 `services/packages/packages.go:609-637`：
 
@@ -549,7 +723,7 @@ if setting.Packages.LimitTotalOwnerCount > -1 {
 
 **直链模式**：当存储为 MinIO/Azure 且 `ServeDirect` 启用时，生成 5 分钟有效的预签名 URL，客户端直接从对象存储下载，不经过 Gitea 服务器。
 
-### 6.4 包版本描述符 `PackageDescriptor`
+### 7.4 包版本描述符 `PackageDescriptor`
 
 `models/packages/descriptor.go:56-71` 定义了完整的包版本描述结构：
 
@@ -572,9 +746,9 @@ type PackageDescriptor struct {
 
 ---
 
-## 七、直链存储支持范围核对
+## 八、直链存储支持范围核对
 
-### 7.1 直链机制总览
+### 8.1 直链机制总览
 
 直链（Serve Direct）允许客户端直接从对象存储下载文件，而不经过 Gitea 服务器中转。核心决策点在 `services/packages/packages.go:609-637` 的 `OpenBlobForDownload`：
 
@@ -585,7 +759,7 @@ if cs.ShouldServeDirect() {
 }
 ```
 
-### 7.2 支持直链的存储后端
+### 8.2 支持直链的存储后端
 
 | 后端 | 文件 | `ServeDirectURL` 实现 | 预签名有效期 | 配置项 |
 |------|------|----------------------|-------------|--------|
@@ -593,11 +767,11 @@ if cs.ShouldServeDirect() {
 | **AzureBlobStorage** | `modules/storage/azureblob.go` | SAS Token 生成 | 5 分钟 | `SERVE_DIRECT` |
 | **LocalStorage** | `modules/storage/local.go` | 返回 `ErrURLNotSupported` | N/A | N/A |
 
-### 7.3 各包类型的直链支持情况
+### 8.3 各包类型的直链支持情况
 
 所有包类型的下载最终都汇聚到 `OpenBlobForDownload`，因此**理论上所有包类型都支持直链**，前提是存储后端支持。但存在以下差异：
 
-#### 标准包类型（Generic, npm, Maven, PyPI, Alpine, Arch, Cargo, Chef, Composer, Conan, Conda, CRAN, Debian, Go, Helm, Pub, RPM, RubyGems, Swift, Terraform, Vagrant）
+#### 8.3.1 标准包类型（Generic, npm, Maven, PyPI, Alpine, Arch, Cargo, Chef, Composer, Conan, Conda, CRAN, Debian, Go, Helm, Pub, RPM, RubyGems, Swift, Terraform, Vagrant）
 
 这些类型通过 `packages_service.OpenFileForDownloadByPackageNameAndVersion` → `OpenFileForDownload` → `OpenBlobForDownload` 调用链获取文件。`helper.ServePackageFile` 处理结果：
 
@@ -612,7 +786,7 @@ func ServePackageFile(ctx, s, u, pf) {
 }
 ```
 
-#### Container（OCI）
+#### 8.3.2 Container（OCI）
 
 Container 的 blob/manifest 下载通过自己的 `serveBlob` 函数 (`routers/api/packages/container/container.go:717-745`)，**不经过** `helper.ServePackageFile`：
 
@@ -638,7 +812,7 @@ func serveBlob(ctx, pfd) {
 - 传递 `ContentType` 参数到 `ServeDirectOptions`，影响预签名 URL 中的 `response-content-type`
 - 同样汇聚到 `OpenBlobForDownload`，因此后端支持情况与标准类型一致
 
-#### Head 请求（HEAD Method）
+#### 8.3.3 Head 请求（HEAD Method）
 
 `HEAD` 请求也支持直链。在 `OpenBlobForDownload` 中，`method` 参数传递给 `GetServeDirectURL`：
 
@@ -650,7 +824,7 @@ case http.MethodHead:
 
 这意味着 `HEAD /api/packages/alice/generic/.../file` 也会返回预签名 URL（作为 `Location` 头），客户端可直接用 `HEAD` 请求对象存储。
 
-### 7.4 直链启用条件
+### 8.4 直链启用条件
 
 直链需要同时满足以下所有条件：
 
@@ -671,7 +845,7 @@ MINIO_BUCKET = packages
 SERVE_DIRECT = true
 ```
 
-### 7.5 直链与下载计数
+### 8.5 直链与下载计数
 
 在 `OpenBlobForDownload` (`packages.go:631-636`)：
 
@@ -687,9 +861,9 @@ if pf.IsLead && method == http.MethodGet {
 
 ---
 
-## 八、数据模型层
+## 九、数据模型层
 
-### 8.1 ER 关系
+### 9.1 ER 关系
 
 ```
 Package (1) ──── (N) PackageVersion
@@ -702,7 +876,7 @@ Package (1) ──── (N) PackageProperty (ref_type=package)
 PackageFile (1) ─ (N) PackageProperty (ref_type=file)
 ```
 
-### 8.2 核心表结构
+### 9.2 核心表结构
 
 | 表 | 关键字段 | 说明 |
 |----|----------|------|
@@ -713,7 +887,7 @@ PackageFile (1) ─ (N) PackageProperty (ref_type=file)
 | `package_property` | `id`, `ref_type`, `ref_id`, `name`, `value` | 通用 KV 属性表，支持 package/version/file 三种引用 |
 | `package_blob_upload` | 容器 blob 分块上传的会话状态 | 仅 Container 类型使用 |
 
-### 8.3 Property 系统
+### 9.3 Property 系统
 
 `models/packages/package_property.go` 中的三态引用：
 
@@ -729,9 +903,9 @@ const (
 
 ---
 
-## 九、内容存储层
+## 十、内容存储层
 
-### 9.1 ContentStore 抽象
+### 10.1 ContentStore 抽象
 
 `modules/packages/content_store.go` 是 Package Registry 专有的存储门面：
 
@@ -748,7 +922,7 @@ type ContentStore struct {
 - `GetServeDirectURL(...)` — 生成预签名直链
 - `ShouldServeDirect()` — 检查是否启用直链模式
 
-### 9.2 存储路径映射
+### 10.2 存储路径映射
 
 键值 `aabb000000...` 被映射为目录结构 `aa/bb/aabb000000...`（`KeyToRelativePath`），避免单目录文件过多：
 
@@ -758,7 +932,7 @@ func KeyToRelativePath(key BlobHash256Key) string {
 }
 ```
 
-### 9.3 ObjectStorage 接口
+### 10.3 ObjectStorage 接口
 
 `modules/storage/storage.go:75-100` 定义了统一的存储接口：
 
@@ -794,7 +968,7 @@ func initPackages() (err error) {
 }
 ```
 
-### 9.4 LocalStorage 实现要点
+### 10.4 LocalStorage 实现要点
 
 `modules/storage/local.go`：
 - 根目录：`setting.Packages.Storage.Path`（绝对路径）
@@ -803,7 +977,7 @@ func initPackages() (err error) {
 - `Delete`：删除文件后递归清理空父目录
 - `IterateObjects`：`filepath.WalkDir` 遍历
 
-### 9.5 MinioStorage 实现要点
+### 10.5 MinioStorage 实现要点
 
 `modules/storage/minio.go`：
 - 使用 `minio-go/v7` SDK
@@ -811,7 +985,7 @@ func initPackages() (err error) {
 - 连接测试：`GetBucketVersioning` 检查参数正确性
 - `ServeDirectURL`：`PresignedGetObject` / `PresignedHeadObject` 生成 5 分钟预签名 URL，可携带 `response-content-type` 和 `response-content-disposition` 参数
 
-### 9.6 Blob 上传期间的哈希计算
+### 10.6 Blob 上传期间的哈希计算
 
 `modules/packages/hashed_buffer.go` 定义 `HashedBuffer`：
 
@@ -827,9 +1001,9 @@ type HashedBuffer struct {
 
 ---
 
-## 十、清理与维护机制
+## 十一、清理与维护机制
 
-### 10.1 延迟存储删除（Deferred Storage Delete）
+### 11.1 延迟存储删除（Deferred Storage Delete）
 
 在 `services/packages/packages.go:487-488` 和 `services/packages/cleanup/cleanup.go:188-209`：
 
@@ -843,7 +1017,7 @@ type HashedBuffer struct {
 2. **不删除** `package_blob` 和底层存储文件
 3. 由 `CleanupExpiredData` 定时任务扫描过期的无引用 blob
 
-### 10.2 清理任务 `CleanupTask`
+### 11.2 清理任务 `CleanupTask`
 
 `services/packages/cleanup/cleanup.go:27-33` 定义了两阶段清理：
 
@@ -869,9 +1043,9 @@ func CleanupTask(ctx context.Context, olderThan time.Duration) error {
 
 ---
 
-## 十一、完整链路时序图
+## 十二、完整链路时序图
 
-### 11.1 包上传时序
+### 12.1 包上传时序
 
 ```
 Client                    Router                Service                 Model              Storage
@@ -921,7 +1095,7 @@ Client                    Router                Service                 Model   
   │<───────────────────────│                     │                      │                   │
 ```
 
-### 11.2 包下载时序
+### 12.2 包下载时序
 
 ```
 Client                    Router                Service                 Model              Storage
@@ -967,7 +1141,7 @@ Client                    Router                Service                 Model   
   │<───────────────────────│                     │                      │                   │
 ```
 
-### 11.3 username → 权限决策流转图
+### 12.3 username → 权限决策流转图
 
 ```
 URL: /api/packages/{username}/{type}/{name}...
@@ -1014,7 +1188,7 @@ URL: /api/packages/{username}/{type}/{name}...
 
 ---
 
-## 十二、关键文件索引
+## 十三、关键文件索引
 
 | 文件路径 | 职责 |
 |----------|------|

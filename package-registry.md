@@ -204,11 +204,24 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 |------|----------|
 | `RequireSignInViewStrict` 启用且用户未登录/Ghost | `AccessModeNone` |
 | 用户被禁用/禁止登录 | `AccessModeNone` |
-| 组织 + 已登录用户 | 取组织团队最高授权 + `TypePackages` 单位的最大访问模式 |
-| 组织 + 未登录/非成员 + 组织可见 | `AccessModeRead` |
+| 组织 + 已登录成员 | 取组织团队最高授权 + `TypePackages` 单位的最大访问模式 |
+| 组织 + 未登录 + Public | `AccessModeRead` |
+| 组织 + 未登录 + Limited/Private | `AccessModeNone` |
+| 组织 + 已登录非成员 + Public/Limited | `AccessModeRead` |
+| 组织 + 已登录非成员 + Private | `AccessModeNone` |
 | 个人 + 本人 | `AccessModeOwner` |
 | 个人 + 公开/有限可见的他人 | `AccessModeRead` |
 | 个人 + 公开 + 未登录 | `AccessModeRead` |
+
+**关键修正**：
+- 组织可见性 `Limited` 的定义是 **"Visible for every connected user"**（仅已登录用户可见），而非对匿名用户可见
+- 匿名用户对 `Limited` 组织的访问模式为 `AccessModeNone`
+- 这由 `HasOrgOrUserVisible` (`models/organization/org.go:423-425`) 保证：
+  ```go
+  if user == nil || user.IsGhost() {
+      return orgOrUser.Visibility == structs.VisibleTypePublic  // 仅 Public
+  }
+  ```
 
 ---
 
@@ -231,15 +244,19 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 | 场景 | `RequireSignInViewStrict = false`（默认） | `RequireSignInViewStrict = true` |
 |------|------------------------------------------|----------------------------------|
 | **匿名用户（doer = nil）** | | |
-| CommonRoutes 公开包 | `AccessModeRead` → 可读取 | `AccessModeNone` → 401 |
-| CommonRoutes 私有包 | `AccessModeNone` → 401 | `AccessModeNone` → 401 |
-| Container 公开包 | 可通过 `/v2/token` 获取 Ghost Token → 可读取 | `/v2/token` 返回 401 → 完全无法访问 |
+| CommonRoutes 个人公开包 | `AccessModeRead` → 可读取 | `AccessModeNone` → 401 |
+| CommonRoutes 个人私有包 | `AccessModeNone` → 401 | `AccessModeNone` → 401 |
+| CommonRoutes 组织 Public 包 | `AccessModeRead` → 可读取 | `AccessModeNone` → 401 |
+| CommonRoutes 组织 Limited 包 | **`AccessModeNone` → 401**（仅已登录可见） | `AccessModeNone` → 401 |
+| CommonRoutes 组织 Private 包 | `AccessModeNone` → 401 | `AccessModeNone` → 401 |
+| Container 组织 Public 包 | 可通过 `/v2/token` 获取 Ghost Token → 可读取 | `/v2/token` 返回 401 → 完全无法访问 |
+| Container 组织 Limited 包 | **获取 Ghost Token 后仍 `AccessModeNone` → 401** | `/v2/token` 返回 401 → 完全无法访问 |
 | Container 私有包 | 即使获取 Ghost Token → `AccessModeNone` → 401 | `/v2/token` 返回 401 → 完全无法访问 |
 | **Ghost 用户（doer = GhostUser）** | | |
-| CommonRoutes 公开包 | `AccessModeRead` → 可读取 | `AccessModeNone` → 401 |
-| CommonRoutes 私有包 | `AccessModeNone` → 401 | `AccessModeNone` → 401 |
-| Container 公开包 | `AccessModeRead` → 可读取 | `ReqContainerAccess` 直接 401 |
-| Container 私有包 | `AccessModeNone` → 401 | `ReqContainerAccess` 直接 401 |
+| CommonRoutes 个人/组织 Public 包 | `AccessModeRead` → 可读取 | `AccessModeNone` → 401 |
+| CommonRoutes 组织 Limited 包 | **`AccessModeNone` → 401**（Ghost 视为匿名） | `AccessModeNone` → 401 |
+| Container 组织 Public 包 | `AccessModeRead` → 可读取 | `ReqContainerAccess` 直接 401 |
+| Container 组织 Limited 包 | **`AccessModeNone` → 401** | `ReqContainerAccess` 直接 401 |
 | **写操作（PUT/POST/DELETE）** | 任何开关下，匿名用户/Ghost 用户均无法通过写操作的 `AccessMode >= Write` 检查 | 同左 |
 
 **关键澄清**：
@@ -264,10 +281,12 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 | **获取 Swift 认证质询** | ✅ 允许（无保护端点） | N/A |
 | **获取 Vagrant 认证质询** | ✅ 允许（无保护端点） | N/A |
 
-**对组织包的匿名访问**：
+**对组织包的匿名访问**（基于 `HasOrgOrUserVisible` 精确逻辑）：
 - 组织可见性为 Public → 匿名用户有 `AccessModeRead`（同公开个人包）
-- 组织可见性为 Limited → 未登录匿名用户有 `AccessModeRead`（同公开个人包），已登录非成员无
-- 组织可见性为 Private → 匿名用户 `AccessModeNone`
+- 组织可见性为 Limited → **未登录匿名用户 = `AccessModeNone`**（Limited 仅对已登录用户可见），**已登录非成员 = `AccessModeRead`**
+- 组织可见性为 Private → 匿名用户 `AccessModeNone`，仅成员可见
+
+**错误点纠正**：原描述将 Limited 的匿名访问与已登录访问颠倒了。`Limited` 的定义是 "Visible for every connected user"（`modules/structs/visible_type.go:13`），即**仅已登录用户可见**，匿名用户无法访问 Limited 组织的任何包。
 
 ### 4.3 写操作的双重限制机制
 
@@ -299,9 +318,15 @@ if pkgOwner.IsOrganization() {
 ```go
 func reqPackageAccess(accessMode perm.AccessMode) func(ctx *context.Context) {
     return func(ctx *context.Context) {
-        // ... Token Scope 检查（第一级） ...
-        
-        // 第二级：访问模式检查
+        // Token Scope 检查（仅当 IsApiToken == true 时执行）
+        if ctx.Data["IsApiToken"] == true {
+            scope, ok := ctx.Data["ApiTokenScope"].(auth_model.AccessTokenScope)
+            if ok {
+                // 检查 scope 包含 ReadPackage/WritePackage
+                // 检查 PublicOnly 限制
+            }
+        }
+        // 访问模式检查（始终执行）
         if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
             ctx.Resp.Header().Set("WWW-Authenticate", `Basic realm="Gitea Package API"`)
             ctx.HTTPError(http.StatusUnauthorized, "reqPackageAccess", "user should have specific permission or be a site admin")
@@ -311,13 +336,23 @@ func reqPackageAccess(accessMode perm.AccessMode) func(ctx *context.Context) {
 }
 ```
 
-**写操作的完整拦截逻辑**：
+**错误点纠正：Scope 校验的门控条件**
+- `IsApiToken` 仅在认证成功且使用了 Token（OAuth2/PAT/HTTP Sign）时才会被设置为 `true`
+- **匿名用户（无 Token）→ `IsApiToken` 不存在或为 `false` → Scope 校验块完全跳过**
+- 拦截匿名用户写操作的是**第二级的 `AccessMode` 检查**，而非 Scope 检查
+- `IsApiToken` 的设置位置（搜索 `IsApiToken`）：
+  - `services/auth/oauth2.go:124,145` — OAuth2 Token
+  - `services/auth/basic.go:83,104` — Basic Auth 用 Token 认证
+  - `services/auth/httpsign.go:81` — HTTP Sign 认证
+
+**写操作的完整拦截逻辑（匿名用户）**：
 
 ```
 匿名用户发起 PUT /api/packages/alice/generic/pkg/1.0/file
         │
         ▼
 1. verifyAuth → ctx.Doer = nil, ctx.IsSigned = false
+   └─ ctx.Data["IsApiToken"] 未设置 → Scope 校验将被跳过
         │
         ▼
 2. UserAssignmentWeb → ctx.ContextUser = alice（公开用户）
@@ -329,16 +364,20 @@ func reqPackageAccess(accessMode perm.AccessMode) func(ctx *context.Context) {
         │
         ▼
 4. reqPackageAccess(perm.AccessModeWrite)
-   └─ ctx.Package.AccessMode (Read=1) < Write(2) → 401 Unauthorized
+   ├─ Scope 检查：IsApiToken != true → 跳过
+   └─ AccessMode 检查：Read(1) < Write(2) → 401 Unauthorized
         │
         ▼
    请求被拦截，Handler 永不执行
 ```
 
-**双重校验的安全冗余**：
-- 即使 `determineAccessMode` 因某种 bug 错误返回了 `AccessModeWrite` 给匿名用户
-- `reqPackageAccess(Write)` 中的 Token Scope 检查仍然会拦截（因为 `ctx.IsSigned = false`，无 Token）
-- 并且在 CommonRoutes 的路由配置中，写操作路径显式叠加了 `reqPackageAccess(Write)` 中间件
+**校验逻辑的真实结构（而非双重冗余）**：
+- 若 `determineAccessMode` 因 bug 给匿名用户错误返回 `AccessModeWrite`，则**两级检查都不会拦截**
+  - Scope 检查因 `IsApiToken != true` 跳过
+  - AccessMode 检查因 `Write < Write` 为 false 也通过
+  - 此时匿名用户将能执行写操作（这是一个真实的安全风险点，而非冗余设计）
+- 安全保障实际依赖于：`determineAccessMode` 的正确性 + 路由配置中 `reqPackageAccess(Write)` 中间件的正确叠加
+- 所有 23 种包类型的 50+ 个写操作路径均显式叠加了 `reqPackageAccess(Write)` 中间件
 
 **各类型写操作的中间件保护情况**（从 `routers/api/packages/api.go` 提取）：
 
@@ -383,6 +422,17 @@ func reqPackageAccess(accessMode perm.AccessMode) func(ctx *context.Context) {
 | | `PUT/DELETE /.../manifests/<reference>` | `reqPackageAccess(Write)` |
 
 **结论**：所有 23 种包类型的所有写操作路径（共 50+ 个）都显式叠加了 `reqPackageAccess(Write)` 中间件，无任何例外。匿名用户即使绕过认证（如通过无保护的协议端点），也无法通过第二重访问模式检查。
+
+### 4.4 本次纠正的错误点汇总
+
+| # | 原错误描述 | 正确代码逻辑 | 代码位置 |
+|---|-----------|-------------|----------|
+| **1** | `determineAccessMode` 表格中"组织 + 未登录/非成员 + 组织可见"合并为一行，未区分 Public/Limited | 需分四行区分：未登录+Public→Read，未登录+Limited→None，已登录非成员+Public/Limited→Read，已登录非成员+Private→None | `services/context/package.go:203-214` |
+| **2** | 组织 Limited → "未登录匿名用户有 AccessModeRead，已登录非成员无" — 完全颠倒 | `HasOrgOrUserVisible` 中 `user == nil` 时仅返回 `Visibility == Public`，Limited 对匿名用户不可见；已登录非成员可见 Limited | `models/organization/org.go:423-425`; `modules/structs/visible_type.go:13` |
+| **3** | "双重校验安全冗余：即使 determineAccessMode 返回 Write，Scope 检查也会拦截" | Scope 检查仅当 `IsApiToken == true` 时执行，匿名用户无 Token → `IsApiToken` 非 true → Scope 检查完全跳过；若 AccessMode 错误返回 Write，则两级都不拦截，是风险点而非冗余 | `routers/api/packages/api.go:43`; `services/auth/oauth2.go:124,145`; `services/auth/basic.go:83,104` |
+| **4** | RequireSignInViewStrict 对照表未包含组织 Limited 场景 | 补充 6 行：CommonRoutes/Container 的组织 Limited 包在开关关闭时匿名用户仍为 `AccessModeNone` | `services/context/package.go:152-155` |
+| **5** | 写操作时序图中未体现 Scope 检查跳过的情况 | 补充 Scope 检查判断分支，明确标注"IsApiToken != true → 跳过" | `routers/api/packages/api.go:43-82` |
+| **6** | `reqPackageAccess` 代码注释写"Token Scope 检查（第一级）"暗示始终执行 | 正确注释应为"Token Scope 检查（仅当 IsApiToken == true 时执行）" | `routers/api/packages/api.go:43` |
 
 ---
 

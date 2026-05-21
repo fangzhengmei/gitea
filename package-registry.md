@@ -90,22 +90,93 @@ return nil, retErr（全部失败）
 
 关键设计：**多种方法串行尝试**，这使得 OAuth2 和 conan.Auth 都能从 `Authorization: Bearer <token>` 头部读取 token——前者先尝试解析为 OAuth2，失败后后者再尝试解析为自定义 JWT。
 
-### 3.3 自定义 JWT Token（packages.Auth）
+### 3.3 各认证方法的细节
+
+| 方法 | 提取凭证的位置 | 验证方式 | Scope 来源 |
+|------|--------------|----------|-----------|
+| `auth.OAuth2` | `Authorization: Bearer <token>` | OAuth2 access_token → DB 查询 → 用户 | token 自身的 scope |
+| `auth.Basic` | `Authorization: Basic <base64(user:pass)>` | 优先尝试作为 access_token → 失败后尝试用户名/密码登录 | access_token 的 scope 或 `AccessTokenScopeAll` |
+| `nuget.Auth` | `X-NuGet-ApiKey` 请求头 | 作为 access_token 查询 DB | access_token 的 scope |
+| `packages.Auth` | `Authorization: Bearer <token>`（JWT） | HS256 签名验证，Claims 中含 `UserID` 和 `Scope` | JWT Claims 中的 `PackageMeta.Scope` |
+| `chef.Auth` | 请求签名（`X-Ops-Sign`、`X-Ops-Timestamp` 等头） | 用户公钥验证签名 | 空（chef 不使用 scope） |
+
+**auth.Basic.Verify 执行顺序** (`services/auth/basic.go:125-175`):
+1. 解析 `Authorization: Basic` 头
+2. 尝试将密码部分作为 **OAuth2 access_token** 查找 (`GetOAuthAccessTokenScopeAndUserID`)
+3. 失败后尝试将密码部分作为 **Personal Access Token** 查找 (`GetAccessTokenBySHA`)
+4. 失败后尝试使用 **用户名/密码登录** (`UserSignIn`)，此时需 `EnableBasicAuth` 开启
+
+### 3.4 自定义 JWT Token（packages.Auth）
 
 定义于 `routers/api/packages/auth.go:17-60` 和 `services/packages/auth.go:21-88`。
 
-**Token 签发** (`CreateAuthorizationToken`)：
+**Token 签发** (`CreateAuthorizationToken`):
 - Claims 结构：`{ UserID, Scope, ActionsUserTaskID }` + JWT 标准字段
 - 签名算法：HS256，密钥取自 `setting.GetGeneralTokenSigningSecret()`
 - 有效期：24 小时
 
-**Token 验证** (`ParseAuthorizationRequest`)：
+**Token 验证** (`ParseAuthorizationRequest`):
 1. 从 `Authorization` 头部提取 Bearer Token
 2. 解析 JWT 得到 `PackageMeta{UserID, Scope, ActionsUserTaskID}`
 3. 根据 UserID 查找用户（支持 GhostUser、ActionsUser）
 4. 将 `Scope` 写入 `store.GetData()["ApiTokenScope"]`，供后续权限校验使用
 
-### 3.4 权限校验中间件 `reqPackageAccess`
+**`AllowGhostUser` 的作用** (`routers/api/packages/auth.go:40-44`):
+- Container 路由设置 `AllowGhostUser: true`
+- 当 JWT 中 `UserID == GhostUserID`（-1）时，若 `AllowGhostUser` 为 `true` 则返回 GhostUser，否则返回 nil（继续尝试其他方法）
+- 这使得匿名用户可通过 `/v2/token` 端点获取 GhostUser 的 JWT Token
+
+### 3.5 从 username 到权限决策的完整流转
+
+这是整个认证链路中最容易混淆的部分。以下逐步拆解一个请求如 `GET /api/packages/alice/npm/mypackage` 的完整处理流程：
+
+```
+Step 1: 路由匹配
+        web.Router 将路径匹配到 r.Group("/{username}", ...)
+        → 触发 AfterRouting 中间件链
+
+Step 2: PackageContexter (AfterRouting #1)
+        创建基础 Web Context（含 BaseContext、渲染器等）
+
+Step 3: verifyAuth (AfterRouting #2)
+        3a. 遍历 auth.Method 列表（OAuth2 → Basic → NuGet → JWT → Chef）
+        3b. 第一个成功的方法返回 ctx.Doer（当前操作用户）
+        3c. 将 Scope 写入 ctx.Data["ApiTokenScope"]，标记 IsApiToken
+        3d. 若全部失败：ctx.Doer = nil, ctx.IsSigned = false
+
+Step 4: 进入 r.Group("/{username}", ...) 的处理链
+        顺序执行以下中间件：
+        4a. UserAssignmentWeb()
+            - 从 URL 提取 username = "alice"
+            - 若 ctx.Doer 的 LowerName == username → ctx.ContextUser = ctx.Doer（跳过 DB 查询）
+            - 否则 → user_model.GetUserByName(ctx, "alice") → ctx.ContextUser = 查到的用户
+            - 若用户不存在 → 尝试 LookupUserRedirect（处理用户名变更）→ 仍不存在则 404
+        4b. PackageAssignment()
+            - 用 ctx.ContextUser 作为 pkgOwner
+            - determineAccessMode(base, pkgOwner, ctx.Doer) → 计算访问模式
+            - 根据 URL 中的 type/name/version 参数加载 PackageDescriptor
+            - ctx.Package = {Owner, AccessMode, Descriptor}
+        4c. reqPackageAccess(perm.AccessModeRead)
+            - 第一级：若 IsApiToken → 检查 Scope 包含 ReadPackage → 若 PublicOnly 且 Owner 私有则 403
+            - 第二级：若 ctx.Package.AccessMode < Read 且非管理员 → 401
+```
+
+**关键区分：`ctx.Doer` vs `ctx.ContextUser` vs `ctx.Package.Owner`**
+
+| 变量 | 含义 | 来源 |
+|------|------|------|
+| `ctx.Doer` | 当前操作的用户（可能为 nil = 匿名） | auth.Group 认证结果 |
+| `ctx.ContextUser` | URL 中 `{username}` 对应的用户（包的拥有者） | `user_model.GetUserByName` 或直接复用 `ctx.Doer` |
+| `ctx.Package.Owner` | 同 `ctx.ContextUser`，用于包权限计算 | `PackageAssignment` 从 `ctx.ContextUser` 传递 |
+
+**`userAssignment` 的短路优化** (`services/context/user.go:40-63`):
+```go
+if doer != nil && strings.EqualFold(doer.LowerName, username) {
+    contextUser = doer  // 操作用户就是包拥有者，跳过 DB 查询
+}
+```
+
+### 3.6 权限校验中间件 `reqPackageAccess`
 
 定义于 `routers/api/packages/api.go:41-90`，执行两级检查：
 
@@ -124,9 +195,8 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
     // 返回 401 Unauthorized
 }
 ```
-`ctx.Package.AccessMode` 的计算逻辑见下节。
 
-### 3.5 访问模式计算 `determineAccessMode`
+### 3.7 访问模式计算 `determineAccessMode`
 
 在 `services/context/package.go:116-170`：
 
@@ -142,9 +212,192 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 
 ---
 
-## 四、协议适配层
+## 四、各协议的匿名与认证例外路径
 
-### 4.1 支持的包类型（23 种）
+不同包类型因协议规范差异，在认证上有各自的例外。以下从路由注册代码 (`routers/api/packages/api.go`) 中提取：
+
+### 4.1 标准模式（reqPackageAccess Read 在 Group 上）
+
+22 种包类型（除 Container）的路由采用以下标准模式：
+
+```go
+r.Group("/{username}", func() {
+    r.Group("/alpine", func() { ... }, reqPackageAccess(perm.AccessModeRead))
+    r.Group("/arch",   func() { ... }, reqPackageAccess(perm.AccessModeRead))
+    // ... 其他包类型
+}, context.UserAssignmentWeb(), context.PackageAssignment())
+```
+
+在这种模式下，`reqPackageAccess(Read)` 作为 **Group 级中间件** 应用于每个包类型的所有路由。写操作路径再叠加 `reqPackageAccess(Write)`。
+
+这意味着：**所有读操作必须至少有 Read 权限，匿名用户仅能访问公开包（AccessMode = Read）**。
+
+### 4.2 例外协议详解
+
+#### NuGet — 服务发现端点无需认证
+
+```go
+r.Group("/nuget", func() {
+    r.Group("", func() { // 无 reqPackageAccess，完全匿名
+        r.Get("/", nuget.ServiceIndexV2)
+        r.Get("/index.json", nuget.ServiceIndexV3)
+        r.Get("/$metadata", nuget.FeedCapabilityResource)
+    })
+    r.Group("", func() { // reqPackageAccess(Read)
+        r.Get("/query", nuget.SearchServiceV3)
+        r.Get("/registration/{id}/index.json", nuget.RegistrationIndex)
+        // ... 其他读操作
+        r.Group("", func() { // reqPackageAccess(Write)
+            r.Put("/", nuget.UploadPackage)
+            r.Delete("/{id}/{version}", nuget.DeletePackage)
+        }, reqPackageAccess(perm.AccessModeWrite))
+    }, reqPackageAccess(perm.AccessModeRead))
+})
+```
+
+**原因**：NuGet 客户端需要先获取服务索引（Service Index）来发现可用的 API 端点，此步骤按协议规范无需认证。
+
+#### Swift — 认证检查端点无需认证
+
+```go
+r.Group("/swift", func() {
+    r.Group("", func() { // 无 reqPackageAccess
+        r.Post("", swift.CheckAuthenticate)       // POST /{scope}/{name}
+        r.Post("/login", swift.CheckAuthenticate)  // POST /{scope}/{name}/login
+    })
+    r.Group("", func() { // reqPackageAccess(Read)
+        // ... 包元数据、下载、上传等操作
+    }, reqPackageAccess(perm.AccessModeRead))
+})
+```
+
+**原因**：Swift Package Manager 的认证协议要求先 `POST` 检查认证状态，即使匿名用户也需要得到 401 响应以触发客户端认证流程。
+
+#### Container（OCI）— 独立的认证体系
+
+Container 使用完全不同的认证流程：
+
+```go
+// 认证方法组：仅 Basic + JWT（无 OAuth2/NuGet/Chef）
+verifyAuth(r, []auth.Method{
+    &auth.Basic{},
+    &Auth{AllowGhostUser: true},  // ← 关键：允许 Ghost 用户
+}, ...)
+
+// 第一层中间件：ReqContainerAccess（替代 reqPackageAccess）
+r.Get("", container.ReqContainerAccess, container.DetermineSupport)
+r.Group("/token", func() { ... })
+r.Get("/_catalog", container.ReqContainerAccess, ...)
+
+// 第二层中间件：在 Group 中
+r.Group("/{username}", func() { ... },
+    container.ReqContainerAccess,
+    context.UserAssignmentWeb(),
+    context.PackageAssignment(),
+    reqPackageAccess(perm.AccessModeRead))
+```
+
+**Container 匿名访问机制：**
+
+1. `Auth{AllowGhostUser: true}` 允许 JWT 中 `UserID = GhostUserID` 通过
+2. 匿名用户访问 `/v2/token` → `container.Authenticate` 签发 GhostUser 的 JWT
+3. 后续请求携带此 JWT → `Auth.Verify` 返回 GhostUser → `ctx.Doer = GhostUser`
+4. `ReqContainerAccess` 检查：若 `RequireSignInViewStrict` 未启用，允许 GhostUser 通过
+5. `determineAccessMode` 计算：GhostUser + 公开包 → `AccessModeRead`
+6. `reqPackageAccess(Read)` 检查通过
+
+| 配置 | 匿名访问结果 |
+|------|-------------|
+| `RequireSignInViewStrict = false`（默认） | 匿名用户可读写公开包 |
+| `RequireSignInViewStrict = true` | 匿名用户收到 401 + `WWW-Authenticate: Bearer` 头 |
+
+#### Conan — 认证端点在 Read Group 内，但实际无保护
+
+```go
+r.Group("/conan", func() {
+    r.Group("/v1", func() {
+        r.Get("/ping", conan.Ping)
+        r.Group("/users", func() {
+            r.Get("/authenticate", conan.Authenticate)      // 返回 JWT Token
+            r.Get("/check_credentials", conan.CheckCredentials)
+        })
+        // ...
+    })
+}, reqPackageAccess(perm.AccessModeRead))
+```
+
+Conan 的 `authenticate` 端点返回用于后续请求的 Bearer Token。由于它在 `reqPackageAccess(Read)` 组内，匿名用户也能访问（公开包即可读）。首次认证通过 Basic Auth，后续请求使用返回的 JWT Token。
+
+#### Vagrant — 认证检查端点无保护
+
+```go
+r.Group("/vagrant", func() {
+    r.Group("/authenticate", func() {
+        r.Get("", vagrant.CheckAuthenticate)  // 无 reqPackageAccess
+    })
+    r.Group("/{name}", func() { ... }, reqPackageAccess(perm.AccessModeRead))
+}, reqPackageAccess(perm.AccessModeRead))
+```
+
+**原因**：Vagrant 客户端需要先检查认证状态，然后根据响应决定是否携带凭证。
+
+#### Terraform — 写操作在 Read Group 内单独保护
+
+```go
+r.Group("/terraform/state/{name}", func() {
+    r.Get("", terraform.GetTerraformState)                    // 读：仅需 Group 级 Read
+    r.Get("/versions/{serial}", terraform.GetTerraformStateBySerial)  // 读：仅需 Group 级 Read
+    r.Group("", func() {
+        r.Post("", terraform.UploadState)                     // 写：需 Write
+        r.Delete("", terraform.DeleteState)                   // 写：需 Write
+    }, reqPackageAccess(perm.AccessModeWrite))
+    r.Group("/lock", func() {
+        r.Post("", terraform.LockState)                       // 写：需 Write
+        r.Delete("", terraform.UnlockState)                   // 写：需 Write
+    }, reqPackageAccess(perm.AccessModeWrite))
+}, reqPackageAccess(perm.AccessModeRead))
+```
+
+#### Pub (Dart/Flutter) — 上传路径的 Write 保护在子 Group
+
+```go
+r.Group("/pub", func() {
+    r.Group("/api/packages", func() {
+        r.Group("/versions/new", func() {
+            r.Get("", pub.RequestUpload)          // 读：获取上传临时 URL
+            r.Post("/upload", pub.UploadPackageFile) // 写：实际上传
+            r.Get("/finalize/{id}/{version}", pub.FinalizePackage)
+        }, reqPackageAccess(perm.AccessModeWrite)) // 整个子 Group 需 Write
+        r.Group("/{id}", func() {
+            r.Get("", pub.EnumeratePackageVersions)    // 读
+            r.Get("/files/{version}", pub.DownloadPackageFile) // 读
+            r.Get("/{version}", pub.PackageVersionMetadata)   // 读
+        })
+    })
+}, reqPackageAccess(perm.AccessModeRead))
+```
+
+注意：Pub 的 `RequestUpload`（GET）获取上传临时 URL 也在 Write 保护下，因为获取上传凭证需要写权限。
+
+### 4.3 例外汇总表
+
+| 包类型 | 无认证保护的端点 | 原因 |
+|--------|-----------------|------|
+| **NuGet** | `GET /`, `GET /index.json`, `GET /$metadata` | 服务发现协议要求 |
+| **Swift** | `POST /`, `POST /login` | 认证检查协议要求 |
+| **Container** | `GET /v2/token`（签发 GhostUser Token） | OCI Token 认证流程 |
+| **Conan** | `GET /v1/ping`, `GET /v1/users/authenticate`, `GET /v2/ping`, `GET /v2/users/authenticate` | 认证握手协议要求（实际在 Read Group 内，匿名用户可访问公开包） |
+| **Vagrant** | `GET /authenticate` | 认证检查协议要求 |
+| **Terraform** | 无 | 全部在 Read Group 内，写操作单独加 Write |
+| **Pub** | 无 | 上传操作在 Write Group 内 |
+
+其余所有包类型（Alpine, Arch, Cargo, Chef, Composer, Conda, CRAN, Debian, Go, Generic, Helm, Maven, npm, PyPI, RPM, RubyGems）的所有端点均在 `reqPackageAccess(Read)` 保护下，无匿名例外。
+
+---
+
+## 五、协议适配层
+
+### 5.1 支持的包类型（23 种）
 
 在 `models/packages/package.go:32-56` 定义：
 
@@ -174,7 +427,7 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 | `TypeTerraformState` | Terraform State | `/terraform` |
 | `TypeVagrant` | Vagrant Box | `/vagrant` |
 
-### 4.2 Generic 包上传链路（典型示例）
+### 5.2 Generic 包上传链路（典型示例）
 
 以 `routers/api/packages/generic/generic.go` 的 `UploadPackage` 为例，展示标准上传流程：
 
@@ -186,7 +439,7 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 5. 返回 201 Created
 ```
 
-### 4.3 Container 包上传链路（OCI 协议）
+### 5.3 Container 包上传链路（OCI 协议）
 
 容器镜像走 OCI 分发规范，分为 Blob Upload 和 Manifest Push：
 
@@ -212,7 +465,7 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 - `processManifest` 解析并创建/关联包版本、文件、tag
 - 支持按 digest 和按 tag 两种引用方式
 
-### 4.4 各包类型 Handler 的共性模式
+### 5.4 各包类型 Handler 的共性模式
 
 每种包类型的 Handler 都遵循以下模式：
 
@@ -233,9 +486,9 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 
 ---
 
-## 五、业务服务层
+## 六、业务服务层
 
-### 5.1 包创建核心流程 `createPackageAndAddFile`
+### 6.1 包创建核心流程 `createPackageAndAddFile`
 
 定义于 `services/packages/packages.go:85-127`，是所有包上传操作的最终汇聚点：
 
@@ -262,7 +515,7 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 - **延迟存储删除**：删除包版本时不立即删除底层 blob，由 `cleanup_packages` 定时任务清理（参见 `services/packages/packages.go:487` 注释）
 - **事务保护**：整个创建过程在一个数据库事务中，任何步骤失败都会回滚，已写入的 blob 会被清理
 
-### 5.2 配额校验
+### 6.2 配额校验
 
 **数量配额** (`CheckCountQuotaExceeded`, `packages.go:330-350`)：
 ```go
@@ -277,7 +530,7 @@ if setting.Packages.LimitTotalOwnerCount > -1 {
 - 检查全局总大小：`LimitTotalOwnerSize`
 - 管理员跳过所有检查
 
-### 5.3 包下载核心流程 `OpenBlobForDownload`
+### 6.3 包下载核心流程 `OpenBlobForDownload`
 
 定义于 `services/packages/packages.go:609-637`：
 
@@ -286,7 +539,7 @@ if setting.Packages.LimitTotalOwnerCount > -1 {
 2. cs = NewContentStore()
 3. if cs.ShouldServeDirect():
        u = cs.GetServeDirectURL(key, filename, method, opts)
-       → 生成预签名直链（仅 MinIO 实现，Local 返回 ErrURLNotSupported）
+       → 生成预签名直链（仅 MinIO/Azure 实现，Local 返回 ErrURLNotSupported）
 4. if u == nil:
        s = cs.OpenBlob(key) → 打开本地文件流
 5. if pf.IsLead && method == GET:
@@ -294,9 +547,9 @@ if setting.Packages.LimitTotalOwnerCount > -1 {
 6. return (s, u, pf, nil)
 ```
 
-**直链模式**：当存储为 MinIO 且 `ServeDirect` 启用时，生成 5 分钟有效的预签名 URL，客户端直接从对象存储下载，不经过 Gitea 服务器。
+**直链模式**：当存储为 MinIO/Azure 且 `ServeDirect` 启用时，生成 5 分钟有效的预签名 URL，客户端直接从对象存储下载，不经过 Gitea 服务器。
 
-### 5.4 包版本描述符 `PackageDescriptor`
+### 6.4 包版本描述符 `PackageDescriptor`
 
 `models/packages/descriptor.go:56-71` 定义了完整的包版本描述结构：
 
@@ -319,9 +572,124 @@ type PackageDescriptor struct {
 
 ---
 
-## 六、数据模型层
+## 七、直链存储支持范围核对
 
-### 6.1 ER 关系
+### 7.1 直链机制总览
+
+直链（Serve Direct）允许客户端直接从对象存储下载文件，而不经过 Gitea 服务器中转。核心决策点在 `services/packages/packages.go:609-637` 的 `OpenBlobForDownload`：
+
+```go
+if cs.ShouldServeDirect() {
+    u, err = cs.GetServeDirectURL(key, pf.Name, method, serveDirectReqParams)
+    // 若返回 ErrURLNotSupported → 回退到本地读取
+}
+```
+
+### 7.2 支持直链的存储后端
+
+| 后端 | 文件 | `ServeDirectURL` 实现 | 预签名有效期 | 配置项 |
+|------|------|----------------------|-------------|--------|
+| **MinioStorage** | `modules/storage/minio.go` | `PresignedGetObject` / `PresignedHeadObject` | 5 分钟 (`ServeDirectDefaultMinExpiry`) | `SERVE_DIRECT` |
+| **AzureBlobStorage** | `modules/storage/azureblob.go` | SAS Token 生成 | 5 分钟 | `SERVE_DIRECT` |
+| **LocalStorage** | `modules/storage/local.go` | 返回 `ErrURLNotSupported` | N/A | N/A |
+
+### 7.3 各包类型的直链支持情况
+
+所有包类型的下载最终都汇聚到 `OpenBlobForDownload`，因此**理论上所有包类型都支持直链**，前提是存储后端支持。但存在以下差异：
+
+#### 标准包类型（Generic, npm, Maven, PyPI, Alpine, Arch, Cargo, Chef, Composer, Conan, Conda, CRAN, Debian, Go, Helm, Pub, RPM, RubyGems, Swift, Terraform, Vagrant）
+
+这些类型通过 `packages_service.OpenFileForDownloadByPackageNameAndVersion` → `OpenFileForDownload` → `OpenBlobForDownload` 调用链获取文件。`helper.ServePackageFile` 处理结果：
+
+```go
+func ServePackageFile(ctx, s, u, pf) {
+    if u != nil {
+        ctx.Redirect(u.String())  // 302 重定向到直链
+        return
+    }
+    // 本地读取
+    ctx.ServeContent(s, opts)
+}
+```
+
+#### Container（OCI）
+
+Container 的 blob/manifest 下载通过自己的 `serveBlob` 函数 (`routers/api/packages/container/container.go:717-745`)，**不经过** `helper.ServePackageFile`：
+
+```go
+func serveBlob(ctx, pfd) {
+    s, u, _, err := packages_service.OpenBlobForDownload(ctx, pfd.File, pfd.Blob,
+        ctx.Req.Method, &storage.ServeDirectOptions{
+            ContentType: pfd.Properties.GetByName(container_module.PropertyMediaType),
+        })
+    if u != nil {
+        // 307 Temporary Redirect（OCI 规范要求）
+        headers.Status = http.StatusTemporaryRedirect
+        headers.Location = u.String()
+        return
+    }
+    // 本地读取
+    io.Copy(ctx.Resp, s)
+}
+```
+
+**Container 直链的特殊之处：**
+- 重定向使用 **307 Temporary Redirect**（OCI 分发规范要求），而非 302
+- 传递 `ContentType` 参数到 `ServeDirectOptions`，影响预签名 URL 中的 `response-content-type`
+- 同样汇聚到 `OpenBlobForDownload`，因此后端支持情况与标准类型一致
+
+#### Head 请求（HEAD Method）
+
+`HEAD` 请求也支持直链。在 `OpenBlobForDownload` 中，`method` 参数传递给 `GetServeDirectURL`：
+
+```go
+// MinioStorage 中的实现
+case http.MethodHead:
+    u, err = s.core.PresignedHeadObject(s.bucket, path, opts)
+```
+
+这意味着 `HEAD /api/packages/alice/generic/.../file` 也会返回预签名 URL（作为 `Location` 头），客户端可直接用 `HEAD` 请求对象存储。
+
+### 7.4 直链启用条件
+
+直链需要同时满足以下所有条件：
+
+| 条件 | 检查位置 | 说明 |
+|------|----------|------|
+| `setting.Packages.Storage.ServeDirect()` | `ShouldServeDirect()` | 存储配置中 `SERVE_DIRECT = true` |
+| 存储后端实现 `ServeDirectURL` | `GetServeDirectURL()` | LocalStorage 始终返回 `ErrURLNotSupported` |
+| 无错误 | `OpenBlobForDownload` | 若生成预签名 URL 出错，回退到本地读取 |
+
+**配置示例（MinIO）：**
+```ini
+[packages]
+STORAGE_TYPE = minio
+MINIO_ENDPOINT = s3.amazonaws.com
+MINIO_ACCESS_KEY_ID = ...
+MINIO_SECRET_ACCESS_KEY = ...
+MINIO_BUCKET = packages
+SERVE_DIRECT = true
+```
+
+### 7.5 直链与下载计数
+
+在 `OpenBlobForDownload` (`packages.go:631-636`)：
+
+```go
+if pf.IsLead && method == http.MethodGet {
+    if err := packages_model.IncrementDownloadCounter(ctx, pf.VersionID); err != nil {
+        log.Error("Error incrementing download counter: %v", err)
+    }
+}
+```
+
+**重要**：直链模式下下载计数仍然准确——计数在返回预签名 URL 之前就已增加，无论客户端是否实际完成下载。
+
+---
+
+## 八、数据模型层
+
+### 8.1 ER 关系
 
 ```
 Package (1) ──── (N) PackageVersion
@@ -334,7 +702,7 @@ Package (1) ──── (N) PackageProperty (ref_type=package)
 PackageFile (1) ─ (N) PackageProperty (ref_type=file)
 ```
 
-### 6.2 核心表结构
+### 8.2 核心表结构
 
 | 表 | 关键字段 | 说明 |
 |----|----------|------|
@@ -345,7 +713,7 @@ PackageFile (1) ─ (N) PackageProperty (ref_type=file)
 | `package_property` | `id`, `ref_type`, `ref_id`, `name`, `value` | 通用 KV 属性表，支持 package/version/file 三种引用 |
 | `package_blob_upload` | 容器 blob 分块上传的会话状态 | 仅 Container 类型使用 |
 
-### 6.3 Property 系统
+### 8.3 Property 系统
 
 `models/packages/package_property.go` 中的三态引用：
 
@@ -361,9 +729,9 @@ const (
 
 ---
 
-## 七、内容存储层
+## 九、内容存储层
 
-### 7.1 ContentStore 抽象
+### 9.1 ContentStore 抽象
 
 `modules/packages/content_store.go` 是 Package Registry 专有的存储门面：
 
@@ -380,7 +748,7 @@ type ContentStore struct {
 - `GetServeDirectURL(...)` — 生成预签名直链
 - `ShouldServeDirect()` — 检查是否启用直链模式
 
-### 7.2 存储路径映射
+### 9.2 存储路径映射
 
 键值 `aabb000000...` 被映射为目录结构 `aa/bb/aabb000000...`（`KeyToRelativePath`），避免单目录文件过多：
 
@@ -390,7 +758,7 @@ func KeyToRelativePath(key BlobHash256Key) string {
 }
 ```
 
-### 7.3 ObjectStorage 接口
+### 9.3 ObjectStorage 接口
 
 `modules/storage/storage.go:75-100` 定义了统一的存储接口：
 
@@ -426,7 +794,7 @@ func initPackages() (err error) {
 }
 ```
 
-### 7.4 LocalStorage 实现要点
+### 9.4 LocalStorage 实现要点
 
 `modules/storage/local.go`：
 - 根目录：`setting.Packages.Storage.Path`（绝对路径）
@@ -435,7 +803,7 @@ func initPackages() (err error) {
 - `Delete`：删除文件后递归清理空父目录
 - `IterateObjects`：`filepath.WalkDir` 遍历
 
-### 7.5 MinioStorage 实现要点
+### 9.5 MinioStorage 实现要点
 
 `modules/storage/minio.go`：
 - 使用 `minio-go/v7` SDK
@@ -443,7 +811,7 @@ func initPackages() (err error) {
 - 连接测试：`GetBucketVersioning` 检查参数正确性
 - `ServeDirectURL`：`PresignedGetObject` / `PresignedHeadObject` 生成 5 分钟预签名 URL，可携带 `response-content-type` 和 `response-content-disposition` 参数
 
-### 7.6 Blob 上传期间的哈希计算
+### 9.6 Blob 上传期间的哈希计算
 
 `modules/packages/hashed_buffer.go` 定义 `HashedBuffer`：
 
@@ -459,9 +827,9 @@ type HashedBuffer struct {
 
 ---
 
-## 八、清理与维护机制
+## 十、清理与维护机制
 
-### 8.1 延迟存储删除（Deferred Storage Delete）
+### 10.1 延迟存储删除（Deferred Storage Delete）
 
 在 `services/packages/packages.go:487-488` 和 `services/packages/cleanup/cleanup.go:188-209`：
 
@@ -475,7 +843,7 @@ type HashedBuffer struct {
 2. **不删除** `package_blob` 和底层存储文件
 3. 由 `CleanupExpiredData` 定时任务扫描过期的无引用 blob
 
-### 8.2 清理任务 `CleanupTask`
+### 10.2 清理任务 `CleanupTask`
 
 `services/packages/cleanup/cleanup.go:27-33` 定义了两阶段清理：
 
@@ -501,9 +869,9 @@ func CleanupTask(ctx context.Context, olderThan time.Duration) error {
 
 ---
 
-## 九、完整链路时序图
+## 十一、完整链路时序图
 
-### 9.1 包上传时序
+### 11.1 包上传时序
 
 ```
 Client                    Router                Service                 Model              Storage
@@ -518,10 +886,15 @@ Client                    Router                Service                 Model   
   │                        │                     │  user_model.GetUser  │                   │
   │                        │                     │─────────────────────>│                   │
   │                        │                     │                      │                   │
+  │                        │  UserAssignmentWeb  │                      │                   │
+  │                        │  (username→user)    │                      │                   │
+  │                        │                     │                      │                   │
+  │                        │  PackageAssignment  │                      │                   │
+  │                        │  (determineAccess-  │                      │                   │
+  │                        │   Mode)             │                      │                   │
+  │                        │                     │                      │                   │
   │                        │  reqPackageAccess   │                      │                   │
   │                        │  (AccessModeWrite)  │                      │                   │
-  │                        │────────────────────>│                      │                   │
-  │                        │                     │  determineAccessMode │                   │
   │                        │                     │                      │                   │
   │                        │  UploadPackage      │                      │                   │
   │                        │────────────────────>│                      │                   │
@@ -548,7 +921,7 @@ Client                    Router                Service                 Model   
   │<───────────────────────│                     │                      │                   │
 ```
 
-### 9.2 包下载时序
+### 11.2 包下载时序
 
 ```
 Client                    Router                Service                 Model              Storage
@@ -557,6 +930,8 @@ Client                    Router                Service                 Model   
   │ {user}/generic/...     │                     │                      │                   │
   │───────────────────────>│                     │                      │                   │
   │                        │  verifyAuth         │                      │                   │
+  │                        │  UserAssignmentWeb  │                      │                   │
+  │                        │  PackageAssignment  │                      │                   │
   │                        │  reqPackageAccess   │                      │                   │
   │                        │  (AccessModeRead)   │                      │                   │
   │                        │                      │                      │                   │
@@ -576,7 +951,10 @@ Client                    Router                Service                 Model   
   │                        │                     │  GetServeDirectURL   │                   │
   │                        │                     │─────────────────────────────────────────>│
   │                        │                     │  返回预签名 URL       │                   │
+  │  302 Redirect          │                     │                      │                   │
+  │  (标准类型)            │                     │                      │                   │
   │  307 Redirect          │                     │                      │                   │
+  │  (Container)           │                     │                      │                   │
   │<───────────────────────│                     │                      │                   │
   │                        │                     │                      │                   │
   │  [或: 本地模式]         │                     │                      │                   │
@@ -589,9 +967,54 @@ Client                    Router                Service                 Model   
   │<───────────────────────│                     │                      │                   │
 ```
 
+### 11.3 username → 权限决策流转图
+
+```
+URL: /api/packages/{username}/{type}/{name}...
+         │
+         ▼
+  ┌──────────────────────┐
+  │ 1. AfterRouting      │ 路由匹配成功，按顺序执行 AfterRouting 中间件
+  │ ├─ PackageContexter  │ 创建 BaseContext + WebContext
+  │ └─ verifyAuth        │ auth.Group 串行尝试 → ctx.Doer, ctx.IsSigned
+  └──────────────────────┘
+         │
+         ▼
+  ┌──────────────────────┐
+  │ 2. Group("{username}")│ 进入包所有者路由组
+  │ ├─ UserAssignmentWeb │
+  │ │   ├─ ctx.Doer.Name │
+  │ │   │   == username? │ → ctx.ContextUser = ctx.Doer（短路优化）
+  │ │   └─ 否则          │ → user_model.GetUserByName(username)
+  │ │                     │   失败 → 404 Not Found
+  │ │
+  │ ├─ PackageAssignment │
+  │ │   └─ determineAccessMode(base, pkgOwner, doer)
+  │ │       ├─ RequireSignInViewStrict + 未登录 → None
+  │ │       ├─ 组织 + 已登录 → 团队最高权限 + TypePackages
+  │ │       ├─ 组织 + 未登录 + 可见 → Read
+  │ │       ├─ 个人 + 本人 → Owner
+  │ │       ├─ 个人 + 公开他人 → Read
+  │ │       └─ 个人 + 公开 + 未登录 → Read
+  │ │
+  │ └─ reqPackageAccess   │
+  │     ├─ IsApiToken?    │ → 检查 Scope (ReadPackage/WritePackage)
+  │     │   └─ PublicOnly + 私有Owner → 403
+  │     └─ AccessMode <   │ → 401 Unauthorized
+  │       required?       │   (除非 SiteAdmin)
+  └──────────────────────┘
+         │
+         ▼
+  ┌──────────────────────┐
+  │ 3. Handler 执行       │ 协议特定逻辑
+  │   └─ 调用 services/   │
+  │     packages/*        │
+  └──────────────────────┘
+```
+
 ---
 
-## 十、关键文件索引
+## 十二、关键文件索引
 
 | 文件路径 | 职责 |
 |----------|------|
@@ -600,14 +1023,19 @@ Client                    Router                Service                 Model   
 | `routers/api/packages/auth.go` | 自定义 JWT Bearer Token 认证（用于 conan/container） |
 | `routers/api/packages/helper/helper.go` | 统一错误处理 `ProcessErrorForUser` + 文件下载 `ServePackageFile` |
 | `routers/api/packages/generic/generic.go` | Generic 包类型 Handler（最简单的参考实现） |
-| `routers/api/packages/container/container.go` | OCI 容器镜像协议完整实现 |
+| `routers/api/packages/container/container.go` | OCI 容器镜像协议完整实现 + ReqContainerAccess + Authenticate |
+| `routers/api/packages/nuget/auth.go` | NuGet 专用 API Key 认证（X-NuGet-ApiKey 头） |
+| `routers/api/packages/chef/auth.go` | Chef 专用签名认证 |
 | `services/packages/auth.go` | JWT Token 签发/验证 (`CreateAuthorizationToken`/`ParseAuthorizationRequest`) |
 | `services/packages/packages.go` | 核心业务逻辑：包创建、删除、下载、配额校验 |
 | `services/packages/spec.go` | 包类型特化接口 `Specialization` + `SpecManager` 注册表 |
 | `services/packages/package_update.go` | 包与仓库的关联/解除关联 |
 | `services/packages/cleanup/cleanup.go` | 清理规则执行 + 过期数据清理 |
 | `services/context/package.go` | Package 上下文构建 + `determineAccessMode` 权限计算 |
+| `services/context/user.go` | `UserAssignmentWeb` + `userAssignment` username → ContextUser 映射 |
 | `services/auth/group.go` | `auth.Group` 串行尝试多认证方法 |
+| `services/auth/basic.go` | Basic Auth 实现（含 `GetAccessScope` scope 推断） |
+| `services/auth/oauth2.go` | OAuth2 Token 认证实现 |
 | `models/packages/package.go` | Package 模型 + 类型定义 + CRUD |
 | `models/packages/package_version.go` | PackageVersion 模型 + 搜索/计数 + 版本管理 |
 | `models/packages/package_file.go` | PackageFile 模型 + 文件搜索/配额计算 |

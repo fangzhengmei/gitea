@@ -213,7 +213,73 @@ type Notifier interface {
 
 **职责**：为用户创建系统通知（带未读状态）。
 
-#### 3.2.1 异步队列架构
+#### 3.2.1 评论通知触发门禁
+
+在业务操作层（`services/issue/comments.go:61-65`）存在用户屏蔽检查门禁：
+
+```go
+func CreateIssueComment(ctx context.Context, doer *user_model.User, repo *repo_model.Repository, issue *issues_model.Issue, content string, attachments []string) (*issues_model.Comment, error) {
+    if user_model.IsUserBlockedBy(ctx, doer, issue.PosterID, repo.OwnerID) {
+        if isAdmin, _ := access_model.IsUserRepoAdmin(ctx, repo, doer); !isAdmin {
+            return nil, user_model.ErrBlockedUser
+        }
+    }
+    // ... 创建评论
+    notify_service.CreateIssueComment(ctx, doer, repo, issue, comment, mentions)  // 只有门禁通过才会触发
+    return comment, nil
+}
+```
+
+**门禁逻辑**：
+- 检查 `doer`（评论者）是否被 `issue.PosterID`（发帖人）屏蔽
+- 如果被屏蔽且 `doer` 不是仓库管理员，则直接返回 `ErrBlockedUser` 错误
+- 此时 `notify_service.CreateIssueComment` 不会被调用，通知完全不会产生
+
+#### 3.2.2 Pending Review Comment 场景跳过
+
+代码评论（`CommentTypeCode`）在 pending review 状态下不会触发通知，直到用户提交评审。
+
+**代码注释明示**（`services/pull/review.go:203`）：
+```go
+// NOTICE: if it's a pending review the notifications will not be fired until user submit review.
+```
+
+**跳过逻辑**（`services/pull/review.go:165-205`）：
+```go
+func CreateCodeComment(ctx context.Context, ..., pendingReview bool, ...) (*issues_model.Comment, error) {
+    // ... 
+    // 当 pendingReview=true 时，只创建评论但不调用 notify_service.CreateIssueComment
+    // 当 pendingReview=false 且不是回复时，立即提交评审并触发通知
+    if !pendingReview && !existsReview {
+        if _, _, err = SubmitReview(ctx, doer, gitRepo, issue, issues_model.ReviewTypeComment, "", latestCommitID, nil); err != nil {
+            return nil, err
+        }
+    }
+    // NOTICE: if it's a pending review the notifications will not be fired until user submit review.
+    return comment, nil
+}
+```
+
+**延迟通知触发点**（`services/pull/review.go:350-362`）：
+```go
+func SubmitReview(ctx context.Context, ...) (*issues_model.Review, *issues_model.Comment, error) {
+    // ...
+    notify_service.PullRequestReview(ctx, pr, review, comm, mentions)  // 评审总评通知
+    
+    // 遍历所有代码评论，逐个触发通知
+    for _, lines := range review.CodeComments {
+        for _, comments := range lines {
+            for _, codeComment := range comments {
+                mentions, err := issues_model.FindAndUpdateIssueMentions(ctx, issue, doer, codeComment.Content)
+                notify_service.PullRequestCodeComment(ctx, pr, codeComment, mentions)
+            }
+        }
+    }
+    return review, comm, nil
+}
+```
+
+#### 3.2.3 异步队列架构
 
 **队列创建**（`services/uinotification/notify.go:44-51`）：
 ```go
@@ -228,16 +294,130 @@ func NewNotifier() notify_service.Notifier {
 }
 ```
 
-**入队操作**（`services/uinotification/notify.go:76`）：
+**入队操作**（`services/uinotification/notify.go:76, 86, 91, 96, 105, 118, 126, 163, 179`）：
 ```go
 _ = ns.issueQueue.Push(issueNotificationOpts{
     IssueID:              issue.ID,
     NotificationAuthorID: doer.ID,
     CommentID:            comment.ID,
+    // ReceiverID: mention.ID,  // 可选：定向通知
 })
 ```
 
-#### 3.2.2 WorkerPoolQueue 工作机制
+#### 3.2.4 Push 返回值被忽略的可靠性影响
+
+**Push 方法签名**（`modules/queue/workerqueue.go:166-176`）：
+```go
+// Push adds an item to the queue, it may block for a while and then returns an error if the queue is full
+func (q *WorkerPoolQueue[T]) Push(data T) error {
+    if q.isBaseQueueDummy() && q.safeHandler != nil {
+        if data, ok := q.unmarshal(q.marshal(data)); ok {
+            q.safeHandler(data)
+        }
+    }
+    return q.baseQueue.PushItem(q.ctxRun, q.marshal(data))
+}
+```
+
+**Push 可能返回的错误**（各 baseQueue 实现）：
+- `errChannelClosed` - 队列通道已关闭（`base_channel.go:45`）
+- `ErrAlreadyInQueue` - 重复条目（`base_channel.go:53`）
+- 阻塞超时错误（队列满时重试超时，`base_levelqueue_common.go:34-43`）
+- Redis 连接错误（`base_redis.go:55-65`）
+
+**调用处全部忽略返回值**（`services/uinotification/notify.go` 中所有 8 处 Push 调用）：
+```go
+_ = ns.issueQueue.Push(opts)  // 错误被静默丢弃
+```
+
+**可靠性影响**（代码可证实）：
+1. **无重试机制**：错误发生时，该通知直接丢失，不会重试
+2. **无调用方感知**：业务操作正常返回，但通知未入队
+3. **队列满时丢失**：队列达到配置上限时，新通知被丢弃且无日志记录
+4. **静默失败**：Push 返回值被 `_` 忽略，错误无任何追踪
+
+#### 3.2.5 ReceiverID 定向通知 vs 全量 Watcher 路径
+
+`CreateOrUpdateIssueNotifications` 函数有两个完全独立的代码分支，由 `receiverID` 参数控制。
+
+**函数签名**（`models/activities/notification_list.go:71-76`）：
+```go
+// receiverID > 0 just send to receiver, else send to all watcher
+func CreateOrUpdateIssueNotifications(ctx context.Context, issueID, commentID, notificationAuthorID, receiverID int64) error {
+    return db.WithTx(ctx, func(ctx context.Context) error {
+        return createOrUpdateIssueNotifications(ctx, issueID, commentID, notificationAuthorID, receiverID)
+    })
+}
+```
+
+**分支差异对比**：
+
+| 维度 | receiverID > 0（定向通知） | receiverID = 0（全量路径） |
+|------|-------------------------|------------------------|
+| **触发场景** | @提及、被指派、代码评论 | 普通评论、状态变更、新建 Issue |
+| **调用来源** | `services/uinotification/notify.go:77-87`（mentions 循环） | `services/uinotification/notify.go:76`（主路径） |
+| **候选接收者** | 仅指定的 `receiverID` 一人 | Issue关注者 + 仓库关注者 + 参与者 |
+| **排除触发者** | ❌ 不执行（只通知指定人） | ✅ 执行 `delete(toNotify, notificationAuthorID)` |
+| **排除取消关注** | ❌ 不执行 | ✅ 执行 `toNotify.Remove(id)` 循环 |
+| **权限校验** | ✅ 仍执行（第 144-149 行） | ✅ 执行（第 144-149 行） |
+| **去重逻辑** | ✅ 同一 Issue 单条记录 | ✅ 同一 Issue 单条记录 |
+
+**定向通知分支代码**（`models/activities/notification_list.go:93-95`）：
+```go
+if receiverID > 0 {
+    toNotify = make(container.Set[int64], 1)
+    toNotify.Add(receiverID)  // 只加指定用户，跳过后续收集逻辑
+}
+```
+
+**全量路径分支代码**（`models/activities/notification_list.go:96-126`）：
+```go
+} else {
+    toNotify = make(container.Set[int64], 32)
+    issueWatches, _ := issues_model.GetIssueWatchersIDs(ctx, issueID, true)
+    toNotify.AddMultiple(issueWatches...)  // 1. Issue 关注者
+    
+    if !(issue.IsPull && issues_model.HasWorkInProgressPrefix(issue.Title)) {
+        repoWatches, _ := repo_model.GetRepoWatchersIDs(ctx, issue.RepoID)
+        toNotify.AddMultiple(repoWatches...)  // 2. 仓库关注者（排除 WIP PR）
+    }
+    
+    issueParticipants, _ := issue.GetParticipantIDsByIssue(ctx)
+    toNotify.AddMultiple(issueParticipants...)  // 3. Issue 参与者
+    
+    delete(toNotify, notificationAuthorID)  // 排除触发者
+    
+    issueUnWatches, _ := issues_model.GetIssueWatchersIDs(ctx, issueID, false)
+    for _, id := range issueUnWatches {
+        toNotify.Remove(id)  // 排除取消关注的用户
+    }
+}
+```
+
+**入队时的分支触发**（`services/uinotification/notify.go:66-88`）：
+```go
+func (ns *notificationService) CreateIssueComment(ctx context.Context, doer *user_model.User, ..., mentions []*user_model.User) {
+    // 1. 全量路径：通知所有 watcher（receiverID = 0）
+    opts := issueNotificationOpts{
+        IssueID:              issue.ID,
+        NotificationAuthorID: doer.ID,
+        // 没有设置 ReceiverID，默认为 0
+    }
+    _ = ns.issueQueue.Push(opts)  // 触发全量路径
+    
+    // 2. 定向路径：为每个 @提及用户单独入队（receiverID > 0）
+    for _, mention := range mentions {
+        opts := issueNotificationOpts{
+            IssueID:              issue.ID,
+            NotificationAuthorID: doer.ID,
+            ReceiverID:           mention.ID,  // 设置定向用户
+        }
+        _ = ns.issueQueue.Push(opts)  // 触发定向路径
+    }
+}
+```
+
+#### 3.2.6 WorkerPoolQueue 工作机制
 
 **核心结构**（`modules/queue/workerqueue.go:22-45`）：
 ```go
@@ -272,60 +452,37 @@ type WorkerPoolQueue[T any] struct {
    ```go
    func handler(items ...issueNotificationOpts) []issueNotificationOpts {
        for _, opts := range items {
-           CreateOrUpdateIssueNotifications(ctx, opts.IssueID, ...)
+           CreateOrUpdateIssueNotifications(ctx, opts.IssueID, opts.CommentID,
+               opts.NotificationAuthorID, opts.ReceiverID)
        }
        return nil
    }
    ```
 
-#### 3.2.3 订阅匹配逻辑
+#### 3.2.7 订阅匹配逻辑
 
-**匹配流程**（`models/activities/notification_list.go:72-162`）：
+**匹配流程**（`models/activities/notification_list.go:128-162`）：
 
-1. **收集候选接收者**：
+无论定向还是全量路径，后续步骤一致：
+
+1. **加载仓库**：
    ```go
-   if receiverID > 0 {
-       // 指定接收者（如 @提及、被指派）
-       toNotify.Add(receiverID)
-   } else {
-       // 1. Issue 关注者（显式关注）
-       issueWatches, _ := issues_model.GetIssueWatchersIDs(ctx, issueID, true)
-       toNotify.AddMultiple(issueWatches...)
-       
-       // 2. 仓库关注者（排除 WIP PR）
-       if !(issue.IsPull && issues_model.HasWorkInProgressPrefix(issue.Title)) {
-           repoWatches, _ := repo_model.GetRepoWatchersIDs(ctx, issue.RepoID)
-           toNotify.AddMultiple(repoWatches...)
+   err = issue.LoadRepo(ctx)
+   ```
+
+2. **权限二次校验**（定向路径也执行）：
+   ```go
+   for userID := range toNotify {
+       user, err := user_model.GetUserByID(ctx, userID)
+       if issue.IsPull && !access_model.CheckRepoUnitUser(ctx, issue.Repo, user, unit.TypePullRequests) {
+           continue
        }
-       
-       // 3. Issue 参与者（发帖人、评论人等）
-       issueParticipants, _ := issue.GetParticipantIDsByIssue(ctx)
-       toNotify.AddMultiple(issueParticipants...)
-   }
+       if !issue.IsPull && !access_model.CheckRepoUnitUser(ctx, issue.Repo, user, unit.TypeIssues) {
+           continue
+       }
    ```
 
-2. **排除过滤**：
-   ```go
-   delete(toNotify, notificationAuthorID)  // 不通知触发者
-   
-   // 移除显式取消关注 Issue 的用户
-   issueUnWatches, _ := issues_model.GetIssueWatchersIDs(ctx, issueID, false)
-   for _, id := range issueUnWatches {
-       toNotify.Remove(id)
-   }
-   ```
-
-3. **权限二次校验**：
-   ```go
-   if issue.IsPull && !access_model.CheckRepoUnitUser(ctx, issue.Repo, user, unit.TypePullRequests) {
-       continue
-   }
-   if !issue.IsPull && !access_model.CheckRepoUnitUser(ctx, issue.Repo, user, unit.TypeIssues) {
-       continue
-   }
-   ```
-
-4. **创建或更新通知**：
+3. **创建或更新通知**：
    ```go
    if notificationExists(notifications, issue.ID, userID) {
        updateIssueNotification(ctx, userID, issue.ID, commentID, notificationAuthorID)
@@ -696,12 +853,27 @@ notifications.LoadComments(ctx)
 | 维度 | 活动流 (Action) | 通知流 (Notification) |
 |------|---------------|---------------------|
 | **处理方式** | 同步，请求 goroutine 内直接调用 `db.Insert` | 异步，先 `Push` 到 `WorkerPoolQueue`，由 worker 后续处理 |
-| **事务** | 使用 `db.WithTx` 包裹所有写入操作 | 队列 handler 内独立事务 |
+| **事务** | 使用 `db.WithTx` 包裹所有写入操作 | 队列 handler 内独立事务（`db.WithTx`） |
 | **执行时机** | Notifier 方法返回时已完成写入 | Notifier 方法返回时仅完成入队，写入时机由队列调度决定 |
 | **Notifier 调用顺序** | 先调用（注册顺序在前） | 后调用（注册顺序在后） |
-| **错误处理** | 写入错误返回给调用方，事务回滚 | handler 内记录错误日志，不返回给调用方 |
+| **错误处理** | 写入错误返回给调用方，事务回滚 | handler 内记录错误日志，不返回给调用方；Push 错误被 `_` 静默忽略 |
+| **业务门禁** | 由调用方控制（如用户屏蔽检查失败则不会触发） | 由调用方控制（同左，门禁失败不会触发） |
+| **延迟通知场景** | 无特殊延迟场景，事件触发即处理 | Pending Review Comment 延迟到 `SubmitReview` 时才触发 |
+| **通知路径分支** | 无分支，单一处理逻辑 | 双分支：`receiverID > 0` 定向通知 vs `receiverID = 0` 全量路径 |
 
-### 7.2 处理流程代码证据
+### 7.2 通知流双路径对比
+
+| 维度 | 定向通知（receiverID > 0） | 全量路径（receiverID = 0） |
+|------|-------------------------|------------------------|
+| **触发场景** | @提及、被指派 | 普通评论、状态变更、新建 Issue |
+| **候选接收者** | 仅指定用户 1 人 | Issue关注者 + 仓库关注者 + 参与者 |
+| **排除触发者** | ❌ 不执行 | ✅ 执行 |
+| **排除取消关注** | ❌ 不执行 | ✅ 执行 |
+| **权限校验** | ✅ 仍执行 | ✅ 执行 |
+| **每条评论入队次数** | N 次（N = @提及人数） | 1 次 |
+| **去重逻辑** | ✅ 同一 Issue 单条记录 | ✅ 同一 Issue 单条记录 |
+
+### 7.3 处理流程代码证据
 
 **活动流同步证据**（`services/feed/feed.go:97-98`）：
 ```go
@@ -717,6 +889,25 @@ func NotifyWatchers(ctx context.Context, acts ...*activities_model.Action) error
 _ = ns.issueQueue.Push(opts)  // 仅入队，立即返回
 ```
 
+**Push 返回值忽略证据**（`services/uinotification/notify.go` 中 8 处调用）：
+```go
+_ = ns.issueQueue.Push(opts)  // 错误被静默丢弃
+```
+
+**Pending Review 跳过证据**（`services/pull/review.go:203`）：
+```go
+// NOTICE: if it's a pending review the notifications will not be fired until user submit review.
+```
+
+**用户屏蔽门禁证据**（`services/issue/comments.go:61-65`）：
+```go
+if user_model.IsUserBlockedBy(ctx, doer, issue.PosterID, repo.OwnerID) {
+    if isAdmin, _ := access_model.IsUserRepoAdmin(ctx, repo, doer); !isAdmin {
+        return nil, user_model.ErrBlockedUser
+    }
+}
+```
+
 **队列工作机制证据**（`modules/queue/workergroup.go:18, 19`）：
 ```go
 batchDebounceDuration  = 100 * time.Millisecond  // 批量收集防抖
@@ -728,7 +919,7 @@ workerIdleDuration     = 1 * time.Second         // worker 空闲超时
 EventSourceUpdateTime: 10 * time.Second
 ```
 
-### 7.3 触发顺序代码证据
+### 7.4 触发顺序代码证据
 
 **注册顺序**（`routers/init.go:130-131`）：
 ```go
@@ -800,19 +991,25 @@ type Notification struct {
 - **Notification**：使用异步队列解耦，不阻塞业务流程
 - 两者独立存储、独立展现，但共享相同的事件源
 
-### 9.2 实时推送架构
+### 9.2 通知链路控制
+- **业务门禁**：用户屏蔽检查在业务层拦截，通知完全不产生
+- **延迟触发**：Pending Review Comment 延迟到 SubmitReview 时批量触发
+- **双路径**：定向通知（@提及）和全量通知（watcher）走不同代码分支
+- **静默去重**：同一 Issue 对同一用户只有一条通知记录
+
+### 9.3 实时推送架构
 - **SharedWorker + EventSource**：多标签页共享单一连接，代码见 `web_src/js/eventsource.sharedworker.ts`
 - **渐进式降级**：从 EventSource → 轮询，代码见 `web_src/js/features/notification.ts:34-49`
 - **序列号防乱序**：通知列表刷新使用递增序列号，代码见 `web_src/js/features/notification.ts:6, 94`
 
-### 9.3 性能优化手段
+### 9.4 性能优化手段
 1. **批量预计算权限**：活动匹配前一次性计算所有关注者权限，代码见 `services/feed/feed.go:124-145`
 2. **异步队列处理**：通知创建通过队列异步化，不阻塞业务流程，代码见 `services/uinotification/notify.go:46`
 3. **批量数据加载**：展现层使用 `LoadRepos`/`LoadIssues` 批量加载关联数据，避免 N+1 查询
 4. **联合索引**：数据库索引针对查询模式优化
 5. **队列防抖**：100ms 批量收集，减少 DB 写入次数，代码见 `modules/queue/workergroup.go:18`
 
-### 9.4 通知去重与更新
+### 9.5 通知去重与更新
 - 同一 Issue 对同一用户只有一条通知记录，代码见 `models/activities/notification_list.go:154`
 - 新活动触发时更新现有通知的时间戳和状态，代码见 `models/activities/notification.go:170-190`
 
@@ -824,6 +1021,10 @@ type Notification struct {
 
 ```
 用户发表评论 (业务操作)
+    │
+    ├─ 业务层门禁：用户屏蔽检查（services/issue/comments.go:61-65）
+    │   ├─ ✓ 通过：继续
+    │   └─ ✗ 不通过：返回 ErrBlockedUser，通知不产生
     │
     ▼
 services/notify/notify.go:CreateIssueComment()
@@ -844,16 +1045,29 @@ services/notify/notify.go:CreateIssueComment()
     │
     └─► ② notificationService.CreateIssueComment() ── 异步
            │
-           ├─ 构造 issueNotificationOpts
-           ├─ issueQueue.Push(opts) ── 入队立即返回
+           ├─ [分支 1] 全量路径 (receiverID = 0)
+           │    └─ issueQueue.Push(opts) ── 入队立即返回（错误被 _ 忽略）
            │
-           └─ 队列后台处理
+           └─ [分支 2] 定向路径：为每个 @提及用户单独入队 (receiverID = mention.ID)
+                └─ issueQueue.Push(opts) ── 入队立即返回（错误被 _ 忽略）
                 │
+                ▼
+           队列后台处理
+                │
+                ├─ 100ms 防抖批量收集
                 └─ handler()
                      └─ CreateOrUpdateIssueNotifications()
-                          ├─ 收集候选接收者
-                          ├─ 排除过滤
-                          ├─ 权限校验
+                          │
+                          ├─ [分支 A] receiverID > 0：只通知指定用户
+                          │    ├─ toNotify = {receiverID}
+                          │    └─ 跳过排除逻辑
+                          │
+                          └─ [分支 B] receiverID = 0：通知所有 watcher
+                               ├─ Issue关注者 + 仓库关注者 + 参与者
+                               ├─ 排除触发者
+                               └─ 排除取消关注用户
+                          │
+                          ├─ 权限校验（双路径都执行）
                           └─ 创建/更新 Notification 表
                                  │
                                  ▼
@@ -876,7 +1090,32 @@ services/notify/notify.go:CreateIssueComment()
     └─► 标签页 2: (同标签页 1)
 ```
 
-### 10.2 页面访问流程
+### 10.2 Pending Review Comment 延迟流程
+
+```
+用户添加代码评论 (pendingReview = true)
+    │
+    ▼
+services/pull/review.go:CreateCodeComment()
+    │
+    ├─ 创建 CommentTypeCode 评论到 DB
+    ├─ 关联到 ReviewTypePending 的 Review
+    └─ 跳过 notify_service 调用（见第 203 行注释）
+    │
+    ▼
+（通知延迟，此时不产生）
+    │
+    ▼
+用户提交评审 SubmitReview()
+    │
+    ├─ 更新 Review 类型为 Comment/Approve/Reject
+    ├─ notify_service.PullRequestReview() 触发评审总评通知
+    └─ 遍历 review.CodeComments
+        └─ 对每个代码评论调用 notify_service.PullRequestCodeComment()
+            └─ issueQueue.Push(opts) 入队处理
+```
+
+### 10.3 页面访问流程
 
 ```
 用户访问 /notifications (通知中心)
@@ -905,7 +1144,12 @@ services/notify/notify.go:CreateIssueComment()
 | 活动匹配逻辑（含权限预计算） | `services/feed/feed.go` |
 | GetFeedsForDashboard 包装函数 | `services/feed/feed.go:21-25` |
 | 通知 Notifier 实现 | `services/uinotification/notify.go` |
-| 通知匹配逻辑 | `models/activities/notification_list.go` |
+| 通知匹配逻辑（双路径分支） | `models/activities/notification_list.go` |
+| 评论通知门禁（用户屏蔽检查） | `services/issue/comments.go:61-65` |
+| Pending Review 跳过逻辑 | `services/pull/review.go:165-205` |
+| Pending Review 延迟触发 | `services/pull/review.go:350-362` |
+| Queue Push 方法定义 | `modules/queue/workerqueue.go:166-176` |
+| Queue Push 可能错误 | `modules/queue/base_channel.go`, `base_levelqueue_common.go` |
 | 后端 EventSource Manager | `modules/eventsource/manager.go` |
 | EventSource 运行循环 | `modules/eventsource/manager_run.go` |
 | 用户 Messenger | `modules/eventsource/messenger.go` |

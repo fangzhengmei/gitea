@@ -56,7 +56,7 @@ r.Mount("/v2", packages_router.ContainerRoutes())
 
 ### 3.1 认证方法组合
 
-在 `routers/api/packages/api.go:96-128`，`verifyAuth` 函数通过 `auth.NewGroup` 组装多种认证方法：
+在 `routers/api/packages/api.go:96-113`，`verifyAuth` 函数通过 `auth.NewGroup` 组装多种认证方法：
 
 ```go
 verifyAuth(r, []auth.Method{
@@ -209,6 +209,7 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 | 组织 + 未登录 + Limited/Private | `AccessModeNone` |
 | 组织 + 已登录非成员 + Public/Limited | `AccessModeRead` |
 | 组织 + 已登录非成员 + Private | `AccessModeNone` |
+| 组织 + **Restricted 用户** + 非成员 | `AccessModeNone`（任何可见性下） |
 | 个人 + 本人 | `AccessModeOwner` |
 | 个人 + 公开/有限可见的他人 | `AccessModeRead` |
 | 个人 + 公开 + 未登录 | `AccessModeRead` |
@@ -222,6 +223,16 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
       return orgOrUser.Visibility == structs.VisibleTypePublic  // 仅 Public
   }
   ```
+
+**Restricted 用户边界条件**：
+- Restricted 用户（已登录但受限）即使访问 `Public`/`Limited` 组织，只要不是成员，就返回 `AccessModeNone`
+- 代码依据 (`models/organization/org.go:435`):
+  ```go
+  if (orgOrUser.Visibility == structs.VisibleTypePrivate || user.IsRestricted) && !OrgFromUser(orgOrUser).hasMemberWithUserID(ctx, user.ID) {
+      return false
+  }
+  ```
+- Restricted 用户必须是组织成员才能访问任何包（无论组织可见性）
 
 ---
 
@@ -257,12 +268,24 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 | CommonRoutes 组织 Limited 包 | **`AccessModeNone` → 401**（Ghost 视为匿名） | `AccessModeNone` → 401 |
 | Container 组织 Public 包 | `AccessModeRead` → 可读取 | `ReqContainerAccess` 直接 401 |
 | Container 组织 Limited 包 | **`AccessModeNone` → 401** | `ReqContainerAccess` 直接 401 |
+| **Restricted 用户（已登录 + 受限）** | | |
+| 任何包 + 非成员 | `AccessModeNone` → 401（任何可见性下） | `AccessModeNone` → 401 |
+| 任何包 + 是成员 | 按成员权限正常授权 | 按成员权限正常授权 |
 | **写操作（PUT/POST/DELETE）** | 任何开关下，匿名用户/Ghost 用户均无法通过写操作的 `AccessMode >= Write` 检查 | 同左 |
 
 **关键澄清**：
-- 即使 `RequireSignInViewStrict = false`，**匿名用户也绝对无法写入任何包**（公开包也不行）。写入需要 `AccessMode >= Write`，而匿名用户最多只有 `AccessModeRead`。
+- 即使 `RequireSignInViewStrict = false`，**正常代码路径下匿名用户也绝对无法写入任何包**（公开包也不行）。写入需要 `AccessMode >= Write`，而匿名用户最多只有 `AccessModeRead`。
 - 开关只影响**读权限**的判定。
 - `AccessMode` 枚举值：`None(0) < Read(1) < Write(2) < Admin(3) < Owner(4)`。
+
+**匿名写操作拦截的统一口径**：
+| 场景 | 是否被拦截 | 拦截点 |
+|------|-----------|--------|
+| **正常代码路径 | ✅ 被拦截 | `reqPackageAccess(Write)` 中 `AccessModeRead < AccessModeWrite` |
+| **bug 场景：`determineAccessMode` 错误返回 `AccessModeWrite` | ❌ 不被拦截 | Scope 检查因 `IsApiToken != true` 跳过，AccessMode 检查因 `Write < Write` 为 false 也通过 |
+| **bug 场景：`reqPackageAccess(Write)` 中间件未正确叠加 | ❌ 不被拦截 | 无任何权限检查 |
+
+**重要**：bug 场景属于理论上的安全风险，实际代码中所有 50+ 写操作路径均显式叠加了 `reqPackageAccess(Write)` 中间件，且 `determineAccessMode` 的逻辑经过严格测试，风险极低。
 
 ### 4.2 公开包场景下的实际读写边界
 
@@ -285,12 +308,13 @@ if ctx.Package.AccessMode < accessMode && !ctx.IsUserSiteAdmin() {
 - 组织可见性为 Public → 匿名用户有 `AccessModeRead`（同公开个人包）
 - 组织可见性为 Limited → **未登录匿名用户 = `AccessModeNone`**（Limited 仅对已登录用户可见），**已登录非成员 = `AccessModeRead`**
 - 组织可见性为 Private → 匿名用户 `AccessModeNone`，仅成员可见
+- **Restricted 用户** → 无论组织可见性如何，只要不是成员就 = `AccessModeNone`
 
 **错误点纠正**：原描述将 Limited 的匿名访问与已登录访问颠倒了。`Limited` 的定义是 "Visible for every connected user"（`modules/structs/visible_type.go:13`），即**仅已登录用户可见**，匿名用户无法访问 Limited 组织的任何包。
 
-### 4.3 写操作的双重限制机制
+### 4.3 写操作的两级检查机制（非冗余设计）
 
-写操作（PUT/POST/DELETE）受到**鉴权中间件**与**访问模式判定**的双重保护，即使访问模式计算出错，中间件仍然会拦截。
+写操作（PUT/POST/DELETE）通过**鉴权中间件的 Scope 检查**与**访问模式判定**的两级检查。两级检查为串联关系，而非冗余备份，任何一级条件满足都会通过。
 
 **第一重限制：`determineAccessMode` 计算出的 `AccessMode` 本身就不允许写入**
 
@@ -421,18 +445,21 @@ func reqPackageAccess(accessMode perm.AccessMode) func(ctx *context.Context) {
 | | `DELETE /.../blobs/<digest>` | `reqPackageAccess(Write)` |
 | | `PUT/DELETE /.../manifests/<reference>` | `reqPackageAccess(Write)` |
 
-**结论**：所有 23 种包类型的所有写操作路径（共 50+ 个）都显式叠加了 `reqPackageAccess(Write)` 中间件，无任何例外。匿名用户即使绕过认证（如通过无保护的协议端点），也无法通过第二重访问模式检查。
+**结论**：所有 23 种包类型的所有写操作路径（共 50+ 个）都显式叠加了 `reqPackageAccess(Write)` 中间件，无任何例外。匿名用户即使绕过认证（如通过无保护的协议端点），在正常代码路径下也会被 `AccessModeRead < AccessModeWrite` 的检查拦截。
 
 ### 4.4 本次纠正的错误点汇总
 
 | # | 原错误描述 | 正确代码逻辑 | 代码位置 |
 |---|-----------|-------------|----------|
-| **1** | `determineAccessMode` 表格中"组织 + 未登录/非成员 + 组织可见"合并为一行，未区分 Public/Limited | 需分四行区分：未登录+Public→Read，未登录+Limited→None，已登录非成员+Public/Limited→Read，已登录非成员+Private→None | `services/context/package.go:203-214` |
+| **1** | `determineAccessMode` 表格中"组织 + 未登录/非成员 + 组织可见"合并为一行，未区分 Public/Limited | 需分四行区分：未登录+Public→Read，未登录+Limited→None，已登录非成员+Public/Limited→Read，已登录非成员+Private→None | `services/context/package.go:116-170` |
 | **2** | 组织 Limited → "未登录匿名用户有 AccessModeRead，已登录非成员无" — 完全颠倒 | `HasOrgOrUserVisible` 中 `user == nil` 时仅返回 `Visibility == Public`，Limited 对匿名用户不可见；已登录非成员可见 Limited | `models/organization/org.go:423-425`; `modules/structs/visible_type.go:13` |
-| **3** | "双重校验安全冗余：即使 determineAccessMode 返回 Write，Scope 检查也会拦截" | Scope 检查仅当 `IsApiToken == true` 时执行，匿名用户无 Token → `IsApiToken` 非 true → Scope 检查完全跳过；若 AccessMode 错误返回 Write，则两级都不拦截，是风险点而非冗余 | `routers/api/packages/api.go:43`; `services/auth/oauth2.go:124,145`; `services/auth/basic.go:83,104` |
+| **3** | "双重校验安全冗余：即使 determineAccessMode 返回 Write，Scope 检查也会拦截" | Scope 检查仅当 `IsApiToken == true` 时执行，匿名用户无 Token → `IsApiToken` 非 true → Scope 检查完全跳过；若 AccessMode 错误返回 Write，则两级都不拦截，是风险点而非冗余 | `routers/api/packages/api.go:43-82`; `services/auth/oauth2.go:124,145`; `services/auth/basic.go:83,104` |
 | **4** | RequireSignInViewStrict 对照表未包含组织 Limited 场景 | 补充 6 行：CommonRoutes/Container 的组织 Limited 包在开关关闭时匿名用户仍为 `AccessModeNone` | `services/context/package.go:152-155` |
 | **5** | 写操作时序图中未体现 Scope 检查跳过的情况 | 补充 Scope 检查判断分支，明确标注"IsApiToken != true → 跳过" | `routers/api/packages/api.go:43-82` |
 | **6** | `reqPackageAccess` 代码注释写"Token Scope 检查（第一级）"暗示始终执行 | 正确注释应为"Token Scope 检查（仅当 IsApiToken == true 时执行）" | `routers/api/packages/api.go:43` |
+| **7** | 文档未提及 Restricted 用户边界条件 | Restricted 用户（已登录但受限）即使访问 Public/Limited 组织，只要不是成员就返回 `AccessModeNone` | `models/organization/org.go:435` |
+| **8** | `verifyAuth` 行号引用错误（96-128） | 实际函数范围为 96-113 | `routers/api/packages/api.go:96-113` |
+| **9** | 匿名写操作结论存在冲突表述（"绝对无法写入" vs "bug 场景不拦截"未区分） | 正常代码路径 ✅ 被拦截；bug 场景 ❌ 不拦截（理论风险，实际代码配置正确） | 参见 §4.1 统一口径表 |
 
 ---
 

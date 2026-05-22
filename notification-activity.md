@@ -77,7 +77,7 @@ func RegisterNotifier(notifier Notifier) {
 }
 ```
 
-> **关键观察**：Notifier 按注册顺序被调用，`actionNotifier` 先于 `notificationService` 执行。但由于通知使用异步队列，两者的 DB 写入顺序**不保证**。
+> **代码证实**：Notifier 按注册顺序被调用，`actionNotifier` 先于 `notificationService` 执行。但由于通知使用异步队列，两者的 DB 写入顺序由调度决定。
 
 ### 2.2 事件源定义
 
@@ -142,52 +142,70 @@ type Notifier interface {
 
 **职责**：为每个符合条件的用户创建活动时间线记录。
 
-**处理方式**：**同步**执行，在请求 goroutine 中直接写入 DB。
+**处理方式**：**同步**执行，在请求 goroutine 中直接写入 DB，使用 `db.WithTx` 事务包裹。
 
-**匹配流程**（`services/feed/feed.go:96-161`）：
+**匹配流程**（`services/feed/feed.go:97-162`）：
 
-1. **获取关注者列表**：
+1. **事务包裹**：
+   ```go
+   func NotifyWatchers(ctx context.Context, acts ...*activities_model.Action) error {
+       return db.WithTx(ctx, func(ctx context.Context) error {
+           // ... 所有操作在同一事务内
+       })
+   }
+   ```
+
+2. **获取关注者列表**：
    ```go
    watchers, err := repo_model.GetWatchers(ctx, repoID)
    ```
 
-2. **预计算权限**（批量处理，性能优化）：
+3. **批量预计算权限**（在 `NotifyWatchers` 内完成，`services/feed/feed.go:124-145`）：
    ```go
    permCode := make([]bool, len(watchers))   // 代码可读权限
    permIssue := make([]bool, len(watchers))  // Issue 可读权限
    permPR := make([]bool, len(watchers))     // PR 可读权限
    
    for i, watcher := range watchers {
-       perm, _ := access_model.GetIndividualUserRepoPermission(ctx, repo, user)
+       user, err := user_model.GetUserByID(ctx, watcher.UserID)
+       if err != nil {
+           permCode[i] = false
+           permIssue[i] = false
+           permPR[i] = false
+           continue
+       }
+       perm, err := access_model.GetIndividualUserRepoPermission(ctx, repo, user)
        permCode[i] = perm.CanRead(unit.TypeCode)
        permIssue[i] = perm.CanRead(unit.TypeIssues)
        permPR[i] = perm.CanRead(unit.TypePullRequests)
    }
    ```
 
-3. **按动作类型过滤**：
+4. **按动作类型过滤**（在内部 `notifyWatchers` 函数中，`services/feed/feed.go:72-86`）：
    ```go
    switch act.OpType {
-   case ActionCommitRepo, ActionPushTag, ActionDeleteTag:
-       if !permCode[i] { continue }  // 需要代码权限
-   case ActionCreateIssue, ActionCommentIssue:
-       if !permIssue[i] { continue } // 需要 Issue 权限
-   case ActionCreatePullRequest, ActionCommentPull:
-       if !permPR[i] { continue }    // 需要 PR 权限
+   case activities_model.ActionCommitRepo, activities_model.ActionPushTag, activities_model.ActionDeleteTag:
+       if !permCode[i] { continue }
+   case activities_model.ActionCreateIssue, activities_model.ActionCommentIssue:
+       if !permIssue[i] { continue }
+   case activities_model.ActionCreatePullRequest, activities_model.ActionCommentPull:
+       if !permPR[i] { continue }
    }
    ```
 
-4. **排除操作者自身**：
+5. **排除操作者自身**：
    ```go
    if act.ActUserID == watcher.UserID {
-       continue  // 不通知自己
+       continue
    }
    ```
 
-5. **插入重复记录**（设计特性）：
+6. **插入记录**（`services/feed/feed.go:49-91`）：
    - 为操作者本人插入一条（UserID = ActUserID）
-   - 为仓库所属组织插入一条（如果是组织仓库）
-   - 为每个关注者插入一条
+   - 为仓库所属组织插入一条（如果是组织仓库且 ActUserID != 组织 ID）
+   - 为每个符合条件的关注者插入一条
+
+   均使用 `db.Insert(ctx, act)` 同步写入。
 
 ### 3.2 通知（Notification）订阅匹配 - `notificationService`
 
@@ -235,7 +253,7 @@ type WorkerPoolQueue[T any] struct {
 
 **消息分发流程**（`modules/queue/workergroup.go:48-88`）：
 
-1. **批量收集**（100ms 防抖）：
+1. **批量收集防抖**（代码常量，`modules/queue/workergroup.go:18`）：
    ```go
    batchDebounceDuration = 100 * time.Millisecond
    ```
@@ -245,12 +263,12 @@ type WorkerPoolQueue[T any] struct {
    if full || noWorker {
        if q.workerNum < q.workerMaxNum || noWorker && q.workerMaxNum <= 0 {
            q.workerNum++
-           q.doStartNewWorker(wg)  // 启动新 worker
+           q.doStartNewWorker(wg)
        }
    }
    ```
 
-3. **批量处理**：
+3. **批量处理**（`services/uinotification/notify.go:53-60`）：
    ```go
    func handler(items ...issueNotificationOpts) []issueNotificationOpts {
        for _, opts := range items {
@@ -300,20 +318,18 @@ type WorkerPoolQueue[T any] struct {
 3. **权限二次校验**：
    ```go
    if issue.IsPull && !access_model.CheckRepoUnitUser(ctx, issue.Repo, user, unit.TypePullRequests) {
-       continue  // PR 需要 PR 权限
+       continue
    }
    if !issue.IsPull && !access_model.CheckRepoUnitUser(ctx, issue.Repo, user, unit.TypeIssues) {
-       continue  // Issue 需要 Issue 权限
+       continue
    }
    ```
 
 4. **创建或更新通知**：
    ```go
    if notificationExists(notifications, issue.ID, userID) {
-       // 已存在：更新状态为未读，更新时间戳
        updateIssueNotification(ctx, userID, issue.ID, commentID, notificationAuthorID)
    } else {
-       // 不存在：创建新通知
        createIssueNotification(ctx, userID, issue, commentID, notificationAuthorID)
    }
    ```
@@ -355,9 +371,10 @@ type Messenger struct {
 
 **定时推送流程**（`modules/eventsource/manager_run.go:31-120`）：
 
-1. **定时轮询**（间隔由配置决定）：
+1. **定时轮询**（间隔由配置决定，默认 10 秒，`modules/setting/ui.go:118`）：
    ```go
    timer := time.NewTicker(setting.UI.Notification.EventSourceUpdateTime)
+   // 默认值: EventSourceUpdateTime: 10 * time.Second
    ```
 
 2. **获取变化用户的通知计数**：
@@ -409,7 +426,7 @@ func Events(ctx *context.Context) {
     // 注册到 EventSource Manager
     messageChan := eventsource.GetManager().Register(uid)
     
-    // 心跳（30秒）
+    // 心跳（30秒，代码中硬编码）
     timer := time.NewTicker(30 * time.Second)
     
     // 事件循环
@@ -495,13 +512,20 @@ function initNotificationCount() {
 }
 ```
 
+**轮询配置**（默认值，`modules/setting/ui.go:115-117`）：
+```go
+MinTimeout:  10 * time.Second,  // 最小间隔
+TimeoutStep: 10 * time.Second,  // 退避步长
+MaxTimeout:  60 * time.Second,  // 最大间隔
+```
+
 **渐进式退避**（`web_src/js/features/notification.ts:55-76`）：
 ```typescript
 async function updateNotificationCountWithCallback(...) {
     if (lastCount !== newCount) {
-        timeout = notificationSettings.MinTimeout;  // 有变化，加快轮询
+        timeout = notificationSettings.MinTimeout;  // 有变化，使用最小间隔
     } else if (timeout < notificationSettings.MaxTimeout) {
-        timeout += notificationSettings.TimeoutStep;  // 无变化，减慢轮询
+        timeout += notificationSettings.TimeoutStep;  // 无变化，增加间隔
     }
 }
 ```
@@ -551,15 +575,19 @@ async function updateNotificationTable() {
 
 ### 5.3 手动查询未读数
 
-**Web 路由**（`routers/web/web.go:1749`）：
+**Web 路由**（`routers/web/web.go:1743-1750`）：
 ```go
-m.Get("/new", user.NewAvailable)  // 完整路径: /notifications/new
+m.Group("/notifications", func() {
+    m.Get("", user.Notifications)
+    // ...
+    m.Get("/new", user.NewAvailable)  // 完整路径: /notifications/new
+}, reqSignIn)
 ```
 
-> ⚠️ **路由检查说明**：
-> - 第 630 行 `/user/settings/notifications` - 用户通知设置页面
-> - 第 1743 行 `/notifications` - 通知中心（根路径）
-> - 两者在不同分组下，无冲突。未读数路由 `/notifications/new` 定义正确。
+> **路由核查说明**：
+> - 第 630 行 `m.Group("/user/settings/notifications", ...)` - 用户通知设置页面（父路径 `/user/settings`）
+> - 第 1743 行 `m.Group("/notifications", ...)` - 通知中心（根路径 `/notifications`）
+> - 两者位于不同的父分组下，路径不冲突。未读数路由 `/notifications/new` 定义正确。
 
 **未读数查询实现**（`routers/web/user/notification.go:388-399`）：
 ```go
@@ -611,15 +639,19 @@ SharedWorker 接收事件，广播给所有标签页
 - 按时间周期筛选（日/周/月/季/年）
 
 #### 6.1.2 用户首页 Dashboard
-**代码**：`services/feed/feed.go:21-30`
+**代码**：`services/feed/feed.go:21-25`
 
 ```go
 func GetFeedsForDashboard(ctx context.Context, opts activities_model.GetFeedsOptions) (activities_model.ActionList, int64, error) {
-    return activities_model.GetFeeds(ctx, opts)
+    opts.DontCount = opts.RequestedTeam == nil && opts.Date == ""
+    results, cnt, err := activities_model.GetFeeds(ctx, opts)
+    return results, util.Iif(opts.DontCount, -1, cnt), err
 }
 ```
 
-查询时进行可见性过滤（`models/activities/action.go:469-552`）：
+> **事实校准**：`GetFeedsForDashboard` 是一个包装函数，设置 `DontCount` 标志后直接调用 `activities_model.GetFeeds`。当 `RequestedTeam` 为空且 `Date` 为空时，跳过计数查询，返回 `-1` 作为计数值。
+
+**实际查询**在 `models/activities/action_list.go:207` 中进行，查询时进行可见性过滤：
 - 检查用户活动隐私设置
 - 检查仓库可读权限
 - 按时间、用户、仓库等维度过滤
@@ -657,63 +689,46 @@ notifications.LoadComments(ctx)
 
 ---
 
-## 七、活动流 vs 通知流：一致性与延迟对比
+## 七、活动流 vs 通知流：代码可证实的差异对比
 
 ### 7.1 处理模型对比
 
 | 维度 | 活动流 (Action) | 通知流 (Notification) |
 |------|---------------|---------------------|
-| **处理方式** | 同步，请求 goroutine 内直接执行 | 异步，通过 WorkerPoolQueue 队列处理 |
-| **事务保证** | 与业务操作在同一 DB 事务 | 独立事务，最终一致 |
-| **写入时机** | 业务操作提交时同时写入 | 队列消费时写入（延迟不确定） |
-| **失败处理** | 失败则业务操作回滚 | 失败重试，可能丢失 |
+| **处理方式** | 同步，请求 goroutine 内直接调用 `db.Insert` | 异步，先 `Push` 到 `WorkerPoolQueue`，由 worker 后续处理 |
+| **事务** | 使用 `db.WithTx` 包裹所有写入操作 | 队列 handler 内独立事务 |
+| **执行时机** | Notifier 方法返回时已完成写入 | Notifier 方法返回时仅完成入队，写入时机由队列调度决定 |
+| **Notifier 调用顺序** | 先调用（注册顺序在前） | 后调用（注册顺序在后） |
+| **错误处理** | 写入错误返回给调用方，事务回滚 | handler 内记录错误日志，不返回给调用方 |
 
-### 7.2 延迟特性对比
+### 7.2 处理流程代码证据
 
-**活动流延迟**：
-- **典型延迟**：< 10ms（同步写入）
-- **影响因素**：DB 写入速度、关注者数量（批量插入）
-- **可见性**：页面刷新立即可见，无推送机制
-
-**通知流延迟**：
-- **典型延迟**：100ms ~ 数秒（队列 + EventSource 轮询间隔）
-- **延迟组成**：
-  1. 队列防抖：100ms (`batchDebounceDuration`)
-  2. 队列处理：取决于积压情况
-  3. EventSource 轮询：配置项 `EventSourceUpdateTime`（通常 1-5 秒）
-  4. 前端刷新：额外的 HTTP 请求
-- **最坏情况**：队列严重积压时，延迟可达分钟级
-
-### 7.3 一致性分析
-
-**强一致性场景**：
-- 活动流与业务操作强一致，操作成功则活动必然存在
-- 适合作为"事实记录"的时间线
-
-**最终一致性场景**：
-- 通知流最终一致，可能出现：
-  - **顺序不一致**：活动已显示，但通知红点未更新
-  - **状态不一致**：通知已读/未读状态短暂不同步
-  - **丢失风险**：队列处理失败可能导致通知丢失
-
-**已知不一致窗口**：
-1. **操作→活动**：同步，无窗口
-2. **操作→通知**：队列处理时间（~100ms+）
-3. **通知→推送**：EventSource 轮询间隔（配置项，如 2s）
-4. **推送→列表刷新**：前端 HTTP 请求时间（~几十 ms）
-
-> **设计权衡**：通知流选择最终一致性是为了不阻塞业务操作。活动流选择强一致是因为它是"历史记录"，必须可靠。
-
-### 7.4 触发顺序分析
-
-**代码执行顺序**（`services/notify/notify.go:29-33`）：
+**活动流同步证据**（`services/feed/feed.go:97-98`）：
 ```go
-func NewIssue(ctx context.Context, issue *issues_model.Issue, mentions []*user_model.User) {
-    for _, notifier := range notifiers {
-        notifier.NewIssue(ctx, issue, mentions)  // 按注册顺序调用
-    }
+func NotifyWatchers(ctx context.Context, acts ...*activities_model.Action) error {
+    return db.WithTx(ctx, func(ctx context.Context) error {
+        // ... 循环内直接调用 db.Insert
+    })
 }
 ```
+
+**通知流异步证据**（`services/uinotification/notify.go:76`）：
+```go
+_ = ns.issueQueue.Push(opts)  // 仅入队，立即返回
+```
+
+**队列工作机制证据**（`modules/queue/workergroup.go:18, 19`）：
+```go
+batchDebounceDuration  = 100 * time.Millisecond  // 批量收集防抖
+workerIdleDuration     = 1 * time.Second         // worker 空闲超时
+```
+
+**默认轮询间隔证据**（`modules/setting/ui.go:118`）：
+```go
+EventSourceUpdateTime: 10 * time.Second
+```
+
+### 7.3 触发顺序代码证据
 
 **注册顺序**（`routers/init.go:130-131`）：
 ```go
@@ -721,13 +736,14 @@ mustInit(feed_service.Init)          // 1. actionNotifier 先注册
 mustInit(uinotification.Init)       // 2. notificationService 后注册
 ```
 
-**因此调用顺序为**：
-1. `actionNotifier.NewIssue()` - 同步写入 Action 表
-2. `notificationService.NewIssue()` - 入队，立即返回
-
-**DB 写入顺序**：
-- Action 表：业务事务提交时写入（确定）
-- Notification 表：队列消费时写入（不确定，可能在 Action 之后几十~几百 ms）
+**调用顺序**（`services/notify/notify.go:73-77`）：
+```go
+func NewIssue(ctx context.Context, issue *issues_model.Issue, mentions []*user_model.User) {
+    for _, notifier := range notifiers {  // 按切片顺序遍历
+        notifier.NewIssue(ctx, issue, mentions)
+    }
+}
+```
 
 ---
 
@@ -777,34 +793,28 @@ type Notification struct {
 
 ---
 
-## 九、关键设计决策
+## 九、关键设计决策（代码可证实）
 
 ### 9.1 双轨并行设计
-- **Action** 面向"发生了什么"，是公开的时间线记录，要求强一致
-- **Notification** 面向"需要我关注什么"，是个人的待处理提醒，可接受最终一致
+- **Action**：使用同步事务写入，与业务操作同生命周期
+- **Notification**：使用异步队列解耦，不阻塞业务流程
 - 两者独立存储、独立展现，但共享相同的事件源
 
 ### 9.2 实时推送架构
-- **SharedWorker + EventSource**：多标签页共享单一连接，降低服务器压力
-- **渐进式降级**：从 EventSource → 轮询，适应不同浏览器环境
-- **序列号防乱序**：通知列表刷新使用递增序列号，避免旧响应覆盖新内容
+- **SharedWorker + EventSource**：多标签页共享单一连接，代码见 `web_src/js/eventsource.sharedworker.ts`
+- **渐进式降级**：从 EventSource → 轮询，代码见 `web_src/js/features/notification.ts:34-49`
+- **序列号防乱序**：通知列表刷新使用递增序列号，代码见 `web_src/js/features/notification.ts:6, 94`
 
 ### 9.3 性能优化手段
-1. **批量预计算权限**：通知匹配前一次性计算所有关注者权限
-2. **异步队列处理**：通知创建通过队列异步化，不阻塞业务流程
+1. **批量预计算权限**：活动匹配前一次性计算所有关注者权限，代码见 `services/feed/feed.go:124-145`
+2. **异步队列处理**：通知创建通过队列异步化，不阻塞业务流程，代码见 `services/uinotification/notify.go:46`
 3. **批量数据加载**：展现层使用 `LoadRepos`/`LoadIssues` 批量加载关联数据，避免 N+1 查询
 4. **联合索引**：数据库索引针对查询模式优化
-5. **队列防抖**：100ms 批量收集，减少 DB 写入次数
+5. **队列防抖**：100ms 批量收集，减少 DB 写入次数，代码见 `modules/queue/workergroup.go:18`
 
 ### 9.4 通知去重与更新
-- 同一 Issue 对同一用户只有一条通知记录
-- 新活动触发时更新现有通知的时间戳和状态
-- 避免通知列表被同一 Issue 的多次更新淹没
-
-### 9.5 延迟与一致性权衡
-- 活动流：同步写入，强一致，低延迟
-- 通知流：异步队列，最终一致，较高延迟
-- 设计目标：业务操作不被通知系统阻塞
+- 同一 Issue 对同一用户只有一条通知记录，代码见 `models/activities/notification_list.go:154`
+- 新活动触发时更新现有通知的时间戳和状态，代码见 `models/activities/notification.go:170-190`
 
 ---
 
@@ -822,29 +832,32 @@ services/notify/notify.go:CreateIssueComment()
     │      │
     │      ├─ 构造 Action 对象
     │      ├─ NotifyWatchers()
+    │      │    ├─ db.WithTx 开启事务
     │      │    ├─ 获取仓库关注者
-    │      │    ├─ 预计算权限
-    │      │    ├─ 按动作类型过滤
-    │      │    └─ 批量插入 Action 表 ──┐
-    │      └─ 完成（活动时间线更新）      │  同步，<10ms
-    │                                    │
+    │      │    ├─ 批量预计算权限 (permCode/permIssue/permPR)
+    │      │    ├─ notifyWatchers() 内部函数
+    │      │    │    ├─ 按动作类型过滤权限
+    │      │    │    ├─ 排除操作者自身
+    │      │    │    └─ db.Insert 写入 Action 表
+    │      │    └─ 事务提交
+    │      └─ 返回
+    │
     └─► ② notificationService.CreateIssueComment() ── 异步
            │
            ├─ 构造 issueNotificationOpts
            ├─ issueQueue.Push(opts) ── 入队立即返回
            │
-           └─ 队列后台处理 (~100ms 防抖 + 批量)
+           └─ 队列后台处理
                 │
                 └─ handler()
-                     ├─ CreateOrUpdateIssueNotifications()
-                     │    ├─ 收集候选接收者
-                     │    ├─ 排除过滤
-                     │    ├─ 权限校验
-                     │    └─ 创建/更新 Notification 表 ──┐
-                     └─ 完成（系统通知更新）               │  异步，100ms+
-                                                            │
-                                                            ▼
-后端 EventSource Manager 定时轮询 (~2s)
+                     └─ CreateOrUpdateIssueNotifications()
+                          ├─ 收集候选接收者
+                          ├─ 排除过滤
+                          ├─ 权限校验
+                          └─ 创建/更新 Notification 表
+                                 │
+                                 ▼
+后端 EventSource Manager 定时轮询 (默认 10s)
     │
     ├─ GetUIDsAndNotificationCounts(then, now)
     └─ SendMessage(uid, notification-count 事件)
@@ -858,7 +871,7 @@ services/notify/notify.go:CreateIssueComment()
     │       ├─ 更新未读红点 (同步)
     │       └─ updateNotificationTable() (异步)
     │           ├─ GET /notifications?div-only=true&sequence-number=N
-    │           └─ 替换 #notification_div DOM
+    │           └─ 序列号校验通过后替换 #notification_div DOM
     │
     └─► 标签页 2: (同标签页 1)
 ```
@@ -874,7 +887,8 @@ services/notify/notify.go:CreateIssueComment()
 
 用户访问首页 Dashboard
     │
-    ├─ 查询 Action 表（按 user_id + created_unix）
+    ├─ GetFeedsForDashboard() 设置 DontCount 标志
+    ├─ activities_model.GetFeeds() 查询 Action 表
     ├─ 可见性过滤（隐私、权限）
     └─ 渲染活动时间线
 ```
@@ -888,7 +902,8 @@ services/notify/notify.go:CreateIssueComment()
 | 事件分发中心 | `services/notify/notify.go` |
 | Notifier 接口 | `services/notify/notifier.go` |
 | 活动 Notifier 实现 | `services/feed/notifier.go` |
-| 活动匹配逻辑 | `services/feed/feed.go` |
+| 活动匹配逻辑（含权限预计算） | `services/feed/feed.go` |
+| GetFeedsForDashboard 包装函数 | `services/feed/feed.go:21-25` |
 | 通知 Notifier 实现 | `services/uinotification/notify.go` |
 | 通知匹配逻辑 | `models/activities/notification_list.go` |
 | 后端 EventSource Manager | `modules/eventsource/manager.go` |
@@ -899,11 +914,13 @@ services/notify/notify.go:CreateIssueComment()
 | 前端通知计数更新 | `web_src/js/features/notification.ts` |
 | Worker 封装类 | `web_src/js/modules/worker.ts` |
 | WorkerPoolQueue 实现 | `modules/queue/workerqueue.go` |
-| Worker 组调度 | `modules/queue/workergroup.go` |
+| Worker 组调度（含防抖常量） | `modules/queue/workergroup.go` |
 | Action 模型 | `models/activities/action.go` |
 | Notification 模型 | `models/activities/notification.go` |
+| Action 查询逻辑 | `models/activities/action_list.go:207` |
 | Web 通知展现 | `routers/web/user/notification.go` |
 | Web 活动展现 | `routers/web/repo/activity.go` |
 | API 通知接口 | `routers/api/v1/notify/notifications.go` |
 | 系统初始化顺序 | `routers/init.go` |
 | 路由定义 | `routers/web/web.go` |
+| 通知配置默认值 | `modules/setting/ui.go:109-119` |

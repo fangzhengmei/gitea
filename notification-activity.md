@@ -237,47 +237,73 @@ func CreateIssueComment(ctx context.Context, doer *user_model.User, repo *repo_m
 
 #### 3.2.2 Pending Review Comment 场景跳过
 
-代码评论（`CommentTypeCode`）在 pending review 状态下不会触发通知，直到用户提交评审。
+代码评论（`CommentTypeCode`）的通知触发逻辑由 `CreateCodeComment` 的 `pendingReview` 参数和评论上下文共同决定。
+
+**Review 入口触发条件 vs Notify 入口调用点并排对齐**：
+
+| 场景 | `CreateCodeComment` 参数条件 | `notify_service` 调用点 | 通知时机 |
+|------|----------------------------|------------------------|----------|
+| 1. 回复已有代码评论 | `!pendingReview && existsReview` | `notify_service.CreateIssueComment` (第 160 行) | **立即触发** |
+| 2. 独立代码评论（非 pending） | `!pendingReview && !existsReview` | `SubmitReview` 内调用 `notify_service.PullRequestCodeComment` (第 359 行) | **立即触发**（通过自动 SubmitReview） |
+| 3. Pending 评审中的代码评论 | `pendingReview = true` | 无调用（见第 203 行注释） | **延迟到 SubmitReview** |
+| 4. 评审总评（提交时） | `SubmitReview` 函数内 | `notify_service.PullRequestReview` (第 350 行) | **立即触发** |
+| 5. 所有 pending 代码评论（提交时） | `SubmitReview` 遍历 `review.CodeComments` | `notify_service.PullRequestCodeComment` (第 359 行) | **延迟到 SubmitReview** |
 
 **代码注释明示**（`services/pull/review.go:203`）：
 ```go
 // NOTICE: if it's a pending review the notifications will not be fired until user submit review.
 ```
 
-**跳过逻辑**（`services/pull/review.go:165-205`）：
-```go
-func CreateCodeComment(ctx context.Context, ..., pendingReview bool, ...) (*issues_model.Comment, error) {
-    // ... 
-    // 当 pendingReview=true 时，只创建评论但不调用 notify_service.CreateIssueComment
-    // 当 pendingReview=false 且不是回复时，立即提交评审并触发通知
-    if !pendingReview && !existsReview {
-        if _, _, err = SubmitReview(ctx, doer, gitRepo, issue, issues_model.ReviewTypeComment, "", latestCommitID, nil); err != nil {
-            return nil, err
-        }
-    }
-    // NOTICE: if it's a pending review the notifications will not be fired until user submit review.
-    return comment, nil
-}
-```
+**立即触发的评论**（场景 1、2、4）：
+1. **回复已有代码评论**（`services/pull/review.go:160`）：
+   ```go
+   if !pendingReview && existsReview {
+       // ... 创建评论
+       notify_service.CreateIssueComment(ctx, doer, issue.Repo, issue, comment, mentions)  // 立即调用
+   }
+   ```
 
-**延迟通知触发点**（`services/pull/review.go:350-362`）：
-```go
-func SubmitReview(ctx context.Context, ...) (*issues_model.Review, *issues_model.Comment, error) {
-    // ...
-    notify_service.PullRequestReview(ctx, pr, review, comm, mentions)  // 评审总评通知
-    
-    // 遍历所有代码评论，逐个触发通知
-    for _, lines := range review.CodeComments {
-        for _, comments := range lines {
-            for _, codeComment := range comments {
-                mentions, err := issues_model.FindAndUpdateIssueMentions(ctx, issue, doer, codeComment.Content)
-                notify_service.PullRequestCodeComment(ctx, pr, codeComment, mentions)
-            }
-        }
-    }
-    return review, comm, nil
-}
-```
+2. **独立代码评论**（`services/pull/review.go:196-200`）：
+   ```go
+   if !pendingReview && !existsReview {
+       // 自动提交评审，内部触发通知
+       if _, _, err = SubmitReview(ctx, doer, gitRepo, issue, issues_model.ReviewTypeComment, "", latestCommitID, nil); err != nil {
+           return nil, err
+       }
+   }
+   ```
+
+3. **评审总评**（`services/pull/review.go:350`）：
+   ```go
+   notify_service.PullRequestReview(ctx, pr, review, comm, mentions)  // SubmitReview 内立即调用
+   ```
+
+**延迟到 SubmitReview 的评论**（场景 3、5）：
+1. **Pending 评审中的代码评论**（`services/pull/review.go:203`）：
+   ```go
+   // pendingReview=true 时，只创建评论到 DB，不调用任何 notify_service
+   // NOTICE: if it's a pending review the notifications will not be fired until user submit review.
+   return comment, nil
+   ```
+
+2. **SubmitReview 时批量触发**（`services/pull/review.go:352-362`）：
+   ```go
+   func SubmitReview(ctx context.Context, ...) (*issues_model.Review, *issues_model.Comment, error) {
+       // ...
+       notify_service.PullRequestReview(ctx, pr, review, comm, mentions)  // 评审总评通知
+       
+       // 遍历所有代码评论，逐个触发通知
+       for _, lines := range review.CodeComments {
+           for _, comments := range lines {
+               for _, codeComment := range comments {
+                   mentions, err := issues_model.FindAndUpdateIssueMentions(ctx, issue, doer, codeComment.Content)
+                   notify_service.PullRequestCodeComment(ctx, pr, codeComment, mentions)
+               }
+           }
+       }
+       return review, comm, nil
+   }
+   ```
 
 #### 3.2.3 异步队列架构
 
@@ -294,17 +320,46 @@ func NewNotifier() notify_service.Notifier {
 }
 ```
 
-**入队操作**（`services/uinotification/notify.go:76, 86, 91, 96, 105, 118, 126, 163, 179`）：
+**入队操作**：`services/uinotification/notify.go` 中所有 `issueQueue.Push` 调用均忽略返回值。
+
+#### 3.2.4 issueQueue Push 调用点完整清单（按触发入口分组）
+
+`services/uinotification/notify.go` 中共有 **15 个独立的 Push 语句**，所有调用均使用 `_` 忽略返回值。按 Notifier 接口方法分组：
+
+| 触发入口（Notifier 方法） | 代码行 | ReceiverID | 路径类型 | 错误处理 |
+|--------------------------|--------|------------|----------|----------|
+| **1. CreateIssueComment** | 76 | 未设置 (=0) | 全量路径 | ❌ `_ =` 忽略 |
+| | 86 | mention.ID | 定向路径（@提及循环） | ❌ `_ =` 忽略 |
+| **2. NewIssue** | 91 | 未设置 (=0) | 全量路径 | ❌ `_ =` 忽略 |
+| | 96 | mention.ID | 定向路径（@提及循环） | ❌ `_ =` 忽略 |
+| **3. IssueChangeStatus** | 105 | 未设置 (=0) | 全量路径 | ❌ `_ =` 忽略 |
+| **4. IssueChangeTitle** | 118 | 未设置 (=0) | 全量路径（仅 WIP 移除时） | ❌ `_ =` 忽略 |
+| **5. MergePullRequest** | 126 | 未设置 (=0) | 全量路径 | ❌ `_ =` 忽略 |
+| **6. NewPullRequest** | 163 | receiverID | 定向路径（提前计算 toNotify 循环） | ❌ `_ =` 忽略 |
+| **7. PullRequestReview** | 179 | 未设置 (=0) | 全量路径 | ❌ `_ =` 忽略 |
+| | 189 | mention.ID | 定向路径（@提及循环） | ❌ `_ =` 忽略 |
+| **8. PullRequestCodeComment** | 195 | mention.ID | 定向路径（只有@提及循环，无全量路径） | ❌ `_ =` 忽略 |
+| **9. PullRequestPushCommits** | 210 | 未设置 (=0) | 全量路径 | ❌ `_ =` 忽略 |
+| **10. PullReviewDismiss** | 219 | 未设置 (=0) | 全量路径 | ❌ `_ =` 忽略 |
+| **11. IssueChangeAssignee** | 234 | assignee.ID | 定向路径（仅新增 assignee 且 doer≠assignee 时） | ❌ `_ =` 忽略 |
+| **12. PullRequestReviewRequest** | 250 | reviewer.ID | 定向路径（仅 isRequest=true 时） | ❌ `_ =` 忽略 |
+
+> **说明**：
+> - 第 133 行 `AutoMergePullRequest` 调用 `MergePullRequest`，无独立 Push
+> - 第 254 行 `RepoPendingTransfer` 直接调用 `CreateRepoTransferNotification`，不通过队列
+> - 循环内的 Push（如 mentions 循环）是单个语句但运行时执行多次
+
+**典型调用格式**：
 ```go
 _ = ns.issueQueue.Push(issueNotificationOpts{
     IssueID:              issue.ID,
     NotificationAuthorID: doer.ID,
     CommentID:            comment.ID,
-    // ReceiverID: mention.ID,  // 可选：定向通知
+    ReceiverID:           mention.ID,  // 可选，定向通知时设置
 })
 ```
 
-#### 3.2.4 Push 返回值被忽略的可靠性影响
+#### 3.2.5 Push 返回值被忽略的可靠性影响
 
 **Push 方法签名**（`modules/queue/workerqueue.go:166-176`）：
 ```go
@@ -325,7 +380,7 @@ func (q *WorkerPoolQueue[T]) Push(data T) error {
 - 阻塞超时错误（队列满时重试超时，`base_levelqueue_common.go:34-43`）
 - Redis 连接错误（`base_redis.go:55-65`）
 
-**调用处全部忽略返回值**（`services/uinotification/notify.go` 中所有 8 处 Push 调用）：
+**调用处全部忽略返回值**（`services/uinotification/notify.go` 中所有 15 处 Push 调用）：
 ```go
 _ = ns.issueQueue.Push(opts)  // 错误被静默丢弃
 ```
@@ -336,7 +391,7 @@ _ = ns.issueQueue.Push(opts)  // 错误被静默丢弃
 3. **队列满时丢失**：队列达到配置上限时，新通知被丢弃且无日志记录
 4. **静默失败**：Push 返回值被 `_` 忽略，错误无任何追踪
 
-#### 3.2.5 ReceiverID 定向通知 vs 全量 Watcher 路径
+#### 3.2.6 ReceiverID 定向通知 vs 全量 Watcher 路径
 
 `CreateOrUpdateIssueNotifications` 函数有两个完全独立的代码分支，由 `receiverID` 参数控制。
 
@@ -865,15 +920,29 @@ notifications.LoadComments(ctx)
 
 | 维度 | 定向通知（receiverID > 0） | 全量路径（receiverID = 0） |
 |------|-------------------------|------------------------|
-| **触发场景** | @提及、被指派 | 普通评论、状态变更、新建 Issue |
+| **触发场景** | @提及、被指派、评审、代码评论@提及 | 普通评论、状态变更、新建 Issue、PR 合并、评审总评 |
+| **Notifier 方法及行号** | CreateIssueComment:86, NewIssue:96, NewPullRequest:163, PullRequestReview:189, PullRequestCodeComment:195, IssueChangeAssignee:234, PullRequestReviewRequest:250 | CreateIssueComment:76, NewIssue:91, IssueChangeStatus:105, IssueChangeTitle:118, MergePullRequest:126, PullRequestReview:179, PullRequestPushCommits:210, PullReviewDismiss:219 |
 | **候选接收者** | 仅指定用户 1 人 | Issue关注者 + 仓库关注者 + 参与者 |
 | **排除触发者** | ❌ 不执行 | ✅ 执行 |
 | **排除取消关注** | ❌ 不执行 | ✅ 执行 |
 | **权限校验** | ✅ 仍执行 | ✅ 执行 |
 | **每条评论入队次数** | N 次（N = @提及人数） | 1 次 |
 | **去重逻辑** | ✅ 同一 Issue 单条记录 | ✅ 同一 Issue 单条记录 |
+| **独立 Push 语句数** | 7 个（在 163/189/195/234/250/86/96） | 8 个（76/91/105/118/126/179/210/219） |
 
-### 7.3 处理流程代码证据
+### 7.3 Pending Review 触发条件并排对齐（Review 入口 vs Notify 入口）
+
+| 场景 | `CreateCodeComment` 参数条件 | `notify_service` 调用点 | 通知时机 |
+|------|----------------------------|------------------------|----------|
+| **立即触发** | | | |
+| 回复已有代码评论 | `!pendingReview && existsReview` | `notify_service.CreateIssueComment` (`services/pull/review.go:160`) | 立即 |
+| 独立代码评论（非 pending） | `!pendingReview && !existsReview` | `SubmitReview` 内 `notify_service.PullRequestCodeComment` (`services/pull/review.go:359`) | 立即（自动 SubmitReview） |
+| 评审总评（提交时） | `SubmitReview` 函数内 | `notify_service.PullRequestReview` (`services/pull/review.go:350`) | 立即 |
+| **延迟到 SubmitReview** | | | |
+| Pending 评审中的代码评论 | `pendingReview = true` | 无调用（见 `services/pull/review.go:203` 注释） | 延迟到 SubmitReview |
+| 所有 pending 代码评论（提交时） | `SubmitReview` 遍历 `review.CodeComments` | `notify_service.PullRequestCodeComment` (`services/pull/review.go:359`) | 延迟到 SubmitReview |
+
+### 7.4 处理流程代码证据
 
 **活动流同步证据**（`services/feed/feed.go:97-98`）：
 ```go
@@ -889,7 +958,7 @@ func NotifyWatchers(ctx context.Context, acts ...*activities_model.Action) error
 _ = ns.issueQueue.Push(opts)  // 仅入队，立即返回
 ```
 
-**Push 返回值忽略证据**（`services/uinotification/notify.go` 中 8 处调用）：
+**Push 返回值忽略证据**（`services/uinotification/notify.go` 中全部 15 处调用均使用 `_`）：
 ```go
 _ = ns.issueQueue.Push(opts)  // 错误被静默丢弃
 ```
@@ -919,7 +988,7 @@ workerIdleDuration     = 1 * time.Second         // worker 空闲超时
 EventSourceUpdateTime: 10 * time.Second
 ```
 
-### 7.4 触发顺序代码证据
+### 7.5 触发顺序代码证据
 
 **注册顺序**（`routers/init.go:130-131`）：
 ```go

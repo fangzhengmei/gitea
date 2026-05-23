@@ -52,6 +52,61 @@ if slices.Contains(cols, "status") && job.Status.IsWaiting() {
 }
 ```
 
+##### 2.1.2.0.1 FetchTask 版本变化与 task=nil 的约束（避免"版本变化必有任务"误解）
+
+**仓内代码可证的完整 FetchTask 逻辑** (`routers/api/actions/runner/runner.go:177-220`):
+```go
+func (s *Service) FetchTask(ctx, req) (*Response[FetchTaskResponse], error) {
+    runner := GetRunner(ctx)
+    var task *runnerv1.Task
+    tasksVersion := req.Msg.TasksVersion
+    
+    latestVersion, err := actions_model.GetTasksVersionByScope(ctx, runner.OwnerID, runner.RepoID)
+    // ... tasksVersion=0 兼容处理 ...
+    
+    if tasksVersion != latestVersion {
+        // 版本不一致时才尝试 PickTask
+        freshRunner, _ := actions_model.GetRunnerByUUID(ctx, runner.UUID)
+        if t, ok, err := actions_service.PickTask(ctx, freshRunner); err != nil {
+            return nil, status.Errorf(codes.Internal, "pick task: %v", err)
+        } else if ok {
+            task = t  // 只有 ok=true 时才赋值
+        }
+        // ok=false 时 task 仍为 nil
+    }
+    
+    return connect.NewResponse(&runnerv1.FetchTaskResponse{
+        Task:         task,         // 可能为 nil，即使版本已变化
+        TasksVersion: latestVersion,
+    }), nil
+}
+```
+
+**PickTask 返回 `ok=false` (task=nil) 的仓内代码可证场景** (`services/actions/task.go:19-112`):
+
+| 场景 | 代码位置 | 返回值 |
+|------|---------|--------|
+| Runner 被禁用 | `services/actions/task.go:26-28` | `nil, false, nil` |
+| Ephemeral Runner 已有未完成任务 | `services/actions/task.go:38-40` | `nil, false, nil` |
+| `CreateTaskForRunner` 无匹配作业 | `models/actions/task.go:230-334` | `nil, false, nil` |
+| 作业标签不匹配 | `models/actions/task.go:297-305` | `nil, false, nil` |
+| 乐观锁冲突（task_id 已被其他 Runner 占用）| `models/actions/task.go:323-328` | `nil, false, nil` |
+| 事务内其他错误 | `services/actions/task.go:95-97` | `nil, false, err` |
+
+**核心约束（仓内代码可证）**:
+- ✅ `tasksVersion != latestVersion` 只是 **尝试** PickTask 的前提条件，不是任务存在的保证
+- ✅ 即使版本变化，`PickTask` 返回 `ok=false` 时，`FetchTaskResponse.Task` 仍为 `nil`
+- ✅ `FetchTaskResponse.TasksVersion` 始终返回最新版本号，无论是否分配到任务
+- ✅ Runner 侧需要处理 `Task=nil` 并继续轮询，不能假设版本变化就一定有任务
+
+**典型运行场景示例**:
+1. Repo1 有新作业就绪 → 版本 v20 → v21
+2. Runner A（仓库级）轮询：`tasksVersion=20 != 21` → 尝试 PickTask → 成功分配任务 → 返回 Task 对象
+3. Runner B（同仓库另一个 Runner）轮询：`tasksVersion=20 != 21` → 尝试 PickTask → 无 Waiting 作业 → 返回 `Task=nil, TasksVersion=21`
+4. Runner B 更新本地版本为 21，下次轮询时 `21 == 21` → 跳过 PickTask
+
+---
+
 ##### 2.1.2.1 `tasksVersion=0` 兼容分支深度分析
 
 **问题背景**: 系统首次运行或某作用域从未产生过任务时，`GetTasksVersionByScope` 返回 0。
@@ -174,35 +229,40 @@ func IncreaseTaskVersion(ctx context.Context, ownerID, repoID int64) error {
      - 有组织级 Runner，但标签不匹配 → Runner 版本变化触发 PickTask，但 `CanMatchLabels` 失败，任务仍无法分配
      - 组织级 Runner 被禁用 → 版本递增了，但 Runner 被 `IsDisabled` 检查过滤
 
-3. ✅ **仓内代码可证**：`GetTasksVersionByScope` 的查询逻辑
+3. ✅ **仓内代码可证**：`GetTasksVersionByScope` 的查询逻辑（与源码完全一致）
    ```go
-   // models/actions/tasks_version.go:56-73
+   // models/actions/tasks_version.go:31-40
    func GetTasksVersionByScope(ctx context.Context, ownerID, repoID int64) (int64, error) {
-       cond := builder.NewCond()
-       if ownerID > 0 {
-           cond = cond.And(builder.Eq{"owner_id": ownerID})
-       } else {
-           cond = cond.And(builder.Eq{"owner_id": 0})
-       }
-       if repoID > 0 {
-           cond = cond.And(builder.Eq{"repo_id": repoID})
-       } else {
-           cond = cond.And(builder.Eq{"repo_id": 0})
-       }
-       var v ActionTasksVersion
-       has, err := db.GetEngine(ctx).Where(cond).Get(&v)
+       var tasksVersion ActionTasksVersion
+       has, err := db.GetEngine(ctx).Where("owner_id = ? AND repo_id = ?", ownerID, repoID).Get(&tasksVersion)
        if err != nil {
            return 0, err
        } else if !has {
            return 0, nil // 记录不存在时返回 0
        }
-       return v.Version, nil
+       return tasksVersion.Version, err
    }
    ```
-   - 全局 Runner 查 `owner_id=0, repo_id=0`
-   - 组织 Runner 查 `owner_id=?, repo_id=0`
-   - 仓库 Runner 查 `owner_id=0, repo_id=?`
-   - 三者完全隔离，互不干扰
+   - 全局 Runner 调用：`GetTasksVersionByScope(ctx, 0, 0)` → `WHERE owner_id = 0 AND repo_id = 0`
+   - 组织 Runner 调用：`GetTasksVersionByScope(ctx, ownerID, 0)` → `WHERE owner_id = ? AND repo_id = 0`
+   - 仓库 Runner 调用：`GetTasksVersionByScope(ctx, 0, repoID)` → `WHERE owner_id = 0 AND repo_id = ?`
+   - 三者通过传入参数值隔离，互不干扰
+
+4. ✅ **仓内代码可证**：`increaseTasksVersionByScope` 的更新逻辑（与源码完全一致）
+   ```go
+   // models/actions/tasks_version.go:54-73
+   func increaseTasksVersionByScope(ctx context.Context, ownerID, repoID int64) error {
+       result, err := db.GetEngine(ctx).Exec(
+           "UPDATE action_tasks_version SET version = version + 1 WHERE owner_id = ? AND repo_id = ?",
+           ownerID, repoID)
+       // ...
+       if affected == 0 {
+           // 记录不存在时自动插入
+           insertTasksVersion(ctx, ownerID, repoID)
+       }
+       return nil
+   }
+   ```
 
 4. **版本递增 ≠ 任务可分配**：
    版本递增只是"通知信号"，任务能否实际分配还需经过 `PickTask` 中的多重检查：
@@ -556,17 +616,20 @@ func generateTaskContext(ctx context.Context, t *actions_model.ActionTask) (*str
    - ⚠️ **【推断】** `actions/upload-artifact` / `actions/cache` 等 Action 使用该 JWT 调用 Gitea API
    - > 注：以上 Runner 侧和第三方 Action 的行为不在当前仓内代码范围内，属于合理推断
 
-**双 Token 职责分离**:
+**双 Token 职责分离（仓内代码可证 vs 推断边界）**:
 
 | 特性 | Task Token | gitea_runtime_token (JWT) |
 |------|-----------|--------------------------|
-| **生成方式** | 随机字符串 + Salted SHA256 | JWT HS256 签名 |
-| **存储方式** | 仅存哈希（不可逆） | 无需存储（自包含） |
-| **认证方式** | 哈希比较 | JWT 验签 |
-| **有效条件** | Task 状态为 Running/Cancelling | 签名有效 + 未过期 |
-| **主要用途** | Git 代码克隆认证 | Gitea API 调用授权 |
-| **权限范围** | 仅限对应 Task 的代码仓库 | 对应 Task 的 Actions 权限（artifact/cache 等） |
-| **失效时机** | Task 终态（Success/Failure/Cancelled/Skipped） | 1 小时 + EndlessTaskTimeout 后过期 |
+| **生成方式** ✅ | 随机字符串 + Salted SHA256 | JWT HS256 签名 |
+| **存储方式** ✅ | 仅存哈希（不可逆） | 无需存储（自包含） |
+| **认证方式** ✅ | 恒定时间哈希比较 | HS256 验签 |
+| **有效条件** ✅ | Task 状态为 Running/Cancelling | 签名有效 + 未过期 |
+| **注入字段** ✅ | `gitCtx["token"]` | `gitCtx["gitea_runtime_token"]` |
+| **主要用途** ⚠️【推断】 | Git 代码克隆认证 | Gitea API 调用授权 |
+| **权限范围** ⚠️【推断】 | 对应 Task 的代码仓库访问 | 对应 Task 的 Actions 权限（artifact/cache 等） |
+| **失效时机** ✅ | Task 终态（Success/Failure/Cancelled/Skipped） | 1 小时 + EndlessTaskTimeout 后过期 |
+
+> 标注说明：✅ 表示仓内代码可证，⚠️【推断】表示超出仓内代码范围，属于基于协议约定的合理推断
 
 ---
 
@@ -1054,6 +1117,8 @@ User/System                             Gitea                                  R
 7. **防时序攻击**：所有令牌比较使用 `subtle.ConstantTimeCompare`
 8. **去重机制**：`jobEmitterQueue` 使用 `ErrAlreadyInQueue` 防止重复调度
 9. **版本递增原子性**：三层版本递增在同一数据库事务中完成
+10. **版本变化不保证任务**：`tasksVersion != latestVersion` 仅触发 PickTask 尝试，不保证返回 Task
+11. **查询条件一致性**：版本查询和更新都使用 `WHERE owner_id = ? AND repo_id = ?` 参数化条件
 
 ### 8.2 推断边界说明（仓内代码不可证部分）
 
@@ -1065,6 +1130,8 @@ User/System                             Gitea                                  R
 
 ### 8.3 关键边界说明（避免误推）
 
-1. **版本递增 ≠ 任务可分配**：版本递增只是"通知信号"，任务能否分配还需经过 Runner 禁用、标签匹配、乐观锁等多重检查
-2. **组织版本递增 ≠ 存在组织级 Runner**：版本递增与 Runner 存在是两个独立条件，无组织级 Runner 时任务可由全局或仓库级 Runner 消费
-3. **`tasksVersion=0` 特殊处理**：首次访问时自动初始化版本记录，避免返回 0 被误认为旧版 Gitea
+1. **版本变化 ≠ 必有任务返回**：`tasksVersion != latestVersion` 只是尝试 PickTask 的前提，`PickTask` 返回 `ok=false` 时 `FetchTaskResponse.Task` 仍为 `nil`
+2. **版本递增 ≠ 任务可分配**：版本递增只是"通知信号"，任务能否分配还需经过 Runner 禁用、标签匹配、乐观锁等多重检查
+3. **组织版本递增 ≠ 存在组织级 Runner**：版本递增与 Runner 存在是两个独立条件，无组织级 Runner 时任务可由全局或仓库级 Runner 消费
+4. **`tasksVersion=0` 特殊处理**：首次访问时自动初始化版本记录，避免返回 0 被误认为旧版 Gitea
+5. **查询条件一致性**：`GetTasksVersionByScope` 和 `increaseTasksVersionByScope` 都使用 `WHERE owner_id = ? AND repo_id = ?` 条件，通过参数值实现作用域隔离

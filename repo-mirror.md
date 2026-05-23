@@ -368,62 +368,88 @@ type SyncRequest struct {
 
 ### 5.3 队列去重在出队后的生效边界
 
-**底层实现**: `modules/queue/base_levelqueue_unique.go:18-87`
+Gitea 支持两种底层队列实现：**LevelDB (level)** 和 **内存 Channel (channel)**，它们在出队后的去重行为**完全不同**。
 
-`levelqueue.UniqueQueue` 使用两个数据结构存储：
-1. **Queue (List)**: 存储待处理的排队项（按顺序等待消费）
-2. **Set**: 存储所有曾经入队过的项的哈希值（用于去重检查）
+#### 5.3.1 两类队列的去重差异证据
 
-#### 去重生命周期
-
-| 操作 | Queue 行为 | Set 行为 |
-|-----|-----------|---------|
-| **PushItem** | 添加到 Queue 尾部 | 添加到 Set |
-| **LPop (出队)** | 从 Queue 头部移除 | **不从 Set 中移除** |
-| **HasItem** | 不检查 | 检查 Set 中是否存在 |
+| 操作 | Level 队列 (`baseLevelQueueUnique`) | Channel 队列 (`baseChannel`) |
+|-----|-----------------------------------|-------------------------------|
+| **PushItem** | 添加到 Queue + Set | 添加到 channel + Set |
+| **出队** | `LPop()` 仅移除 Queue，**Set 不移除** | `PopItem()` 同时移除 channel 和 **Set** |
+| **出队后 HasItem** | 返回 `true`（仍在 Set 中） | 返回 `false`（已从 Set 移除） |
+| **出队后能否再次入队** | ❌ 不能 | ✅ 可以 |
+| **清空去重方式** | 调用 `RemoveAll()` 或系统重启 | 出队自动清理 |
 
 **关键结论**：
 ```
-一旦一个 SyncRequest 成功入队，在 RemoveAll() 被调用前，它将永远存在于去重 Set 中，无法再次入队。
+Level 队列：一旦入队，除非 RemoveAll() 或重启，否则永远无法再次入队
+Channel 队列：出队后自动清理去重 Set，可以立即再次入队
 ```
 
-#### 生效边界说明
+#### 5.3.2 Level 队列实现 (`modules/queue/base_levelqueue_unique.go`)
 
-1. **入队时去重** (`base_levelqueue_common.go:33-50`):
-   ```go
-   func (q *baseLevelQueueCommonImpl) PushItem(ctx, data) error {
-       // ...
-       if err == levelqueue.ErrAlreadyInQueue {
-           err = ErrAlreadyInQueue  // Set 中已存在，拒绝入队
-       }
-   }
-   ```
+**出队时不清空去重** (`base_levelqueue_common.go:52-68`):
+```go
+func (q *baseLevelQueueCommonImpl) PopItem(ctx) ([]byte, error) {
+    return backoffRetErr(ctx, ..., func() (retry bool, data []byte, err error) {
+        data, err = q.internalFunc().LPop()  // 只从 Queue 移除
+        // 不对 Set 做任何操作
+        return false, data, err
+    })
+}
+```
 
-2. **出队后不清空去重** (`base_levelqueue_common.go:52-68`):
-   ```go
-   func (q *baseLevelQueueCommonImpl) PopItem(ctx) ([]byte, error) {
-       data, err = q.internalFunc().LPop()
-       // 只从 Queue 移除，不修改 Set
-   }
-   ```
+**唯一清空去重的方式** (`base_levelqueue_unique.go:75-87`):
+```go
+func (q *baseLevelQueueUnique) RemoveAll(ctx) error {
+    // 删除 Queue 和 Set 的所有 LevelDB key
+    lqinternal.RemoveLevelQueueKeys(q.db, []byte(q.cfg.QueueFullName))
+    lqinternal.RemoveLevelQueueKeys(q.db, []byte(q.cfg.SetFullName))
+    // 重新创建 queue 和 set
+}
+```
 
-3. **唯一清空去重的方式** (`base_levelqueue_unique.go:75-87`):
-   ```go
-   func (q *baseLevelQueueUnique) RemoveAll(ctx) error {
-       // 删除 Queue 和 Set 的所有 LevelDB key
-       lqinternal.RemoveLevelQueueKeys(q.db, []byte(q.cfg.QueueFullName))
-       lqinternal.RemoveLevelQueueKeys(q.db, []byte(q.cfg.SetFullName))
-       // 重新创建 queue 和 set
-   }
-   ```
+#### 5.3.3 Channel 队列实现 (`modules/queue/base_channel.go:72-85`)
 
-#### 影响与限制
+**出队时同时清空去重**:
+```go
+func (q *baseChannel) PopItem(ctx context.Context) ([]byte, error) {
+    select {
+    case data, ok := <-q.c:
+        if !ok {
+            return nil, errChannelClosed
+        }
+        q.mu.Lock()
+        q.set.Remove(string(data))  // ✅ 从 Set 中移除！
+        q.mu.Unlock()
+        return data, nil
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    }
+}
+```
 
-- 如果一个镜像同步任务正在执行中或刚执行完，**无法立即再次入队**
-- 即使同步失败，也无法立即重试，必须等待 `RemoveAll()` 或系统重启
+#### 5.3.4 共同的入队去重逻辑
+
+两类队列的入队去重逻辑相同：
+```go
+// PushItem 时检查 Set
+if q.isUnique && q.set.Contains(string(data)) {
+    return ErrAlreadyInQueue
+}
+```
+
+#### 5.3.5 实际影响
+
+- **生产环境（默认 Level 队列）**:
+  - 镜像同步任务正在执行中或刚执行完，**无法立即再次入队**
+  - 即使同步失败，也无法立即重试，必须等待 `RemoveAll()` 或系统重启
+- **测试/开发环境（可能使用 Channel 队列）**:
+  - 出队后可以立即再次入队
+
 - `modules/queue/workerqueue.go:178-182` 注释明确说明：
   > "Has only works for unique queues. Keep in mind that this check may not be reliable (due to lacking of proper transaction support). There could be a small chance that duplicate items appear in the queue"
-- 由于缺乏事务支持，仍有极小概率出现重复项
+- 由于缺乏事务支持，两类队列都有极小概率出现重复项
 
 ---
 
@@ -481,21 +507,40 @@ func ParseRemoteAddr(remoteAddr, authUsername, authPassword string) (string, err
 }
 ```
 
-**UpdateAddress 实现** (`services/mirror/mirror.go:46-57`):
+**UpdateAddress 真实实现** (`services/mirror/mirror_pull.go:33-71`):
 ```go
-func UpdateAddress(ctx context.Context, m *repo_model.Mirror, newAddress string) error {
+func UpdateAddress(ctx context.Context, m *repo_model.Mirror, addr string) error {
+    // 解析 URL 用于后续清除凭据
+    u, err := giturl.ParseGitURL(addr)
+    remoteName := m.GetRemoteName()  // 通常为 "origin"
+    repo := m.GetRepository(ctx)
+
     // 先删除旧 remote
-    gitrepo.RemoveRemote(ctx, m.Repo, "origin")
-    // 重新添加带新凭据的 remote
-    err := gitrepo.AddRemote(ctx, m.Repo, "origin", newAddress, ...)
-    // 更新 Wiki remote
-    if m.Repo.HasWiki() {
-        gitrepo.AddRemote(ctx, wikiRepo, "origin", wikiAddress, ...)
+    err = gitrepo.GitRemoteRemove(ctx, repo, remoteName)
+    if err != nil && !git.IsRemoteNotExistError(err) {
+        return err
     }
+
+    // 重新添加带新凭据的 remote（使用 RemoteOptionMirrorFetch）
+    err = gitrepo.GitRemoteAdd(ctx, repo, remoteName, addr, gitrepo.RemoteOptionMirrorFetch)
+
+    // 更新 Wiki remote
+    if repo_service.HasWiki(ctx, m.Repo) {
+        wikiRemotePath := repo_module.WikiRemoteURL(ctx, addr)
+        gitrepo.GitRemoteRemove(ctx, repo.WikiStorageRepo(), remoteName)
+        gitrepo.GitRemoteAdd(ctx, repo.WikiStorageRepo(), remoteName, wikiRemotePath, gitrepo.RemoteOptionMirrorFetch)
+    }
+
+    // 清除 URL 中的用户信息后保存到数据库
+    u.User = nil
+    m.Repo.OriginalURL = u.String()
+    return repo_model.UpdateRepositoryColsNoAutoTime(ctx, m.Repo, "original_url")
 }
 ```
 
 #### 6.2.2 推送镜像凭据更新
+
+**⚠️ 重要事实校正**: 推送镜像的地址**创建后无法通过 Web UI 更新**。`handleSettingsPostPushMirrorUpdate` 只更新 `Interval`，不更新地址。
 
 **创建时** (`routers/web/repo/setting/setting.go:474-535`):
 ```go
@@ -508,32 +553,62 @@ if err = mirror_service.AddPushMirrorRemote(ctx, m, address); err != nil {
 }
 ```
 
-**更新时** (`routers/web/repo/setting/setting.go:388-438`):
+**更新间隔时** (`routers/web/repo/setting/setting.go:399-438`):
 ```go
-// 获取现有 PushMirror 记录
-m, _, _ := repo_model.GetPushMirrorByIDAndRepoID(ctx, form.PushMirrorID, repo.ID)
-// 组合新的带凭据地址
-address, err := git.ParseRemoteAddr(form.PushMirrorAddress, form.PushMirrorUsername, form.PushMirrorPassword)
-// 更新 git remote URL
-if err = mirror_service.UpdatePushMirrorAddress(ctx, m, address); err != nil {
-    ctx.ServerError("UpdatePushMirrorAddress", err)
-    return
+// handleSettingsPostPushMirrorUpdate 只更新 Interval，不更新地址！
+func handleSettingsPostPushMirrorUpdate(ctx *context.Context) {
+    interval, err := time.ParseDuration(form.PushMirrorInterval)
+    m, _, _ := repo_model.GetPushMirrorByIDAndRepoID(ctx, form.PushMirrorID, repo.ID)
+
+    m.Interval = interval
+    // 只更新间隔，不涉及地址/凭据更新
+    if err := repo_model.UpdatePushMirrorInterval(ctx, m); err != nil {
+        ctx.ServerError("UpdatePushMirrorInterval", err)
+        return
+    }
+
+    // 可选立即同步
+    if !ctx.FormBool("push_mirror_defer_sync") {
+        mirror_service.AddPushMirrorToQueue(m.ID)
+    }
 }
 ```
 
+**地址更新的唯一方式**: 目前代码中**不存在 `UpdatePushMirrorAddress` 函数**。若需更新推送镜像地址，只能：
+1. 删除旧的推送镜像
+2. 重新创建新的推送镜像（带新地址和凭据）
+
 #### 6.2.3 凭据更新数据流
 
+**拉取镜像更新流**:
 ```
 用户表单输入 (username/password)
        ↓
 ParseRemoteAddr() → 组合成 https://user:pass@host/repo.git
        ↓
-UpdateAddress() 或 UpdatePushMirrorAddress()
+UpdateAddress(mirror, addr)  [services/mirror/mirror_pull.go:33]
        ↓
-├─ git remote remove <remote>
-└─ git remote add <remote> <new_address_with_creds>
+├─ git remote remove origin
+├─ git remote add origin <new_addr_with_creds>  # --mirror=fetch
+└─ (若有Wiki) wiki remote 同步更新
        ↓
-数据库保存: RemoteAddress = SanitizeURL(address)  // 清除凭据后保存
+数据库保存: OriginalURL = SanitizeURL(address)  // 清除凭据后保存
+```
+
+**推送镜像创建流**（地址更新只能通过删除重建）:
+```
+用户表单输入 (address, username, password)
+       ↓
+ParseRemoteAddr() → 组合成 https://user:pass@host/repo.git
+       ↓
+AddPushMirrorRemote(m, addr)  [services/mirror/mirror_push.go:33]
+       ↓
+├─ git remote add <remote_name> <addr_with_creds>  # --mirror=push
+├─ git config remote.<remote_name>.push +refs/heads/*:refs/heads/*
+├─ git config remote.<remote_name>.push +refs/tags/*:refs/tags/*
+└─ (若有Wiki) wiki remote 同步配置
+       ↓
+数据库保存: RemoteAddress = SanitizeURL(address)
 ```
 
 ### 6.3 日志安全
@@ -606,9 +681,11 @@ UpdateAddress() 或 UpdatePushMirrorAddress()
 | 提交触发推送 | `services/mirror/notifier.go` | `mirrorNotifier` |
 | 数据模型 | `models/repo/mirror.go` | `Mirror`, `PushMirror` |
 | 全局配置 | `modules/setting/mirror.go` | `Mirror` |
-| 凭据更新 | `services/mirror/mirror.go` | `UpdateAddress`, `UpdatePushMirrorAddress` |
+| 拉取凭据更新 | `services/mirror/mirror_pull.go` | `UpdateAddress` |
+| 推送间隔更新 | `models/repo/pushmirror.go` | `UpdatePushMirrorInterval` |
 | URL 组合 | `modules/git/remote.go` | `ParseRemoteAddr` |
-| 队列去重 | `modules/queue/base_levelqueue_unique.go` | `RemoveAll` |
+| Level 队列去重 | `modules/queue/base_levelqueue_unique.go` | `RemoveAll` |
+| Channel 队列去重 | `modules/queue/base_channel.go` | `PopItem` (自动清理) |
 
 ---
 

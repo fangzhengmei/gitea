@@ -65,8 +65,26 @@ var Mirror = struct {
 1. **全局锁保护**: 使用 `globallock.Lock("repo_pull_mirror_{repoID}")` 防止并发同步
 2. **进程上下文**: 通过 `process.GetManager().AddContext()` 跟踪同步进程
 3. **执行同步**: 调用 `runSync()` 执行实际同步
-4. **调度下次更新**: 成功后调用 `ScheduleNextUpdate()` 计算下次同步时间
+4. **调度下次更新**:
+   - **成功**: 调用 `ScheduleNextUpdate()` 计算下次同步时间（`Now + Interval`），并更新 `LastSyncUnix = UpdatedUnix`
+   - **失败**: 仅调用 `TouchMirror()` 更新 `UpdatedUnix`，**不修改 `NextUpdateUnix`**，保持原调度时间不变
 5. **通知机制**: 对变更的引用发送通知（创建/删除/推送）
+
+#### 失败后的调度重试时机
+**文件**: `services/mirror/mirror_pull.go:299-303`
+
+```go
+if !ok {
+    if err = repo_model.TouchMirror(ctx, m); err != nil {
+        log.Error("SyncMirrors [repo: %-v]: failed to TouchMirror: %v", m.Repo, err)
+    }
+    return false
+}
+```
+
+- `TouchMirror()` 只更新 `updated_unix` 时间戳，不改变 `next_update_unix`
+- 因此失败后，下次 cron 检查（每 10 分钟）时，若 `next_update_unix <= now` 会自动重新入队重试
+- 无论成功失败，**都不会立即重新入队**，必须等到原调度时间或下一次 cron 检查
 
 ### 2.2 同步执行逻辑 (`runSync`)
 
@@ -94,16 +112,23 @@ cmd.AddDynamicArguments(remoteName)
 
 #### 2.2.3 冲突处理与重试机制
 
+**可恢复错误计数**: 代码中**没有显式的重试计数器**，在一次 `runSync` 调用内最多只重试 **1 次**：
+
 ```go
 if checkRecoverableSyncError(fetchStderr) {
     // 尝试修剪损坏的引用
     pruneErr := pruneBrokenReferences(ctx, m, m.Repo, timeout)
     if pruneErr == nil {
-        // 重新尝试拉取
+        // 重新尝试拉取（仅此一次）
         fetchStdout, fetchStderr, err = gitrepo.RunCmdString(ctx, m.Repo, cmdFetch())
     }
+    // 如果 prune 失败或再次 fetch 失败，不会继续重试，直接返回失败
 }
 ```
+
+- 重试次数限制：**0 或 1 次**（prune 成功才重试，不成功则直接失败）
+- 若 prune 后 fetch 再次失败，不会继续重试，按普通失败处理
+- 需等待下次 cron 调度（每 10 分钟）才有机会再次尝试
 
 #### 2.2.4 Wiki 同步
 如果仓库启用了 Wiki，会对 Wiki 仓库执行相同的同步流程。
@@ -285,6 +310,39 @@ And("`repository`.is_archived = ?", false).
 OrderBy("last_update ASC")
 ```
 
+> **注意**: `And("`push_mirror`.`interval` != 0")` 条件意味着 **interval=0 的推送镜像永远不会被定时调度触发**。
+
+### 4.4 推送镜像 interval=0 时的触发路径
+
+当 `Interval = 0` 时，推送镜像不会被定时 cron 任务调度，只能通过以下三种路径触发：
+
+| 触发路径 | 代码位置 | 说明 |
+|---------|---------|------|
+| **提交自动触发** | `services/mirror/notifier.go:25-31` | 需满足 `SyncOnCommit = true`（默认值）。每次有代码推送时，`mirrorNotifier.PushCommits()` 被调用，筛选出 `SyncOnCommit=true` 的推送镜像并加入队列。 |
+| **Web UI 手动触发** | `routers/web/repo/setting/setting.go:378-393` | 用户在仓库设置页面点击 "Sync" 按钮，调用 `handleSettingsPostPushMirrorSync()` → `AddPushMirrorToQueue(m.ID)`。 |
+| **API 同步触发** | `routers/api/v1/repo/mirror.go:77-124` | 调用 `POST /repos/{owner}/{repo}/push_mirrors-sync`，会遍历该仓库所有推送镜像并**同步执行** `SyncPushMirror()`（不走队列）。 |
+
+**关键代码 - 提交触发** (`services/mirror/mirror_push.go:256-265`):
+```go
+func syncPushMirrorWithSyncOnCommit(ctx context.Context, repoID int64) {
+    pushMirrors, err := repo_model.GetPushMirrorsSyncedOnCommit(ctx, repoID)
+    // 筛选 SyncOnCommit = true 的镜像
+    for _, mirror := range pushMirrors {
+        AddPushMirrorToQueue(mirror.ID)
+    }
+}
+```
+
+**数据库查询** (`models/repo/pushmirror.go:132-136`):
+```go
+func GetPushMirrorsSyncedOnCommit(ctx context.Context, repoID int64) ([]*PushMirror, error) {
+    return db.Find[PushMirror](ctx, findPushMirrorOptions{
+        RepoID:       repoID,
+        SyncOnCommit: optional.Some(true),  // 只返回 SyncOnCommit=true 的
+    })
+}
+```
+
 ---
 
 ## 五、队列机制
@@ -308,6 +366,65 @@ type SyncRequest struct {
 - **异步入队**: `addMirrorToQueue()` 使用 goroutine 异步入队，避免阻塞
 - **优雅关闭**: 通过 `graceful.GetManager().RunWithCancel()` 支持优雅关闭
 
+### 5.3 队列去重在出队后的生效边界
+
+**底层实现**: `modules/queue/base_levelqueue_unique.go:18-87`
+
+`levelqueue.UniqueQueue` 使用两个数据结构存储：
+1. **Queue (List)**: 存储待处理的排队项（按顺序等待消费）
+2. **Set**: 存储所有曾经入队过的项的哈希值（用于去重检查）
+
+#### 去重生命周期
+
+| 操作 | Queue 行为 | Set 行为 |
+|-----|-----------|---------|
+| **PushItem** | 添加到 Queue 尾部 | 添加到 Set |
+| **LPop (出队)** | 从 Queue 头部移除 | **不从 Set 中移除** |
+| **HasItem** | 不检查 | 检查 Set 中是否存在 |
+
+**关键结论**：
+```
+一旦一个 SyncRequest 成功入队，在 RemoveAll() 被调用前，它将永远存在于去重 Set 中，无法再次入队。
+```
+
+#### 生效边界说明
+
+1. **入队时去重** (`base_levelqueue_common.go:33-50`):
+   ```go
+   func (q *baseLevelQueueCommonImpl) PushItem(ctx, data) error {
+       // ...
+       if err == levelqueue.ErrAlreadyInQueue {
+           err = ErrAlreadyInQueue  // Set 中已存在，拒绝入队
+       }
+   }
+   ```
+
+2. **出队后不清空去重** (`base_levelqueue_common.go:52-68`):
+   ```go
+   func (q *baseLevelQueueCommonImpl) PopItem(ctx) ([]byte, error) {
+       data, err = q.internalFunc().LPop()
+       // 只从 Queue 移除，不修改 Set
+   }
+   ```
+
+3. **唯一清空去重的方式** (`base_levelqueue_unique.go:75-87`):
+   ```go
+   func (q *baseLevelQueueUnique) RemoveAll(ctx) error {
+       // 删除 Queue 和 Set 的所有 LevelDB key
+       lqinternal.RemoveLevelQueueKeys(q.db, []byte(q.cfg.QueueFullName))
+       lqinternal.RemoveLevelQueueKeys(q.db, []byte(q.cfg.SetFullName))
+       // 重新创建 queue 和 set
+   }
+   ```
+
+#### 影响与限制
+
+- 如果一个镜像同步任务正在执行中或刚执行完，**无法立即再次入队**
+- 即使同步失败，也无法立即重试，必须等待 `RemoveAll()` 或系统重启
+- `modules/queue/workerqueue.go:178-182` 注释明确说明：
+  > "Has only works for unique queues. Keep in mind that this check may not be reliable (due to lacking of proper transaction support). There could be a small chance that duplicate items appear in the queue"
+- 由于缺乏事务支持，仍有极小概率出现重复项
+
 ---
 
 ## 六、凭据安全处理
@@ -328,7 +445,98 @@ Git 凭据通过 **git remote URL 内嵌** 方式存储，而非使用 credentia
    m.Repo.OriginalURL = u.String()
    ```
 
-### 6.2 日志安全
+### 6.2 凭据更新回填逻辑
+
+凭据实际存储在 git remote 配置中，数据库只存储清除了凭据的地址。更新凭据需要重新构造带凭据的 URL 并更新 git remote。
+
+#### 6.2.1 拉取镜像凭据更新
+
+**文件**: `routers/web/repo/setting/setting.go:309-327`
+
+```go
+// 特殊回填逻辑：如果用户名与当前用户相同且密码为空，自动回填用户密码
+if form.MirrorPassword == "" && form.MirrorUsername == u.User.Username() {
+    form.MirrorPassword, _ = u.User.Password()
+}
+
+// ParseRemoteAddr 组合用户名和密码到 URL 中
+address, err := git.ParseRemoteAddr(form.MirrorAddress, form.MirrorUsername, form.MirrorPassword)
+
+// UpdateAddress 更新 git remote URL（含凭据）
+if err := mirror_service.UpdateAddress(ctx, pullMirror, address); err != nil {
+    ctx.ServerError("UpdateAddress", err)
+    return
+}
+```
+
+**URL 组合逻辑** (`modules/git/remote.go:82-110`):
+```go
+func ParseRemoteAddr(remoteAddr, authUsername, authPassword string) (string, error) {
+    u, err := url.Parse(remoteAddr)
+    if len(authUsername)+len(authPassword) > 0 {
+        // 覆盖 URL 中的 userinfo
+        u.User = url.UserPassword(authUsername, authPassword)
+    }
+    return u.String(), nil
+}
+```
+
+**UpdateAddress 实现** (`services/mirror/mirror.go:46-57`):
+```go
+func UpdateAddress(ctx context.Context, m *repo_model.Mirror, newAddress string) error {
+    // 先删除旧 remote
+    gitrepo.RemoveRemote(ctx, m.Repo, "origin")
+    // 重新添加带新凭据的 remote
+    err := gitrepo.AddRemote(ctx, m.Repo, "origin", newAddress, ...)
+    // 更新 Wiki remote
+    if m.Repo.HasWiki() {
+        gitrepo.AddRemote(ctx, wikiRepo, "origin", wikiAddress, ...)
+    }
+}
+```
+
+#### 6.2.2 推送镜像凭据更新
+
+**创建时** (`routers/web/repo/setting/setting.go:474-535`):
+```go
+// 组合带凭据的地址
+address, err := git.ParseRemoteAddr(form.PushMirrorAddress, form.PushMirrorUsername, form.PushMirrorPassword)
+// 添加到 git remote
+if err = mirror_service.AddPushMirrorRemote(ctx, m, address); err != nil {
+    ctx.ServerError("AddPushMirrorRemote", err)
+    return
+}
+```
+
+**更新时** (`routers/web/repo/setting/setting.go:388-438`):
+```go
+// 获取现有 PushMirror 记录
+m, _, _ := repo_model.GetPushMirrorByIDAndRepoID(ctx, form.PushMirrorID, repo.ID)
+// 组合新的带凭据地址
+address, err := git.ParseRemoteAddr(form.PushMirrorAddress, form.PushMirrorUsername, form.PushMirrorPassword)
+// 更新 git remote URL
+if err = mirror_service.UpdatePushMirrorAddress(ctx, m, address); err != nil {
+    ctx.ServerError("UpdatePushMirrorAddress", err)
+    return
+}
+```
+
+#### 6.2.3 凭据更新数据流
+
+```
+用户表单输入 (username/password)
+       ↓
+ParseRemoteAddr() → 组合成 https://user:pass@host/repo.git
+       ↓
+UpdateAddress() 或 UpdatePushMirrorAddress()
+       ↓
+├─ git remote remove <remote>
+└─ git remote add <remote> <new_address_with_creds>
+       ↓
+数据库保存: RemoteAddress = SanitizeURL(address)  // 清除凭据后保存
+```
+
+### 6.3 日志安全
 
 **文件**: `modules/util/sanitize.go:37-127`
 
@@ -343,7 +551,7 @@ Git 凭据通过 **git remote URL 内嵌** 方式存储，而非使用 credentia
 - 错误消息（`SanitizeErrorCredentialURLs`）
 - 所有可能包含 URL 的日志输出
 
-### 6.3 禁用交互式凭据提示
+### 6.4 禁用交互式凭据提示
 
 **文件**: `modules/git/gitcmd/command.go:251`
 ```go
@@ -398,6 +606,9 @@ Git 凭据通过 **git remote URL 内嵌** 方式存储，而非使用 credentia
 | 提交触发推送 | `services/mirror/notifier.go` | `mirrorNotifier` |
 | 数据模型 | `models/repo/mirror.go` | `Mirror`, `PushMirror` |
 | 全局配置 | `modules/setting/mirror.go` | `Mirror` |
+| 凭据更新 | `services/mirror/mirror.go` | `UpdateAddress`, `UpdatePushMirrorAddress` |
+| URL 组合 | `modules/git/remote.go` | `ParseRemoteAddr` |
+| 队列去重 | `modules/queue/base_levelqueue_unique.go` | `RemoveAll` |
 
 ---
 

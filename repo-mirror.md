@@ -380,24 +380,59 @@ type SyncRequest struct {
 
 ### 5.3 队列去重在出队后的生效边界
 
-Gitea 支持两种底层队列实现：**LevelDB (level)** 和 **内存 Channel (channel)**，它们在出队后的去重行为**完全不同**。
+Gitea 支持三种底层队列实现：**LevelDB (level)**、**Redis** 和 **内存 Channel (channel)**，它们在出队后的去重行为**各不相同**。
 
-#### 5.3.1 两类队列的去重差异证据
+#### 5.3.1 三类队列的去重差异证据
 
-| 操作 | Level 队列 (`baseLevelQueueUnique`) | Channel 队列 (`baseChannel`) |
-|-----|-----------------------------------|-------------------------------|
-| **PushItem** | 添加到 Queue + Set | 添加到 channel + Set |
-| **出队** | `LPop()` 仅移除 Queue，**Set 不移除** | `PopItem()` 同时移除 channel 和 **Set** |
-| **出队后 HasItem** | 返回 `true`（仍在 Set 中） | 返回 `false`（已从 Set 移除） |
-| **出队后能否再次入队** | ❌ 不能 | ✅ 可以 |
-| **清空去重方式** | 调用 `RemoveAll()` | 出队自动清理 |
-| **重启后去重集合** | ✅ **保留**（LevelDB 持久化） | ❌ 丢失（内存 channel） |
+Gitea 支持三种底层队列实现，它们在出队后的去重行为**各不相同**：
+
+| 操作 | Level 队列 (`baseLevelQueueUnique`) | Redis 队列 (`baseRedis`) | Channel 队列 (`baseChannel`) |
+|-----|-----------------------------------|--------------------------|-------------------------------|
+| **底层存储** | LevelDB（磁盘） | Redis（内存/持久化） | Go Channel（内存） |
+| **PushItem** | `RPush` + `SAdd` 到 Set | `RPush` + `SADD` 到 Set | `channel<-` + `set.Add` |
+| **出队** | `LPop()` 仅移除 Queue，**Set 不移除** | `LPop()` + `SREM` ✅ 移除 Set | `<-channel` + `set.Remove` ✅ 移除 Set |
+| **出队后 HasItem** | `true`（仍在 Set 中） | `false`（已从 Set 移除） | `false`（已从 Set 移除） |
+| **出队后能否再次入队** | ❌ 不能 | ✅ 可以 | ✅ 可以 |
+| **清空去重方式** | 调用 `RemoveAll()` | 出队自动清理 / `RemoveAll()` | 出队自动清理 / `RemoveAll()` |
+| **重启后去重集合** | ✅ **保留**（LevelDB 持久化） | ✅ **保留**（Redis 持久化） | ❌ 丢失（内存 channel） |
 
 **关键结论**：
 ```
 Level 队列：一旦入队，除非 RemoveAll() 手动清理，否则永远无法再次入队
-Channel 队列：出队后自动清理去重 Set，可以立即再次入队
+Redis / Channel 队列：出队后自动清理去重 Set，可以立即再次入队
 ```
+
+#### 5.3.1.2 Redis 队列实现 (`modules/queue/base_redis.go`)
+
+**出队时同时清空去重** (`modules/queue/base_redis.go:81-98`):
+```go
+func (q *baseRedis) PopItem(ctx) ([]byte, error) {
+    return backoffRetErr(ctx, ..., func() (retry bool, data []byte, err error) {
+        data, err = q.client.LPop(ctx, q.cfg.QueueFullName).Bytes()
+        if q.isUnique {
+            // the data has been popped, even if there is any error we can't do anything
+            _ = q.client.SRem(ctx, q.cfg.SetFullName, data).Err()  // ✅ 从 Set 移除！
+        }
+        return false, data, err
+    })
+}
+```
+
+**入队去重** (`modules/queue/base_redis.go:68-76`):
+```go
+if q.isUnique {
+    added, err := q.client.SAdd(ctx, q.cfg.SetFullName, data).Result()
+    if added == 0 {
+        return false, ErrAlreadyInQueue  // Set 中已存在，拒绝入队
+    }
+}
+q.client.RPush(ctx, q.cfg.QueueFullName, data)
+```
+
+**⚠️ Redis 队列重启行为**:
+- Redis 数据默认持久化，重启后去重集合保留
+- 但由于出队时已 `SREM` 移除，已处理完成的项不会影响后续入队
+- 只有那些**入队后未出队就崩溃**的项会残留在 Set 中，无法再次入队
 
 #### 5.3.1.1 Level 队列重启后去重集合保留的证据
 
@@ -492,13 +527,18 @@ if q.isUnique && q.set.Contains(string(data)) {
 
 - **生产环境（默认 Level 队列）**:
   - 镜像同步任务正在执行中或刚执行完，**无法立即再次入队**
-  - 即使同步失败，也无法立即重试，必须等待 `RemoveAll()` 或系统重启
+  - 即使同步失败，也无法立即重试，**必须等待 `RemoveAll()` 手动清理**
+  - **⚠️ 系统重启不能解决问题**：重启后去重集合仍然保留在 LevelDB 中
+- **集群环境（Redis 队列）**:
+  - 出队后自动清理去重 Set，可以立即再次入队
+  - **异常崩溃场景**：入队后未出队就崩溃的项会残留在 Redis Set 中，需手动 `RemoveAll()`
 - **测试/开发环境（可能使用 Channel 队列）**:
   - 出队后可以立即再次入队
+  - 重启后去重集合完全清空（内存 channel 不持久化）
 
 - `modules/queue/workerqueue.go:178-182` 注释明确说明：
   > "Has only works for unique queues. Keep in mind that this check may not be reliable (due to lacking of proper transaction support). There could be a small chance that duplicate items appear in the queue"
-- 由于缺乏事务支持，两类队列都有极小概率出现重复项
+- 由于缺乏事务支持，三类队列都有极小概率出现重复项
 
 ---
 
@@ -688,12 +728,15 @@ AddPushMirrorRemote(m, addr)  [services/mirror/mirror_push.go:33]
 
 ### 7.1 可恢复错误自动重试
 
-| 错误类型 | 处理方式 | 重试机制 |
-|---------|---------|---------|
-| 引用损坏 (`reference broken`) | `git remote prune` 清理后重试 | 同步内立即重试 |
-| 远程引用消失 (`not our ref`) | 同上 | 同步内立即重试 |
-| 锁文件冲突 (`.lock`) | 同上 | 同步内立即重试 |
-| 强制推送竞态 (`but expected`) | 同上 | 同步内立即重试 |
+| 错误类型 | 检测条件 | 处理方式 | 重试机制 |
+|---------|---------|---------|---------|
+| 引用损坏 | `unable to resolve reference` + `reference broken` | `git remote prune` 清理后重试 | 同步内立即重试 |
+| 远程引用消失 | `remote error` + `not our ref` | 同上 | 同步内立即重试 |
+| 强制推送竞态 | `cannot lock ref` + `but expected` | 同上 | 同步内立即重试 |
+| 引用解析失败 | `cannot lock ref` + `unable to resolve reference` | 同上 | 同步内立即重试 |
+| 锁文件冲突 | `Unable to create` + `.lock` | 同上 | 同步内立即重试 |
+
+> 以上 **5 种** 可恢复错误与 `checkRecoverableSyncError()` 实现完全一致，测试覆盖全部 5 种场景。
 
 ### 7.2 不可恢复错误
 
@@ -734,6 +777,7 @@ AddPushMirrorRemote(m, addr)  [services/mirror/mirror_push.go:33]
 | 推送间隔更新 | `models/repo/pushmirror.go` | `UpdatePushMirrorInterval` |
 | URL 组合 | `modules/git/remote.go` | `ParseRemoteAddr` |
 | Level 队列去重 | `modules/queue/base_levelqueue_unique.go` | `RemoveAll` |
+| Redis 队列去重 | `modules/queue/base_redis.go` | `PopItem` (自动 `SREM`) |
 | Channel 队列去重 | `modules/queue/base_channel.go` | `PopItem` (自动清理) |
 
 ---
@@ -766,4 +810,4 @@ AddPushMirrorRemote(m, addr)  [services/mirror/mirror_push.go:33]
 
 **文件**: `services/mirror/mirror_pull_test.go:12-38`
 
-测试 6 种可恢复错误 + 3 种不可恢复错误的识别准确性。
+测试 **5 种可恢复错误** + **3 种不可恢复错误**的识别准确性，与 `checkRecoverableSyncError()` 实现完全一致。

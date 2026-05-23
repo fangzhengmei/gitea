@@ -103,12 +103,24 @@ cmd.AddDynamicArguments(remoteName)
 
 **文件**: `services/mirror/mirror_pull.go:91-106`
 
-检测以下可自动恢复的错误类型：
-- `unable to resolve reference` + `reference broken` - 引用损坏
-- `remote error` + `not our ref` - 远程引用在拉取过程中被删除（竞态条件）
-- `cannot lock ref` + `but expected` - 强制推送导致的预期值不匹配
-- `cannot lock ref` + `unable to resolve reference` - 引用解析失败
-- `Unable to create` + `.lock` - 锁文件冲突（与本地 GC 等操作竞态）
+**实现与测试对照**:
+- 实现中有 **5 个 case** 返回 `true`（可恢复）
+- 测试覆盖 **5 个可恢复场景 + 3 个不可恢复场景** (`services/mirror/mirror_pull_test.go:12-38`)
+
+检测以下 **5 种** 可自动恢复的错误模式：
+
+| 错误模式 | 检测条件 | 典型场景 |
+|---------|---------|---------|
+| 引用损坏 | `unable to resolve reference` + `reference broken` | 引用在拉取过程中损坏 |
+| 远程引用消失 | `remote error` + `not our ref` | 远程引用在拉取过程中被删除（竞态） |
+| 强制推送竞态 | `cannot lock ref` + `but expected` | 强制推送导致预期值不匹配 |
+| 引用解析失败 | `cannot lock ref` + `unable to resolve reference` | 无法解析引用 |
+| 锁文件冲突 | `Unable to create` + `.lock` | 与本地 GC/维护操作的锁竞争 |
+
+**不可恢复错误（测试覆盖 3 种）**:
+- 认证失败 (`Authentication failed`)
+- 远程仓库不存在 (`Could not read from remote repository`)
+- 代理连接失败 (`Failed to connect to configured-https-proxy`)
 
 #### 2.2.3 冲突处理与重试机制
 
@@ -378,13 +390,50 @@ Gitea 支持两种底层队列实现：**LevelDB (level)** 和 **内存 Channel 
 | **出队** | `LPop()` 仅移除 Queue，**Set 不移除** | `PopItem()` 同时移除 channel 和 **Set** |
 | **出队后 HasItem** | 返回 `true`（仍在 Set 中） | 返回 `false`（已从 Set 移除） |
 | **出队后能否再次入队** | ❌ 不能 | ✅ 可以 |
-| **清空去重方式** | 调用 `RemoveAll()` 或系统重启 | 出队自动清理 |
+| **清空去重方式** | 调用 `RemoveAll()` | 出队自动清理 |
+| **重启后去重集合** | ✅ **保留**（LevelDB 持久化） | ❌ 丢失（内存 channel） |
 
 **关键结论**：
 ```
-Level 队列：一旦入队，除非 RemoveAll() 或重启，否则永远无法再次入队
+Level 队列：一旦入队，除非 RemoveAll() 手动清理，否则永远无法再次入队
 Channel 队列：出队后自动清理去重 Set，可以立即再次入队
 ```
+
+#### 5.3.1.1 Level 队列重启后去重集合保留的证据
+
+**证据 1 - LevelDB 持久化特性** (`modules/queue/queue.go:34`):
+> "LevelDB: Especially useful in persistent queues for single instances."
+
+**证据 2 - NewUniqueQueue 不清空已有数据** (`modules/queue/base_levelqueue_unique.go:36`):
+```go
+lq, err := levelqueue.NewUniqueQueue(db, []byte(cfg.QueueFullName), []byte(cfg.SetFullName), false)
+// 第三个参数 false = 不清空已有数据，保留历史 Set
+```
+
+**证据 3 - 损坏恢复测试** (`modules/queue/base_levelqueue_test.go:29-76`):
+```go
+// 1. 创建队列并写入数据
+lq, _ := levelqueue.NewUniqueQueue(db, nameQueuePrefix, nameSetPrefix, false)
+lq.RPush([]byte("item-1"))
+lq.Close()  // 关闭但不清空数据
+
+// 2. 删除部分数据模拟损坏
+db.Delete(itemKey, nil)
+
+// 3. RemoveAll 是唯一清空方式
+lqinternal.RemoveLevelQueueKeys(db, nameQueuePrefix)  // 仅删除 Queue 前缀的 key
+lqinternal.RemoveLevelQueueKeys(db, nameSetPrefix)    // 仅删除 Set 前缀的 key
+
+// 4. 重新创建队列，从空开始
+lq, _ = levelqueue.NewUniqueQueue(db, nameQueuePrefix, nameSetPrefix, false)
+lq.RPush([]byte("item-new-1"))  // 正常工作
+```
+
+**⚠️ 重要事实校正**: 之前的"系统重启会清空去重集合"是**错误推断**。实际上：
+- 系统重启不会清空 LevelDB 中的 Set 数据
+- 重启后去重集合仍然存在，之前入队过的项仍然无法再次入队
+- `RemoveAll()` 是代码中**唯一**显式清空去重集合的方式
+- 如果队列数据损坏（如测试中所示），RemoveAll 也是唯一的恢复手段
 
 #### 5.3.2 Level 队列实现 (`modules/queue/base_levelqueue_unique.go`)
 

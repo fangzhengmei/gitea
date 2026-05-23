@@ -321,18 +321,19 @@ if verb == git.CmdVerbLfsTransfer {
 ```
 
 ### 5.4 与 HTTP 批接口的关联
-Pure SSH 传输底层**复用所有 HTTP API 的业务逻辑**：
+Pure SSH 传输底层**复用大部分 HTTP API 的业务逻辑**，但存在重要差异：
 
-| SSH 操作 | 调用的内部 HTTP API | 复用的业务逻辑 |
-|----------|-------------------|----------------|
-| `Batch` | `POST /api/internal/repo/{repo}/info/lfs/objects/batch` | `BatchHandler` - 认证、配额校验、对象存在性检查 |
-| `Download` | `GET /api/internal/repo/{repo}/info/lfs/objects/{oid}` | `DownloadHandler` - Range 处理、内容读取 |
-| `Upload` | `PUT /api/internal/repo/{repo}/info/lfs/objects/{oid}/{size}` | `UploadHandler` - 哈希校验、大小校验、存储写入 |
-| `Verify` | `POST /api/internal/repo/{repo}/info/lfs/verify` | `VerifyHandler` - 存在性验证 |
-| `Lock` | `POST /api/internal/repo/{repo}/info/lfs/locks` | 锁管理逻辑 |
+| SSH 操作 | 调用的内部 HTTP API | 复用的业务逻辑 | 重要差异 |
+|----------|-------------------|----------------|----------|
+| `Batch` | `POST /api/internal/repo/{repo}/info/lfs/objects/batch` | `BatchHandler` - 认证、配额校验、对象存在性检查 | 无 |
+| `Download` | `GET /api/internal/repo/{repo}/info/lfs/objects/{oid}` | `DownloadHandler` - 内容读取 | ⚠️ **不传递 Range 头**，不支持断点续传 |
+| `Upload` | `PUT /api/internal/repo/{repo}/info/lfs/objects/{oid}/{size}` | `UploadHandler` - 哈希校验、大小校验、存储写入 | ⚠️ **不使用 Transfer-Encoding: chunked**，改用 Content-Length |
+| `Verify` | `POST /api/internal/repo/{repo}/info/lfs/verify` | `VerifyHandler` - 存在性验证 | 无 |
+| `Lock` | `POST /api/internal/repo/{repo}/info/lfs/locks` | 锁管理逻辑 | 无 |
 
 - **内部认证**: 通过 `X-Gitea-Internal-Auth` 头携带 `setting.InternalToken` 进行内部服务认证
 - **URL 转换**: `modules/lfstransfer/backend/util.go:toInternalLFSURL` 将外部 URL 转换为内部 API 路径
+- **权限检查差异**: Pure SSH 路径下**不触发仓库 Scope 检查**（非 API Token 场景），但仍会执行其他所有权限校验
 
 ### 5.5 上传校验流程
 Pure SSH 上传与 HTTP 上传走完全相同的校验链路：
@@ -510,18 +511,65 @@ func authenticate(ctx *context.Context, repository *repo_model.Repository, autho
   3. 验证 Task 与目标仓库的关联关系
 
 #### 6.2.2 仓库 Scope 检查生效点
-- **触发条件**: 使用 API Token 认证时 (`ctx.Data["IsApiToken"] == true`)
+- **触发条件**: **仅在使用 API Token 认证时** (`ctx.Data["IsApiToken"] == true`)
 - **生效位置**: `services/lfs/server.go:getAuthenticatedRepository` L469-473 (认证通过后)
 - **检查函数**: `context.CheckRepoScopedToken` (`services/context/permission.go:94-96`)
 - **检查逻辑**:
   ```go
-  if requireWrite {
-      context.CheckRepoScopedToken(ctx, repository, auth_model.Write)  // 需要 write_repo scope
-  } else {
-      context.CheckRepoScopedToken(ctx, repository, auth_model.Read)   // 需要 read_repo scope
+  func CheckTokenScopes(ctx *Context, repo *repo_model.Repository, scopes ...auth_model.AccessTokenScope) {
+      if ctx.Data["IsApiToken"] != true {
+          return  // ⚠️  不是 API Token 直接返回，不做任何检查
+      }
+      // 后续 scope 检查...
   }
   ```
+- **实际生效场景**:
+  - ✅ HTTP 路径使用个人访问令牌 (PAT) 认证时
+  - ✅ HTTP 路径使用 OAuth2 Token 认证时
+  - ❌ Pure SSH 路径（使用 LFS JWT Token，不设置 `IsApiToken`）
+  - ❌ Session/浏览器登录场景
 - **额外限制**: 如果 Token 只有 public scope，不能访问私有仓库 (`PublicOnly` 检查)
+
+#### 6.2.3 Pure SSH 路径下的权限门禁真实生效条件
+
+Pure SSH 路径与 HTTP 路径的权限检查存在差异，以下是真实生效的门禁：
+
+| 权限检查 | HTTP 路径 (API Token) | HTTP 路径 (JWT/Session) | Pure SSH 路径 |
+|---------|----------------------|------------------------|---------------|
+| Actions 用户权限 | ✅ | ✅ | ✅ |
+| 常规用户权限 (GetDoerRepoPermission) | ✅ | ✅ | ✅ |
+| LFS JWT Token 校验 | ✅ | ✅ | ✅ |
+| **仓库 Scope 检查** | ✅ | ❌ | ❌ |
+| 令牌读写约束 | ✅ | ✅ | ✅ |
+| 仓库绑定校验 | ✅ | ✅ | ✅ |
+
+**Pure SSH 权限链路详解**：
+```
+SSH 连接建立
+    ↓
+1. SSH Key 认证 (cmd/serv.go 前置认证)
+    ↓
+2. 生成 LFS JWT Token (绑定 RepoID + Op + UserID)
+    ↓
+3. lfstransfer.Processor 启动
+    ↓
+4. 内部 API 调用 (携带 X-Gitea-Internal-Auth + Authorization)
+    ↓
+5. authenticate() 函数执行:
+   a. 检查是否是 Actions 用户 → 如果是，用 Actions 权限
+   b. 检查常规用户权限 (通过 JWT 解析出的 UserID)
+   c. 如果失败，解析 LFS JWT Token 并校验
+    ↓
+6. getAuthenticatedRepository() 执行:
+   a. CheckRepoScopedToken() → 因 IsApiToken != true 直接返回
+   b. ⚠️  仓库 Scope 检查在此处被跳过
+```
+
+**关键结论**：Pure SSH 路径下**不会触发仓库 Scope 检查**，因为内部 API 调用使用 LFS JWT Token 认证，而非 API Token。权限主要通过以下机制保障：
+1. SSH Key 强身份认证
+2. LFS JWT Token 的 RepoID 绑定（跨仓库拒绝）
+3. LFS JWT Token 的 Op 约束（写操作必须是 upload）
+4. 最终 `GetDoerRepoPermission` 的用户仓库权限校验
 
 ### 6.3 Token 解析与校验
 - **函数**: `services/lfs/server.go:handleLFSToken` (L580-622)
@@ -733,7 +781,7 @@ type Link struct {
 1. **凭据隔离**: JWT Token 与仓库 ID、操作类型、用户 ID 三重绑定，防止跨仓库越权
 2. **令牌读写约束不对称**: 写操作强制要求 `Op="upload"`，读操作允许多种令牌，兼顾安全与便利
 3. **Actions 用户权限**: CI/CD 场景下优先使用 Task/Job 级别的细粒度权限控制
-4. **仓库 Scope 检查**: API Token 必须具备 `write_repo`/`read_repo` scope，且 Public scope 不能访问私有仓库
+4. **仓库 Scope 检查**: **仅在 API Token 场景生效**，必须具备 `write_repo`/`read_repo` scope，且 Public scope 不能访问私有仓库（Pure SSH 路径不触发此检查）
 5. **对象访问控制**: `LFSObjectAccessible` 确保用户只能访问其有权限仓库中的对象
 6. **配额防护**: 入口处校验批量大小和单文件大小，防止滥用
 7. **完整性校验**: 上传过程中实时计算 SHA256 哈希和大小，确保数据完整性
@@ -747,20 +795,20 @@ type Link struct {
 |------|----------|---------------|
 | **协议** | HTTP/HTTPS | SSH (git-lfs-transfer) |
 | **批接口** | 独立 HTTP Batch API | 通过 GiteaBackend 调用内部 Batch API |
-| **Range 下载** | Gitea 处理 (非 ServeDirect) / 对象存储处理 (ServeDirect) | 通过内部 API 复用 DownloadHandler |
-| **Chunked 上传** | Batch 响应通知客户端使用 chunked | 内部调用使用 Content-Length，不使用 chunked |
+| **Range 下载 (断点续传)** | ✅ 支持（Gitea 处理 / 对象存储处理） | ❌ 不支持（GiteaBackend 不传递 Range 头） |
+| **Chunked 上传** | ✅ Batch 响应通知客户端使用 chunked | ❌ 内部调用使用 Content-Length，不使用 chunked |
 | **上传请求头** | 由 git-lfs 客户端决定 | 显式设置 Content-Length / Content-Type |
 | **内部认证** | 不需要 | `X-Gitea-Internal-Auth` 头 |
 | **认证方式** | Basic Auth / JWT Token / Session / API Token | SSH Key + 内部 JWT Token |
-| **Actions 支持** | 支持（authenticate 优先检查） | 支持（复用相同 authenticate 逻辑） |
-| **仓库 Scope** | 支持（CheckRepoScopedToken） | 支持（复用相同检查逻辑） |
+| **Actions 支持** | ✅ 支持（authenticate 优先检查） | ✅ 支持（复用相同 authenticate 逻辑） |
+| **仓库 Scope 检查** | ✅ API Token 场景生效 | ❌ 不生效（非 API Token 场景） |
 | **凭据有效期** | JWT 默认 24h | JWT 默认 24h |
-| **配额校验** | BatchHandler 入口 | 复用 BatchHandler 逻辑 |
-| **完整性校验** | hashingReader 实时校验 | 复用 hashingReader 逻辑 |
+| **配额校验** | ✅ BatchHandler 入口 | ✅ 复用 BatchHandler 逻辑 |
+| **完整性校验** | ✅ hashingReader 实时校验 | ✅ 复用 hashingReader 逻辑 |
 | **适用场景** | 大部分用户、CI/CD | SSH 环境偏好者、纯内网部署 |
 | **客户端配置** | `git config lfs.url` | `git config lfs.sshtransfer always` |
 
-### 关键代码路径对照
+### 11.1 关键代码路径对照
 
 | 功能 | HTTP 路径 | SSH 路径 | 复用逻辑 |
 |------|----------|----------|----------|
@@ -770,6 +818,73 @@ type Link struct {
 | 验证 | `POST /info/lfs/verify` | `GiteaBackend.Verify()` | `VerifyHandler` |
 | 权限校验 | `getAuthenticatedRepository()` | `getAuthenticatedRepository()` | 完全相同 |
 | 配额校验 | `BatchHandler` L215/L258 | `BatchHandler` L215/L258 | 完全相同 |
+
+### 11.2 Pure SSH 下载链路中 Range 请求的实际传递分析
+
+⚠️ **重要修正**：虽然 `DownloadHandler` 本身支持 Range 请求（断点续传），但 Pure SSH 传输链路**实际上不支持断点续传**。
+
+#### 11.2.1 代码证据
+
+**GiteaBackend.Download 实现** (`modules/lfstransfer/backend/backend.go:159-209`):
+```go
+func (g *GiteaBackend) Download(oid string, args transfer.Args) (_ io.ReadCloser, _ int64, retErr error) {
+    // ... 解析 action href ...
+    
+    headers := map[string]string{
+        headerAuthorization:     g.authToken,
+        headerGiteaInternalAuth: g.internalAuth,
+        headerAccept:            mimeOctetStream,
+        // ⚠️  注意：这里没有设置 Range 头！
+    }
+    req := newInternalRequestLFS(g.ctx, toInternalLFSURL(action.Href), http.MethodGet, headers, nil)
+    resp, err := req.Response()
+    
+    // ⚠️  只接受 200 OK，不接受 206 Partial Content
+    if resp.StatusCode != http.StatusOK {
+        return nil, 0, statusCodeToErr(resp.StatusCode)
+    }
+    
+    // 通过自定义头获取大小，而不是 Content-Range
+    respSize, err := strconv.ParseInt(resp.Header.Get("X-Gitea-LFS-Content-Length"), 10, 64)
+    return resp.Body, respSize, nil
+}
+```
+
+#### 11.2.2 不支持断点续传的三层原因
+
+| 层面 | 原因 | 代码位置 |
+|------|------|----------|
+| **协议层** | `git-lfs-transfer` 协议的 `Backend` 接口没有定义 `offset`/`size` 参数，无法传递断点信息 | `transfer.Backend` 接口定义 |
+| **实现层** | `GiteaBackend.Download` 没有设置 `Range` 请求头 | `modules/lfstransfer/backend/backend.go:181-185` |
+| **响应处理** | 只接受 `200 OK`，不处理 `206 Partial Content` 状态码 | `modules/lfstransfer/backend/backend.go:200-202` |
+
+#### 11.2.3 对比：HTTP 路径 vs Pure SSH 路径的下载流程
+
+```
+HTTP 下载路径 (支持断点续传):
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ git-lfs     │     │ Gitea       │     │ Content     │
+│ Client      │────▶│ Download    │────▶│ Store       │
+│  (支持)     │     │ Handler     │     │             │
+│ Range Header│     │ (解析 Range)│     │ (Seek offset)│
+└─────────────┘     └─────────────┘     └─────────────┘
+
+Pure SSH 下载路径 (不支持断点续传):
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ git-lfs     │     │ GiteaBackend│     │ Gitea       │     │ Content     │
+│ Client      │────▶│ .Download() │────▶│ Download    │────▶│ Store       │
+│  (支持)     │     │ (❌ 不传递) │     │ Handler     │     │             │
+│ Range Header│     │  Range      │     │ (Range 无用)│     │ (Seek 0)    │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+#### 11.2.4 关键结论
+
+1. **"复用 DownloadHandler" ≠ "支持断点续传"**：虽然底层 `DownloadHandler` 代码支持 Range，但上层 `GiteaBackend` 没有传递 Range 请求的能力
+2. **git-lfs-transfer 协议限制**：该协议的 `transfer.Backend` 接口设计不支持断点续传参数
+3. **实际行为**：Pure SSH 下载总是从字节 0 开始传输整个文件，不支持从断点继续
+4. **X-Gitea-LFS-Content-Length 头**：仅用于传递内容长度，不用于断点续传（避免被反向代理或压缩修改）
+
 
 ## 十二、认证与授权体系完整总结
 
@@ -845,8 +960,19 @@ type Link struct {
 | MaxBatchSize | `BatchHandler` L215 | 批量请求入口 |
 | MaxFileSize | `BatchHandler` L258 | 对象不存在且需上传 |
 | Actions 权限 | `authenticate` L544 | ctx.Doer 是 Actions 用户 |
-| 仓库 Scope | `getAuthenticatedRepository` L469 | 使用 API Token 认证 |
+| 仓库 Scope 检查 | `getAuthenticatedRepository` L469 | **仅**使用 API Token 认证时 |
 | 令牌写约束 | `handleLFSToken` L600 | mode == AccessModeWrite |
+| 令牌读约束 | 无 | 读路径宽松，download 和 upload 令牌均可 |
 | 跨仓库访问 | `UploadHandler` L340 | 对象已存在但当前仓库无关联 |
 | 哈希/大小校验 | `contentStore.Put` | 所有上传场景 |
 | 内部 API 认证 | `newInternalRequestLFS` | Pure SSH 传输场景 |
+| Range 请求处理 | `DownloadHandler` L126-147 | **仅** HTTP 路径，Pure SSH 不传递 |
+
+### 12.5 边界修正总结
+
+| 之前的错误结论 | 修正后的正确结论 | 证据代码 |
+|---------------|-----------------|----------|
+| 仓库 Scope 检查在所有场景生效 | **仅在 API Token 场景生效** | `services/context/permission.go:17` `if ctx.Data["IsApiToken"] != true { return }` |
+| Pure SSH 路径支持断点续传 | **不支持**，GiteaBackend 不传递 Range 头 | `modules/lfstransfer/backend/backend.go:181-185` 未设置 Range 头 |
+| 复用 DownloadHandler 就支持断点续传 | 上层协议不传递 Range，底层能力无法发挥 | `modules/lfstransfer/backend/backend.go:200-202` 只接受 200 OK |
+| Pure SSH 与 HTTP 权限检查完全相同 | 仓库 Scope 检查在 Pure SSH 下被跳过 | 对比 `ctx.Data["IsApiToken"]` 设置场景 |

@@ -52,6 +52,87 @@ if slices.Contains(cols, "status") && job.Status.IsWaiting() {
 }
 ```
 
+##### 2.1.2.1 `tasksVersion=0` 兼容分支深度分析
+
+**问题背景**: 系统首次运行或某作用域从未产生过任务时，`GetTasksVersionByScope` 返回 0。
+
+**兼容处理** (`routers/api/actions/runner/runner.go:188-196`):
+```go
+latestVersion, err := actions_model.GetTasksVersionByScope(ctx, runner.OwnerID, runner.RepoID)
+if err != nil {
+    return nil, status.Errorf(codes.Internal, "query tasks version failed: %v", err)
+} else if latestVersion == 0 {
+    if err := actions_model.IncreaseTaskVersion(ctx, runner.OwnerID, runner.RepoID); err != nil {
+        return nil, status.Errorf(codes.Internal, "fail to increase task version: %v", err)
+    }
+    // if we don't increase the value of `latestVersion` here,
+    // the response of FetchTask will return tasksVersion as zero.
+    // and the runner will treat it as an old version of Gitea.
+    latestVersion++
+}
+```
+
+**关键设计点**:
+1. **自动初始化**: 当 `latestVersion == 0` 时，立即调用 `IncreaseTaskVersion` 初始化版本记录
+2. **手动递增**: `IncreaseTaskVersion` 执行后不返回更新后的值，需手动 `latestVersion++`
+3. **版本语义**: 避免返回 0 给 Runner，因为旧版 Gitea 没有 tasksVersion 机制，Runner 会将 0 误认为是不支持该特性的旧服务端
+
+##### 2.1.2.2 三层版本递增对任务可见性的影响
+
+**递增链路** (`models/actions/tasks_version.go:75-101`):
+```go
+func IncreaseTaskVersion(ctx context.Context, ownerID, repoID int64) error {
+    return db.WithTx(ctx, func(ctx context.Context) error {
+        // 1. 递增全局版本 (OwnerID=0, RepoID=0)
+        if err := increaseTasksVersionByScope(ctx, 0, 0); err != nil {
+            return err
+        }
+
+        // 2. 递增组织版本 (OwnerID>0, RepoID=0)
+        if ownerID > 0 {
+            if err := increaseTasksVersionByScope(ctx, ownerID, 0); err != nil {
+                return err
+            }
+        }
+
+        // 3. 递增仓库版本 (OwnerID=0, RepoID>0)
+        if repoID > 0 {
+            if err := increaseTasksVersionByScope(ctx, 0, repoID); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+```
+
+**可见性影响矩阵**:
+
+| 触发场景 | 递增层级 | 受影响 Runner 范围 |
+|---------|---------|------------------|
+| 仓库作业就绪 | 全局 + 仓库 | 全局 Runner + 该仓库专属 Runner |
+| 组织下某仓库作业就绪 | 全局 + 组织 + 仓库 | 全局 Runner + 该组织 Runner + 该仓库 Runner |
+| Runner 读取版本 | 仅读取自身作用域 | 按 Runner.OwnerID/RepoID 匹配对应层级 |
+
+**设计意图**:
+- **全局递增**: 确保全局 Runner 能感知所有新任务
+- **组织/仓库递增**: 实现"任务可见性隔离"，专属 Runner 只需要感知自己作用域内的任务
+- **事务性**: 三层递增在同一事务中完成，保证版本变更的原子性
+- **通知广播**: 任何作业就绪都会触发全局版本递增，确保全局 Runner 不会错过任务
+
+**实际运行示例**:
+1. 组织 `Org1` 下的仓库 `Repo1` 有新作业就绪
+2. 调用 `IncreaseTaskVersion(Org1.ID, Repo1.ID)`
+3. 事务内依次递增：
+   - `increaseTasksVersionByScope(0, 0)` → 全局版本 v100 → v101
+   - `increaseTasksVersionByScope(Org1.ID, 0)` → 组织版本 v50 → v51
+   - `increaseTasksVersionByScope(0, Repo1.ID)` → 仓库版本 v20 → v21
+4. 各 Runner 下次 FetchTask 时：
+   - 全局 Runner (OwnerID=0, RepoID=0)：比较全局版本 100≠101 → 尝试 PickTask
+   - Org1 Runner (OwnerID=Org1.ID, RepoID=0)：比较组织版本 50≠51 → 尝试 PickTask
+   - Repo1 Runner (OwnerID=0, RepoID=Repo1.ID)：比较仓库版本 20≠21 → 尝试 PickTask
+   - 其他组织/仓库 Runner：版本不变 → 跳过 PickTask
+
 ### 2.2 任务分配流程 (`PickTask`)
 
 **入口**: `services/actions/task.go:19-112` → `models/actions/task.go:230-334`
@@ -252,6 +333,157 @@ Gitea Actions 采用 **三层令牌体系**，各层职责分明：
   - 基础时效：1 小时
   - 附加时效：`EndlessTaskTimeout`（防止超长任务令牌过期）
 - **用途**: Runner 调用 Gitea API 时的 Authorization 头，用于 artifact 上传、cache 操作等
+
+##### 3.3.3 Task Token 与 `gitea_runtime_token` 生成注入完整流程
+
+**完整时序链**:
+```
+PickTask 分配任务
+    ↓
+① task.GenerateAndFillToken() 生成 Task Token
+    ↓
+② CreateTaskForRunner 持久化 Task（含 TokenHash/TokenSalt/TokenLastEight）
+    ↓
+③ generateTaskContext() 构建上下文
+    ├─ 调用 CreateAuthorizationToken() 生成 JWT (gitea_runtime_token)
+    ├─ 注入 Task Token 到 gitCtx["token"]
+    ├─ 注入 JWT 到 gitCtx["gitea_runtime_token"]
+    ↓
+④ structpb.NewStruct(gitCtx) 序列化为 protobuf Struct
+    ↓
+⑤ task.Context 字段设置为序列化结果
+    ↓
+⑥ Task 对象通过 FetchTaskResponse 返回给 Runner
+    ↓
+⑦ Runner 解析 task.Context 获取两个 Token
+    ├─ token: 用于 Git 认证 (actions/checkout)
+    └─ gitea_runtime_token: 用于 Gitea API 调用 (artifact/cache)
+```
+
+**步骤 1：Task Token 生成** (`models/actions/utils.go:21-27` → `models/actions/task.go:147-149`)
+```go
+func generateSaltedToken() (string, string, string, string) {
+    salt := util.CryptoRandomString(10)           // 10 位随机盐
+    buf := util.CryptoRandomBytes(20)             // 20 字节随机数
+    token := hex.EncodeToString(buf)              // 40 位十六进制字符串（明文，仅返回一次给 Runner）
+    hash := auth_model.HashToken(token, salt)      // SHA256(token + salt)
+    return token, salt, hash, token[len(token)-8:] // 明文、盐、哈希、后8位
+}
+
+func (task *ActionTask) GenerateAndFillToken() {
+    task.Token, task.TokenSalt, task.TokenHash, task.TokenLastEight = generateSaltedToken()
+}
+```
+
+**存储策略**:
+- `task.Token`: 明文 Token，**仅在内存中短暂存在**，序列化到 Context 后不再返回
+- `task.TokenHash`: SHA256 哈希，持久化到数据库
+- `task.TokenSalt`: 盐值，持久化到数据库
+- `task.TokenLastEight`: 后 8 位，用于快速查询过滤
+
+**步骤 2：JWT (`gitea_runtime_token`) 生成** (`services/actions/auth.go:41-73`)
+```go
+func CreateAuthorizationToken(taskID, runID, jobID int64) (string, error) {
+    now := time.Now()
+
+    // 缓存权限序列化
+    ac, err := json.Marshal(&[]actionsCacheScope{
+        {
+            Scope:      "",
+            Permission: actionsCachePermissionWrite, // 写权限
+        },
+    })
+    if err != nil {
+        return "", err
+    }
+
+    claims := actionsClaims{
+        RegisteredClaims: jwt.RegisteredClaims{
+            Issuer:    "gitea",
+            Subject:   strconv.FormatInt(taskID, 10),
+            ExpiresAt: jwt.NewNumericDate(now.Add(1*time.Hour + setting.Actions.EndlessTaskTimeout)),
+            IssuedAt:  jwt.NewNumericDate(now),
+            ID:        util.CryptoRandomString(10),
+        },
+        Scp:    fmt.Sprintf("Actions.Results:%d:%d", runID, jobID), // 作用域声明
+        TaskID: taskID,
+        RunID:  runID,
+        JobID:  jobID,
+        Ac:     string(ac), // 缓存权限
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    return token.SignedString(setting.GetGeneralTokenSigningSecret())
+}
+```
+
+**JWT 验证** (`services/actions/auth.go:75-111`):
+```go
+func ParseAuthorizationToken(req *http.Request) (int64, error) {
+    authHeader := req.Header.Get("Authorization")
+    // Bearer 前缀解析 ...
+
+    token, err := jwt.ParseWithClaims(tokenStr, &actionsClaims{}, func(t *jwt.Token) (any, error) {
+        // 验证签名算法
+        if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+            return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+        }
+        return setting.GetGeneralTokenSigningSecret(), nil
+    })
+
+    if claims, ok := token.Claims.(*actionsClaims); ok && token.Valid {
+        return claims.TaskID, nil // 返回 TaskID，用于查找任务
+    }
+    return 0, errors.New("invalid token")
+}
+```
+
+**步骤 3：上下文构建与注入** (`services/actions/task.go:114-125` → `services/actions/context.go:26-121`)
+```go
+func generateTaskContext(ctx context.Context, t *actions_model.ActionTask) (*structpb.Struct, error) {
+    // 生成 JWT
+    giteaRuntimeToken, err := CreateAuthorizationToken(t.ID, t.Job.RunID, t.JobID)
+    if err != nil {
+        return nil, err
+    }
+
+    // 生成基础上下文（不含 token）
+    gitCtx := GenerateGiteaContext(ctx, t.Job.Run, nil, t.Job)
+
+    // 注入两个 Token 到上下文
+    gitCtx["token"] = t.Token                // Task Token，用于 Git 认证
+    gitCtx["gitea_runtime_token"] = giteaRuntimeToken // JWT，用于 API 调用
+
+    // 序列化为 protobuf Struct
+    return structpb.NewStruct(gitCtx)
+}
+```
+
+**步骤 4：Runner 侧使用场景**
+1. **Task Token (`gitCtx["token"]`)**:
+   - Runner 将其设置为环境变量 `GIT_AUTH_TOKEN`
+   - `actions/checkout` 使用该 Token 通过 HTTPS 克隆代码
+   - 认证验证：`GetRunningTaskByToken(token)` → 比较哈希
+
+2. **`gitea_runtime_token` (`gitCtx["gitea_runtime_token"]`)**:
+   - Runner 将其设置为环境变量 `GITEA_RUNTIME_TOKEN`
+   - 用于调用 Gitea API：
+     - `actions/upload-artifact`: 上传构建产物
+     - `actions/cache`: 缓存依赖
+     - 其他需要授权的 Gitea API 调用
+   - 认证验证：`ParseAuthorizationToken(req)` → JWT 验签
+
+**双 Token 职责分离**:
+
+| 特性 | Task Token | gitea_runtime_token (JWT) |
+|------|-----------|--------------------------|
+| **生成方式** | 随机字符串 + Salted SHA256 | JWT HS256 签名 |
+| **存储方式** | 仅存哈希（不可逆） | 无需存储（自包含） |
+| **认证方式** | 哈希比较 | JWT 验签 |
+| **有效条件** | Task 状态为 Running/Cancelling | 签名有效 + 未过期 |
+| **主要用途** | Git 代码克隆认证 | Gitea API 调用授权 |
+| **权限范围** | 仅限对应 Task 的代码仓库 | 对应 Task 的 Actions 权限（artifact/cache 等） |
+| **失效时机** | Task 终态（Success/Failure/Cancelled/Skipped） | 1 小时 + EndlessTaskTimeout 后过期 |
 
 ---
 
@@ -487,6 +719,73 @@ func StopTask(ctx, taskID int64, status Status) error {
     }
 }
 ```
+
+##### 5.2.2.1 任务取消信号返回路径修正
+
+**原理解误**: 之前的分析认为取消信号通过 `FetchTask` 响应返回给 Runner，但实际返回路径有两条独立通道：
+
+**返回路径一：通过 `UpdateTaskResponse` 即时响应**
+这是 Runner 执行任务期间最主要的取消信号通道。
+
+**完整链路** (`routers/api/actions/runner/runner.go:222-288` → `models/actions/status.go:102-115`):
+```go
+// 1. 用户/系统触发取消 → StopTask(StatusCancelling) → task.Status = StatusCancelling
+
+// 2. Runner 正常上报任务状态
+func (s *Service) UpdateTask(ctx, req) (*Response[UpdateTaskResponse], error) {
+    runner := GetRunner(ctx)
+    task, err := actions_model.UpdateTaskByState(ctx, runner.ID, req.Msg.State)
+    // ...
+    // 3. 响应中携带取消信号
+    return connect.NewResponse(&runnerv1.UpdateTaskResponse{
+        State: &runnerv1.TaskState{
+            Id:     req.Msg.State.Id,
+            Result: task.Status.AsResult(), // 关键：状态转换
+        },
+        SentOutputs: sentOutputs,
+    }), nil
+}
+
+// 4. Status → Result 转换逻辑
+func (s Status) AsResult() runnerv1.Result {
+    switch s {
+    case StatusSuccess:
+        return runnerv1.Result_RESULT_SUCCESS
+    case StatusFailure:
+        return runnerv1.Result_RESULT_FAILURE
+    case StatusCancelled, StatusCancelling:  // 两个状态都映射为 CANCELLED
+        return runnerv1.Result_RESULT_CANCELLED
+    case StatusSkipped:
+        return runnerv1.Result_RESULT_SKIPPED
+    default:
+        return runnerv1.Result_RESULT_UNSPECIFIED
+    }
+}
+```
+
+**关键机制**:
+- `StatusCancelling` 和 `StatusCancelled` 在 `AsResult()` 中都映射为 `runnerv1.Result_RESULT_CANCELLED`
+- Runner 收到 `RESULT_CANCELLED` 后立即终止当前步骤，执行 `post:` 和 `always:` 步骤清理
+- 设计意图：通过 Runner 的正常心跳（`UpdateTask`）通道返回取消信号，无需额外长连接或推送机制
+
+**返回路径二：通过 `FetchTask` 响应（针对空闲 Runner）**
+仅适用于 Runner 正在轮询新任务、尚未分配到任务的场景：
+```go
+// CancelJobs() → job.TaskID == 0 → 直接设置 StatusCancelled
+// 这种情况下没有正在运行的 Task，取消信号无需传递给 Runner
+```
+
+**状态映射关系表** (`models/actions/status.go:13-27, 102-130`):
+| 内部 Status | proto Result | 含义 |
+|------------|-------------|------|
+| `StatusWaiting` (5) | `UNSPECIFIED` (0) | 非终态 |
+| `StatusRunning` (6) | `UNSPECIFIED` (0) | 非终态 |
+| `StatusBlocked` (7) | `UNSPECIFIED` (0) | 非终态 |
+| `StatusCancelling` (8) | `CANCELLED` (3) | 过渡态，映射为取消 |
+| `StatusSuccess` (1) | `SUCCESS` (1) | 成功 |
+| `StatusFailure` (2) | `FAILURE` (2) | 失败 |
+| `StatusCancelled` (3) | `CANCELLED` (3) | 已取消 |
+| `StatusSkipped` (4) | `SKIPPED` (4) | 已跳过 |
 
 #### 5.2.3 Runner 上报处理
 **实现** (`models/actions/task.go:353-429`):

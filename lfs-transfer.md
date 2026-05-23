@@ -370,6 +370,86 @@ if verb == git.CmdVerbLfsAuthenticate {
 }
 ```
 
+### 5.7 Pure SSH 上传链路与 HTTP 路径的异同
+
+虽然两者最终都调用 `UploadHandler` 执行业务逻辑，但在请求头策略和内容长度处理上存在显著差异。
+
+#### 5.7.1 请求头对比
+
+| 头字段 | HTTP 上传路径 | Pure SSH 上传路径 | 说明 |
+|--------|--------------|-------------------|------|
+| `Authorization` | ✅ Bearer JWT | ✅ Bearer JWT | 相同，都使用 LFS JWT Token 进行认证 |
+| `Transfer-Encoding` | ✅ `chunked` (在 batch 响应中通知) | ❌ 不设置 | HTTP 路径通过 batch 响应主动通知客户端使用分块编码 |
+| `Content-Length` | ❌ 依赖 chunked，不设置 | ✅ `strconv.FormatInt(size, 10)` | SSH 路径显式设置精确的内容长度 |
+| `Content-Type` | 由客户端决定 (通常 `application/octet-stream`) | ✅ `application/octet-stream` | SSH 路径显式指定 MIME 类型 |
+| `X-Gitea-Internal-Auth` | ❌ 不需要 | ✅ `setting.InternalToken` | SSH 内部调用专用认证头 |
+| `Accept` | 由客户端决定 | ❌ 不设置 | - |
+
+**代码实现对比**:
+
+HTTP 上传 batch 响应 (`services/lfs/server.go:504-508`):
+```go
+rep.Actions["upload"] = lfs_module.NewLink(rc.UploadLink(pointer)).
+    WithHeader("Authorization", rc.Authorization).
+    WithHeader("Transfer-Encoding", "chunked") // 通知客户端使用分块上传
+```
+
+Pure SSH 上传 (`modules/lfstransfer/backend/backend.go:233-241`):
+```go
+headers := map[string]string{
+    headerAuthorization:     g.authToken,
+    headerGiteaInternalAuth: g.internalAuth,  // 内部认证
+    headerContentType:       mimeOctetStream,
+    headerContentLength:     strconv.FormatInt(size, 10), // 显式设置 Content-Length
+}
+req := newInternalRequestLFS(g.ctx, toInternalLFSURL(action.Href), http.MethodPut, headers, nil)
+req.Body(r) // 流式传输数据
+```
+
+#### 5.7.2 内容长度策略对比
+
+| 特性 | HTTP 上传路径 | Pure SSH 上传路径 |
+|------|--------------|-------------------|
+| **size 来源** | URL 路径参数 `/objects/{oid}/{size}` | `git-lfs-transfer` 协议参数 + URL 路径参数 |
+| **传输编码** | `Transfer-Encoding: chunked` (通知客户端) | `Content-Length: {size}` (内部调用使用) |
+| **服务端解析** | `UploadHandler` 从 URL 路径解析 size | `UploadHandler` 从 URL 路径解析 size (复用相同逻辑) |
+| **Go HTTP 客户端行为** | 由外部 git-lfs 客户端决定 | 根据 Content-Length 自动判断是否 chunked |
+
+**关键差异分析**:
+
+1. **HTTP 路径的 chunked 设计**：
+   - 在 batch 响应中设置 `Transfer-Encoding: chunked` 是为了兼容 git-lfs 客户端的行为
+   - 参考：[git-lfs basic_upload.go#L58-59](https://github.com/git-lfs/git-lfs/blob/main/tq/basic_upload.go#L58-59)
+   - 这样客户端可以在不知道总大小时流式上传
+   - 但 Gitea 实际上在 URL 路径中已经包含了 size，所以这是"带长度的分块上传"
+
+2. **Pure SSH 路径的 Content-Length 设计**：
+   - `git-lfs-transfer` 协议在调用 Upload 方法时已经传递了精确的 size
+   - GiteaBackend 直接使用这个 size 设置 `Content-Length` 头
+   - 内部 HTTP 调用时，Go 标准库会根据 Content-Length 决定传输方式
+   - 避免了分块编码的额外开销，传输效率更高
+
+3. **服务端处理一致性**：
+   - 无论哪种路径，`UploadHandler` 都从 URL 路径参数解析 size (`services/lfs/server.go:315`)
+   - 无论哪种传输编码，`hashingReader` 都会实时校验实际传输字节数与声明 size 是否一致
+   - 所以最终的完整性校验逻辑是完全相同的
+
+#### 5.7.3 完整链路对比表
+
+| 阶段 | HTTP 上传链路 | Pure SSH 上传链路 |
+|------|--------------|-------------------|
+| **1. 批请求** | `POST /info/lfs/objects/batch` (HTTP) | `Processor.Batch()` → 内部 HTTP API |
+| **2. 认证** | `Authorization` 头 → `authenticate()` | `Authorization` + `X-Gitea-Internal-Auth` → `authenticate()` |
+| **3. 配额校验** | `BatchHandler` L215/L258 | 复用 `BatchHandler` 相同逻辑 |
+| **4. 上传数据** | git-lfs 客户端 → `PUT /objects/{oid}/{size}` | `Processor.Upload()` → 内部 `PUT /api/internal/repo/...` |
+| **5. 数据读取** | `ctx.Req.Body` (由 net/http 处理 chunked) | `req.Body(r)` (io.Reader 流式传输) |
+| **6. 哈希校验** | `hashingReader` 实时计算 SHA256 | 复用 `hashingReader` 相同逻辑 |
+| **7. 大小校验** | `hashingReader` 检查 written == size | 复用 `hashingReader` 相同逻辑 |
+| **8. 跨仓库检查** | `LFSObjectAccessible` | 复用 `LFSObjectAccessible` 相同逻辑 |
+| **9. 元数据创建** | `NewLFSMetaObject` | 复用 `NewLFSMetaObject` 相同逻辑 |
+
+**核心结论**：Pure SSH 传输在**传输层**（请求头、编码方式）与 HTTP 路径不同，但在**业务层**（认证、配额、校验、存储）100% 复用相同的代码逻辑，确保了两种传输方式的行为一致性。
+
 ## 六、凭据隔离机制
 
 ### 6.1 JWT Token 认证体系
@@ -389,17 +469,28 @@ type Claims struct {
 
 ### 6.2 认证流程
 - **入口函数**: `services/lfs/server.go:authenticate` (L538-578)
+- **完整流程包含三层权限检查**：Actions 用户权限 → 常规用户权限 → LFS JWT Token 认证
 
 ```go
 func authenticate(ctx *context.Context, repository *repo_model.Repository, authorization string, requireSigned, requireWrite bool) bool {
-    // 1. 首先检查常规用户权限
+    // 1. 优先检查 Actions 用户权限 (CI/CD 场景)
+    if taskID, ok := user_model.GetActionsUserTaskID(ctx.Doer); ok {
+        perm, err := access_model.GetActionsUserRepoPermission(ctx, repository, ctx.Doer, taskID)
+        if err != nil {
+            log.Error("Unable to GetActionsUserRepoPermission for task[%d] Error: %v", taskID, err)
+            return false
+        }
+        return perm.CanAccess(accessMode, unit.TypeCode)
+    }
+
+    // 2. 检查常规用户权限 (登录用户 / 匿名访问)
     perm, _ := access_model.GetDoerRepoPermission(ctx, repository, ctx.Doer)
     canAccess := perm.CanAccess(accessMode, unit.TypeCode)
     if canAccess && (!requireSigned || ctx.IsSigned) {
         return true
     }
     
-    // 2. 回退到 LFS JWT Token 认证
+    // 3. 回退到 LFS JWT Token 认证 (git-lfs 客户端场景)
     user, err := parseToken(ctx, authorization, repository, accessMode)
     if err != nil {
         return false
@@ -409,8 +500,32 @@ func authenticate(ctx *context.Context, repository *repo_model.Repository, autho
 }
 ```
 
+#### 6.2.1 Actions 用户权限生效点
+- **触发条件**: `ctx.Doer` 是 Actions 系统用户（ID = `user_model.ActionsUserID`）
+- **生效位置**: `services/lfs/server.go:authenticate` L544-551 (最优先检查)
+- **权限来源**: `GetActionsUserRepoPermission` 从 Actions Task 的 Job 信息中获取权限范围
+- **检查内容**:
+  1. 验证 Task 所属 Job 的仓库权限
+  2. 考虑 Actions Token 的权限级别（读/写/管理）
+  3. 验证 Task 与目标仓库的关联关系
+
+#### 6.2.2 仓库 Scope 检查生效点
+- **触发条件**: 使用 API Token 认证时 (`ctx.Data["IsApiToken"] == true`)
+- **生效位置**: `services/lfs/server.go:getAuthenticatedRepository` L469-473 (认证通过后)
+- **检查函数**: `context.CheckRepoScopedToken` (`services/context/permission.go:94-96`)
+- **检查逻辑**:
+  ```go
+  if requireWrite {
+      context.CheckRepoScopedToken(ctx, repository, auth_model.Write)  // 需要 write_repo scope
+  } else {
+      context.CheckRepoScopedToken(ctx, repository, auth_model.Read)   // 需要 read_repo scope
+  }
+  ```
+- **额外限制**: 如果 Token 只有 public scope，不能访问私有仓库 (`PublicOnly` 检查)
+
 ### 6.3 Token 解析与校验
 - **函数**: `services/lfs/server.go:handleLFSToken` (L580-622)
+- **关键特性**: 读写路径上存在不对称约束
 
 ```go
 func handleLFSToken(ctx stdCtx.Context, tokenSHA string, target *repo_model.Repository, mode perm_model.AccessMode) (*user_model.User, error) {
@@ -424,10 +539,12 @@ func handleLFSToken(ctx stdCtx.Context, tokenSHA string, target *repo_model.Repo
         return nil, errors.New("invalid token claim") // Token 只能用于指定仓库
     }
     
-    // 3. 校验操作权限
+    // 3. 校验操作权限 - 读写路径不对称约束
+    // ⚠️  注意：只有写路径有严格的 Op 约束，读路径没有 Op 约束！
     if mode == perm_model.AccessModeWrite && claims.Op != "upload" {
-        return nil, errors.New("invalid token claim") // 上传 Token 不能用于下载
+        return nil, errors.New("invalid token claim") // 写操作必须使用 upload 令牌
     }
+    // 读路径：download 令牌 和 upload 令牌 都可以用于下载！
     
     // 4. 校验用户状态
     u, _ := user_model.GetUserByID(ctx, claims.UserID)
@@ -444,6 +561,24 @@ func handleLFSToken(ctx stdCtx.Context, tokenSHA string, target *repo_model.Repo
     return u, nil
 }
 ```
+
+#### 6.3.1 令牌读写约束差异详解
+
+| 令牌 Op | 用于读操作 (下载) | 用于写操作 (上传) |
+|---------|------------------|------------------|
+| `"download"` | ✅ 允许 | ❌ 拒绝 |
+| `"upload"` | ✅ 允许 | ✅ 允许 |
+
+**设计意图分析**:
+- **写路径严格约束**：防止下载令牌被滥用进行上传操作
+- **读路径宽松约束**：upload 令牌可以用于下载，避免客户端需要同时维护两种令牌
+- **安全边界**：最终都会通过 `GetDoerRepoPermission` 再次校验用户的实际仓库权限
+
+**令牌生成位置**:
+- **download 令牌**: `BatchHandler` 处理下载批请求时生成 (`op = "download"`)
+- **upload 令牌**: `BatchHandler` 处理上传批请求时生成 (`op = "upload"`)
+- **SSH authenticate**: `cmd/serv.go:274-294` 根据操作类型生成对应令牌
+- **Pure SSH**: `cmd/serv.go:264-271` 根据操作类型生成对应令牌
 
 ### 6.4 跨仓库对象访问控制
 当对象已存在但当前仓库没有关联记录时，需要校验用户是否有权访问该对象：
@@ -596,12 +731,15 @@ type Link struct {
 ## 十、安全边界总结
 
 1. **凭据隔离**: JWT Token 与仓库 ID、操作类型、用户 ID 三重绑定，防止跨仓库越权
-2. **对象访问控制**: `LFSObjectAccessible` 确保用户只能访问其有权限仓库中的对象
-3. **配额防护**: 入口处校验批量大小和单文件大小，防止滥用
-4. **完整性校验**: 上传过程中实时计算 SHA256 哈希和大小，确保数据完整性
-5. **预签名 URL**: 对象存储签名 URL 有效期仅 5 分钟，且不暴露 Gitea 凭据
-6. **内部 API 认证**: Pure SSH 传输通过 `X-Gitea-Internal-Auth` 头进行内部服务间认证
-7. **传输通道安全**: SSH 传输使用 pkt-line 格式在加密通道内传输，避免额外暴露 HTTP 端点
+2. **令牌读写约束不对称**: 写操作强制要求 `Op="upload"`，读操作允许多种令牌，兼顾安全与便利
+3. **Actions 用户权限**: CI/CD 场景下优先使用 Task/Job 级别的细粒度权限控制
+4. **仓库 Scope 检查**: API Token 必须具备 `write_repo`/`read_repo` scope，且 Public scope 不能访问私有仓库
+5. **对象访问控制**: `LFSObjectAccessible` 确保用户只能访问其有权限仓库中的对象
+6. **配额防护**: 入口处校验批量大小和单文件大小，防止滥用
+7. **完整性校验**: 上传过程中实时计算 SHA256 哈希和大小，确保数据完整性
+8. **预签名 URL**: 对象存储签名 URL 有效期仅 5 分钟，且不暴露 Gitea 凭据
+9. **内部 API 认证**: Pure SSH 传输通过 `X-Gitea-Internal-Auth` 头进行内部服务间认证
+10. **传输通道安全**: SSH 传输使用 pkt-line 格式在加密通道内传输，避免额外暴露 HTTP 端点
 
 ## 十一、传输机制对比总结
 
@@ -610,8 +748,12 @@ type Link struct {
 | **协议** | HTTP/HTTPS | SSH (git-lfs-transfer) |
 | **批接口** | 独立 HTTP Batch API | 通过 GiteaBackend 调用内部 Batch API |
 | **Range 下载** | Gitea 处理 (非 ServeDirect) / 对象存储处理 (ServeDirect) | 通过内部 API 复用 DownloadHandler |
-| **Chunked 上传** | 支持 | 通过内部 API 复用 UploadHandler |
-| **认证方式** | Basic Auth / JWT Token / Session | SSH Key + 内部 JWT Token |
+| **Chunked 上传** | Batch 响应通知客户端使用 chunked | 内部调用使用 Content-Length，不使用 chunked |
+| **上传请求头** | 由 git-lfs 客户端决定 | 显式设置 Content-Length / Content-Type |
+| **内部认证** | 不需要 | `X-Gitea-Internal-Auth` 头 |
+| **认证方式** | Basic Auth / JWT Token / Session / API Token | SSH Key + 内部 JWT Token |
+| **Actions 支持** | 支持（authenticate 优先检查） | 支持（复用相同 authenticate 逻辑） |
+| **仓库 Scope** | 支持（CheckRepoScopedToken） | 支持（复用相同检查逻辑） |
 | **凭据有效期** | JWT 默认 24h | JWT 默认 24h |
 | **配额校验** | BatchHandler 入口 | 复用 BatchHandler 逻辑 |
 | **完整性校验** | hashingReader 实时校验 | 复用 hashingReader 逻辑 |
@@ -628,3 +770,83 @@ type Link struct {
 | 验证 | `POST /info/lfs/verify` | `GiteaBackend.Verify()` | `VerifyHandler` |
 | 权限校验 | `getAuthenticatedRepository()` | `getAuthenticatedRepository()` | 完全相同 |
 | 配额校验 | `BatchHandler` L215/L258 | `BatchHandler` L215/L258 | 完全相同 |
+
+## 十二、认证与授权体系完整总结
+
+### 12.1 完整认证流程栈
+
+```
+请求进入
+    ↓
+┌─────────────────────────────────────────┐
+│ 1. Actions 用户权限检查                  │
+│    (authenticate L544-551)              │
+│    - GetActionsUserTaskID               │
+│    - GetActionsUserRepoPermission       │
+│    - 基于 Task/Job 的权限范围校验        │
+└─────────────────────────────────────────┘
+    ↓ 不是 Actions 用户
+┌─────────────────────────────────────────┐
+│ 2. 常规用户权限检查                      │
+│    (authenticate L553-565)              │
+│    - GetDoerRepoPermission              │
+│    - 支持匿名访问 / Session 登录         │
+└─────────────────────────────────────────┘
+    ↓ 认证失败
+┌─────────────────────────────────────────┐
+│ 3. LFS JWT Token 认证                   │
+│    (authenticate L567-577)              │
+│    - parseToken → handleLFSToken        │
+│    - 令牌读写约束校验 (L600-602)        │
+│    - 仓库绑定校验 (L596-598)            │
+│    - 用户状态校验 (L609-611)            │
+│    - 最终权限校验 (L613-620)            │
+└─────────────────────────────────────────┘
+    ↓ 认证通过
+┌─────────────────────────────────────────┐
+│ 4. 仓库 Scope 检查                       │
+│    (getAuthenticatedRepository L469-473)│
+│    - CheckRepoScopedToken               │
+│    - 仅对 API Token 生效                │
+│    - 检查 write_repo / read_repo scope  │
+│    - PublicOnly 限制私有仓库访问         │
+└─────────────────────────────────────────┘
+    ↓
+业务逻辑执行
+```
+
+### 12.2 令牌读写约束不对称性总结
+
+| 令牌类型 | 生成时机 | 下载权限 | 上传权限 | 约束代码 |
+|---------|---------|---------|---------|---------|
+| `op="download"` | 下载批请求 | ✅ 允许 | ❌ 拒绝 | `mode == Write && Op != "upload"` |
+| `op="upload"` | 上传批请求 | ✅ 允许 | ✅ 允许 | 无约束（读路径宽松） |
+
+**设计权衡**：
+- 安全：写操作严格限制，防止下载令牌被滥用
+- 便利：读操作宽松，避免客户端维护两种令牌
+- 兜底：最终都会通过 `GetDoerRepoPermission` 校验用户实际权限
+
+### 12.3 上传内容长度策略对比总结
+
+| 策略维度 | HTTP 上传 | Pure SSH 上传 |
+|---------|----------|---------------|
+| **Batch 响应头** | `Transfer-Encoding: chunked` | 无（不经过 Batch 响应） |
+| **实际请求头** | 由 git-lfs 客户端决定 | `Content-Length: {size}` |
+| **size 传递** | URL 路径 `/objects/{oid}/{size}` | 协议参数 + URL 路径 |
+| **传输效率** | chunked 编码有额外开销 | Content-Length 更高效 |
+| **完整性校验** | `hashingReader` 实时校验 | 复用 `hashingReader` |
+| **内部认证头** | 无 | `X-Gitea-Internal-Auth` |
+
+### 12.4 关键生效点速查表
+
+| 检查项 | 生效位置 | 触发条件 |
+|--------|----------|---------|
+| MaxBatchSize | `BatchHandler` L215 | 批量请求入口 |
+| MaxFileSize | `BatchHandler` L258 | 对象不存在且需上传 |
+| Actions 权限 | `authenticate` L544 | ctx.Doer 是 Actions 用户 |
+| 仓库 Scope | `getAuthenticatedRepository` L469 | 使用 API Token 认证 |
+| 令牌写约束 | `handleLFSToken` L600 | mode == AccessModeWrite |
+| 跨仓库访问 | `UploadHandler` L340 | 对象已存在但当前仓库无关联 |
+| 哈希/大小校验 | `contentStore.Put` | 所有上传场景 |
+| 内部 API 认证 | `newInternalRequestLFS` | Pure SSH 传输场景 |

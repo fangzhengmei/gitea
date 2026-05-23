@@ -133,6 +133,84 @@ func IncreaseTaskVersion(ctx context.Context, ownerID, repoID int64) error {
    - Repo1 Runner (OwnerID=0, RepoID=Repo1.ID)：比较仓库版本 20≠21 → 尝试 PickTask
    - 其他组织/仓库 Runner：版本不变 → 跳过 PickTask
 
+##### 2.1.2.3 Owner 作用域版本递增与可消费 Runner 关系的边界说明
+
+**仓内代码可证的事实** (`models/actions/tasks_version.go:75-101`):
+```go
+func IncreaseTaskVersion(ctx context.Context, ownerID, repoID int64) error {
+    return db.WithTx(ctx, func(ctx context.Context) error {
+        // 1. 全局版本始终递增
+        if err := increaseTasksVersionByScope(ctx, 0, 0); err != nil {
+            return err
+        }
+        // 2. ownerID>0 时递增组织版本
+        if ownerID > 0 {
+            if err := increaseTasksVersionByScope(ctx, ownerID, 0); err != nil {
+                return err
+            }
+        }
+        // 3. repoID>0 时递增仓库版本
+        if repoID > 0 {
+            if err := increaseTasksVersionByScope(ctx, 0, repoID); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+```
+
+**边界说明（避免误推）**:
+
+1. ✅ **仓内代码可证**：`IncreaseTaskVersion(ownerID, repoID)` 被调用时：
+   - 全局版本 **一定** 递增（无条件）
+   - 组织版本 **仅当** `ownerID > 0` 时递增
+   - 仓库版本 **仅当** `repoID > 0` 时递增
+
+2. ❌ **常见误推**："组织版本递增意味着一定有组织级 Runner 存在并能消费任务"
+   - **边界**：版本递增是 **事实**，但是否有对应 Owner 作用域的 Runner 存在并能消费任务是 **另一个独立条件**
+   - 可能出现的情况：
+     - 组织版本递增了，但没有注册任何组织级 Runner → 任务只能由全局 Runner 或仓库级 Runner 消费
+     - 有组织级 Runner，但标签不匹配 → Runner 版本变化触发 PickTask，但 `CanMatchLabels` 失败，任务仍无法分配
+     - 组织级 Runner 被禁用 → 版本递增了，但 Runner 被 `IsDisabled` 检查过滤
+
+3. ✅ **仓内代码可证**：`GetTasksVersionByScope` 的查询逻辑
+   ```go
+   // models/actions/tasks_version.go:56-73
+   func GetTasksVersionByScope(ctx context.Context, ownerID, repoID int64) (int64, error) {
+       cond := builder.NewCond()
+       if ownerID > 0 {
+           cond = cond.And(builder.Eq{"owner_id": ownerID})
+       } else {
+           cond = cond.And(builder.Eq{"owner_id": 0})
+       }
+       if repoID > 0 {
+           cond = cond.And(builder.Eq{"repo_id": repoID})
+       } else {
+           cond = cond.And(builder.Eq{"repo_id": 0})
+       }
+       var v ActionTasksVersion
+       has, err := db.GetEngine(ctx).Where(cond).Get(&v)
+       if err != nil {
+           return 0, err
+       } else if !has {
+           return 0, nil // 记录不存在时返回 0
+       }
+       return v.Version, nil
+   }
+   ```
+   - 全局 Runner 查 `owner_id=0, repo_id=0`
+   - 组织 Runner 查 `owner_id=?, repo_id=0`
+   - 仓库 Runner 查 `owner_id=0, repo_id=?`
+   - 三者完全隔离，互不干扰
+
+4. **版本递增 ≠ 任务可分配**：
+   版本递增只是"通知信号"，任务能否实际分配还需经过 `PickTask` 中的多重检查：
+   - Runner 是否禁用
+   - Runner 是否已有运行任务（Ephemeral Runner 检查）
+   - 标签是否匹配 (`CanMatchLabels`)
+   - 作业是否仍为 `Waiting` 状态且 `task_id=0`（乐观锁检查）
+
 ### 2.2 任务分配流程 (`PickTask`)
 
 **入口**: `services/actions/task.go:19-112` → `models/actions/task.go:230-334`
@@ -459,19 +537,24 @@ func generateTaskContext(ctx context.Context, t *actions_model.ActionTask) (*str
 }
 ```
 
-**步骤 4：Runner 侧使用场景**
-1. **Task Token (`gitCtx["token"]`)**:
-   - Runner 将其设置为环境变量 `GIT_AUTH_TOKEN`
-   - `actions/checkout` 使用该 Token 通过 HTTPS 克隆代码
-   - 认证验证：`GetRunningTaskByToken(token)` → 比较哈希
+**步骤 4：Runner 侧使用场景（仓内代码可证 vs 推断边界）**
+1. **仓内代码可证**：两个 Token 被注入到 `task.Context` 的 `gitCtx` map 中
+   - `gitCtx["token"]` = Task Token 明文
+   - `gitCtx["gitea_runtime_token"]` = JWT 字符串
+   - 见 `services/actions/task.go:114-125`
 
-2. **`gitea_runtime_token` (`gitCtx["gitea_runtime_token"]`)**:
-   - Runner 将其设置为环境变量 `GITEA_RUNTIME_TOKEN`
-   - 用于调用 Gitea API：
-     - `actions/upload-artifact`: 上传构建产物
-     - `actions/cache`: 缓存依赖
-     - 其他需要授权的 Gitea API 调用
-   - 认证验证：`ParseAuthorizationToken(req)` → JWT 验签
+2. **仓内代码可证**：服务端 Token 验证逻辑
+   - Task Token 验证：`GetRunningTaskByToken(token)` → 恒定时间哈希比较
+     见 `models/actions/task.go:163-214`
+   - JWT 验证：`ParseAuthorizationToken(req)` → HS256 验签
+     见 `services/actions/auth.go:75-111`
+
+3. **⚠️ 【推断】** Runner 侧 Token 使用方式：
+   - ⚠️ **【推断】** Runner 将 `gitCtx["token"]` 设置为环境变量 `GIT_AUTH_TOKEN`
+   - ⚠️ **【推断】** `actions/checkout` 使用该 Token 通过 HTTPS 克隆代码
+   - ⚠️ **【推断】** Runner 将 `gitCtx["gitea_runtime_token"]` 设置为环境变量 `GITEA_RUNTIME_TOKEN`
+   - ⚠️ **【推断】** `actions/upload-artifact` / `actions/cache` 等 Action 使用该 JWT 调用 Gitea API
+   - > 注：以上 Runner 侧和第三方 Action 的行为不在当前仓内代码范围内，属于合理推断
 
 **双 Token 职责分离**:
 
@@ -674,17 +757,30 @@ func runnerRequestHasCancellingCapability(req proto.Message) (bool, bool) {
 ```
 
 #### 5.2.2 状态机设计
+
+**仓内代码可证的状态流转**：
 ```
 StatusWaiting/Blocked → CancelJobs() → StatusCancelled (直接终态)
+                       见 models/actions/run.go:310-328
 
 StatusRunning → StopTask(StatusCancelling) → StatusCancelling
-    ↓ (Runner 支持 Cancelling)
-    执行 post-step cleanup
+                       见 models/actions/task.go:431-505
+
+StatusRunning → StopTask(StatusCancelled) → StatusCancelled
+                       (不支持 Cancelling 时直接终态)
+                       见 models/actions/task.go:460-466
+```
+
+**推断边界标注**：
+```
+StatusCancelling (服务端状态)
+    ↓ ⚠️ 【推断】Runner 支持 Cancelling 时
+    ↓ ⚠️ 【推断】执行 post-step cleanup
     ↓
     UpdateTask(Result=*) → StatusCancelled (保留用户意图)
-
-StatusRunning → StopTask(StatusCancelled) → StatusCancelled (不支持 Cancelling 时直接终态)
+                       见 models/actions/task.go:395-398
 ```
+> 注："执行 post-step cleanup" 是 Runner 侧行为，不在当前仓内代码范围内，属于合理推断
 
 **核心逻辑** (`models/actions/task.go:431-499`):
 ```go
@@ -722,38 +818,34 @@ func StopTask(ctx, taskID int64, status Status) error {
 
 ##### 5.2.2.1 任务取消信号返回路径修正
 
-**原理解误**: 之前的分析认为取消信号通过 `FetchTask` 响应返回给 Runner，但实际返回路径有两条独立通道：
+**主通道：`UpdateTaskResponse`（正在执行任务的取消信号回传）**
+这是 **正在运行任务的唯一取消信号回传通道**，仓内代码可证。
 
-**返回路径一：通过 `UpdateTaskResponse` 即时响应**
-这是 Runner 执行任务期间最主要的取消信号通道。
-
-**完整链路** (`routers/api/actions/runner/runner.go:222-288` → `models/actions/status.go:102-115`):
+**仓内代码可证的链路** (`routers/api/actions/runner/runner.go:281-287` → `models/actions/status.go:102-115`):
 ```go
-// 1. 用户/系统触发取消 → StopTask(StatusCancelling) → task.Status = StatusCancelling
+// 1. 仓内可证：StopTask 将 task.Status 设置为 StatusCancelling 或 StatusCancelled
+//    见 models/actions/task.go:431-499 StopTask
 
-// 2. Runner 正常上报任务状态
+// 2. 仓内可证：UpdateTask 响应返回 task.Status.AsResult()
 func (s *Service) UpdateTask(ctx, req) (*Response[UpdateTaskResponse], error) {
-    runner := GetRunner(ctx)
-    task, err := actions_model.UpdateTaskByState(ctx, runner.ID, req.Msg.State)
     // ...
-    // 3. 响应中携带取消信号
     return connect.NewResponse(&runnerv1.UpdateTaskResponse{
         State: &runnerv1.TaskState{
             Id:     req.Msg.State.Id,
-            Result: task.Status.AsResult(), // 关键：状态转换
+            Result: task.Status.AsResult(), // 仓内可证：状态映射
         },
         SentOutputs: sentOutputs,
     }), nil
 }
 
-// 4. Status → Result 转换逻辑
+// 3. 仓内可证：StatusCancelling 和 StatusCancelled 都映射为 RESULT_CANCELLED
 func (s Status) AsResult() runnerv1.Result {
     switch s {
     case StatusSuccess:
         return runnerv1.Result_RESULT_SUCCESS
     case StatusFailure:
         return runnerv1.Result_RESULT_FAILURE
-    case StatusCancelled, StatusCancelling:  // 两个状态都映射为 CANCELLED
+    case StatusCancelled, StatusCancelling:  // 仓内可证：两个状态都映射
         return runnerv1.Result_RESULT_CANCELLED
     case StatusSkipped:
         return runnerv1.Result_RESULT_SKIPPED
@@ -763,17 +855,29 @@ func (s Status) AsResult() runnerv1.Result {
 }
 ```
 
-**关键机制**:
+**仓内代码可证的机制**:
 - `StatusCancelling` 和 `StatusCancelled` 在 `AsResult()` 中都映射为 `runnerv1.Result_RESULT_CANCELLED`
-- Runner 收到 `RESULT_CANCELLED` 后立即终止当前步骤，执行 `post:` 和 `always:` 步骤清理
-- 设计意图：通过 Runner 的正常心跳（`UpdateTask`）通道返回取消信号，无需额外长连接或推送机制
+- 设计意图（仓内可证）：通过 Runner 的正常心跳（`UpdateTask`）通道返回取消信号，无需额外长连接或推送机制
 
-**返回路径二：通过 `FetchTask` 响应（针对空闲 Runner）**
-仅适用于 Runner 正在轮询新任务、尚未分配到任务的场景：
-```go
-// CancelJobs() → job.TaskID == 0 → 直接设置 StatusCancelled
-// 这种情况下没有正在运行的 Task，取消信号无需传递给 Runner
-```
+**Runner 收到 CANCELLED 后的行为（仓内代码可证 vs 推断边界）**:
+- ✅ **仓内代码可证**：`UpdateTaskResponse.State.Result` 字段会返回 `RESULT_CANCELLED` 给调用方
+- ⚠️ **【推断】** Runner 收到 `RESULT_CANCELLED` 后会终止当前步骤执行
+- ⚠️ **【推断】** Runner 会执行 `post:` 和 `always:` 步骤进行清理
+- ⚠️ **【推断】** Runner 会通过下一次 `UpdateTask` 调用上报清理后的最终结果
+- > 注：以上三点 Runner 侧行为不在当前仓内代码范围内，属于基于 Gitea Actions 协议约定的合理推断
+
+**FetchTask 不是正在运行任务的取消信号回传通道**
+- ✅ **仓内代码可证**：`FetchTask` 仅返回 `tasksVersion` 不一致时新分配的任务对象
+  见 `routers/api/actions/runner/runner.go:177-220`
+- ✅ **仓内代码可证**：`FetchTask` 响应结构中没有"当前运行任务状态"字段
+  仅包含 `Task task` 和 `int64 tasksVersion`
+- ✅ **仓内代码可证**：对于未分配 Task 的 Job（`task_id=0`），`CancelJobs` 直接设置为 `StatusCancelled`
+  见 `models/actions/run.go:310-328`
+
+**FetchTask 的作用域（仓内代码可证）**:
+- 仅在 Runner 空闲、正在轮询新任务时工作
+- 不参与任何正在运行任务的取消信号回传
+- 未分配 Task 的 Job 取消直接在服务端完成，无需通知 Runner
 
 **状态映射关系表** (`models/actions/status.go:13-27, 102-130`):
 | 内部 Status | proto Result | 含义 |
@@ -881,6 +985,8 @@ Runner                                  Gitea
 ```
 
 ### 6.3 任务取消流程
+
+**仓内代码可证部分**：
 ```
 User/System                             Gitea                                  Runner
   |                                        |                                        |
@@ -888,18 +994,33 @@ User/System                             Gitea                                  R
   |--------------------------------------->|                                        |
   |                                        | StopTask(StatusCancelling)             |
   |                                        | 检查 Runner Cancelling 支持              |
-  |                                        | 更新任务状态为 Cancelling                |
+  |                                        | 更新 task.Status = Cancelling           |
   |                                        |                                        |
-  |                                        | 下次 FetchTask 或 UpdateTask 时         |
-  |                                        | 通知 Runner 任务已取消                   |
-  |<---------------------------------------|--------------------------------------->|
-  |                                        |                                        | 执行清理步骤
+  |                                        | 🔄 Runner 定期调用 UpdateTask 上报状态    |
+  |                                        |<---------------------------------------|
+  |                                        |                                        |
+  |                                        | UpdateTaskResponse.State.Result        |
+  |                                        |   = task.Status.AsResult()              |
+  |                                        |   = RESULT_CANCELLED                    |
+  |                                        |--------------------------------------->|
+```
+
+**推断边界标注**：
+- ⚠️ **【推断】** Runner 收到 `RESULT_CANCELLED` 后会终止当前步骤执行
+- ⚠️ **【推断】** Runner 会执行 `post:` 和 `always:` 清理步骤
+- ⚠️ **【推断】** Runner 会通过下一次 `UpdateTask` 上报最终结果
+- > 注：正在运行任务的取消信号 **仅通过 UpdateTaskResponse 返回**，FetchTask 不参与此流程
+
+**后续服务端处理（仓内代码可证）**：
+```
   |                                        |                                        |
   |                                        | UpdateTask(Result=*)                   |
   |                                        |<---------------------------------------|
-  |                                        | 状态强制为 Cancelled (保留用户意图)      |
-  |                                        | 归档日志                                |
-  |                                        | 触发后续作业调度                        |
+  |                                        | 🔹 如原状态为 Cancelling                 |
+  |                                        |    → 强制设置为 Cancelled               |
+  |                                        |    (保留用户取消意图，不被 Runner 结果覆盖)|
+  |                                        | 🔹 归档日志                              |
+  |                                        | 🔹 触发后续作业调度                      |
 ```
 
 ---
@@ -922,11 +1043,28 @@ User/System                             Gitea                                  R
 
 ## 八、设计特点总结
 
+### 8.1 仓内代码可证的设计特点
+
 1. **拉模式调度**：Runner 主动轮询，避免服务端主动连接问题
-2. **乐观锁版本控制**：通过 `tasks_version` 减少无效轮询
+2. **三级乐观锁版本控制**：通过 global/owner/repo 三层 `tasks_version` 减少无效轮询
 3. **三级令牌体系**：注册令牌、Runner 身份令牌、任务运行令牌职责分离
 4. **两级日志存储**：DBFS 高效追加写 + 对象存储长期归档
-5. **优雅取消机制**：支持 `Cancelling` 过渡状态，允许 Runner 执行清理
-6. **并发控制**：作业级和工作流级并发组，支持取消进行中任务
+5. **取消信号主通道**：正在运行任务的取消信号 **仅通过 `UpdateTaskResponse` 返回**，`FetchTask` 不参与
+6. **状态映射设计**：`StatusCancelling` 和 `StatusCancelled` 都映射为 `RESULT_CANCELLED`
 7. **防时序攻击**：所有令牌比较使用 `subtle.ConstantTimeCompare`
 8. **去重机制**：`jobEmitterQueue` 使用 `ErrAlreadyInQueue` 防止重复调度
+9. **版本递增原子性**：三层版本递增在同一数据库事务中完成
+
+### 8.2 推断边界说明（仓内代码不可证部分）
+
+以下内容基于 Gitea Actions 协议约定的合理推断，不在当前仓内代码范围内：
+- Runner 收到 `RESULT_CANCELLED` 后会终止当前步骤并执行 `post:`/`always:` 清理
+- Runner 将 `gitCtx["token"]` 设为 `GIT_AUTH_TOKEN` 环境变量
+- Runner 将 `gitCtx["gitea_runtime_token"]` 设为 `GITEA_RUNTIME_TOKEN` 环境变量
+- `actions/checkout`/`actions/upload-artifact` 等第三方 Action 使用相应 Token
+
+### 8.3 关键边界说明（避免误推）
+
+1. **版本递增 ≠ 任务可分配**：版本递增只是"通知信号"，任务能否分配还需经过 Runner 禁用、标签匹配、乐观锁等多重检查
+2. **组织版本递增 ≠ 存在组织级 Runner**：版本递增与 Runner 存在是两个独立条件，无组织级 Runner 时任务可由全局或仓库级 Runner 消费
+3. **`tasksVersion=0` 特殊处理**：首次访问时自动初始化版本记录，避免返回 0 被误认为旧版 Gitea

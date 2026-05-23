@@ -5,8 +5,9 @@
 Gitea Actions 的任务调度采用 **"拉模式"** 设计，即 Runner 主动轮询 Gitea 服务端获取任务，而非服务端主动推送。核心握手链路如下：
 
 ```
-Runner 注册 → Runner 心跳/声明 → FetchTask 轮询 → PickTask 分配 → 任务执行 → UpdateTask/UpdateLog 回传
+Runner 注册 ⚠️【推断】→ Runner 心跳/声明 ⚠️【推断】→ FetchTask 轮询 ⚠️【推断】→ PickTask 分配 ✅ → 任务执行 ⚠️【推断】→ UpdateTask/UpdateLog 回传 ✅
 ```
+> 标注说明：✅ 表示仓内代码可证的服务端逻辑，⚠️【推断】表示 Runner 侧行为，超出仓内代码范围
 
 ---
 
@@ -43,6 +44,13 @@ func (s *Service) FetchTask(ctx, req) {
     return FetchTaskResponse{Task: task, TasksVersion: latestVersion}
 }
 ```
+
+**FetchTask 硬性要求（仓内代码可证）**:
+- ✅ **必须持续轮询**：当 `tasksVersion` 发生变化时（`tasksVersion != latestVersion`），即使 `FetchTaskResponse.Task` 为 `nil`，Runner 仍需：
+  1. 更新本地 `tasksVersion` 为返回的 `latestVersion`
+  2. 继续下一轮轮询
+- ✅ **不能中断轮询**：不能因为版本变化但未分配到任务就停止轮询，后续版本变化可能有新任务
+- ✅ **不能跳过版本更新**：即使 `task=nil`，`latestVersion` 也必须被更新到本地，否则下一次请求会重复触发相同的 `PickTask` 尝试
 
 **版本递增触发点** (`models/actions/run_job.go:245-250`):
 ```go
@@ -128,9 +136,10 @@ if err != nil {
 ```
 
 **关键设计点**:
-1. **自动初始化**: 当 `latestVersion == 0` 时，立即调用 `IncreaseTaskVersion` 初始化版本记录
-2. **手动递增**: `IncreaseTaskVersion` 执行后不返回更新后的值，需手动 `latestVersion++`
-3. **版本语义**: 避免返回 0 给 Runner，因为旧版 Gitea 没有 tasksVersion 机制，Runner 会将 0 误认为是不支持该特性的旧服务端
+1. **自动初始化** ✅: 当 `latestVersion == 0` 时，立即调用 `IncreaseTaskVersion` 初始化版本记录
+2. **手动递增** ✅: `IncreaseTaskVersion` 执行后不返回更新后的值，需手动 `latestVersion++`
+3. **版本语义** ⚠️【推断】: 避免返回 0 给 Runner，因为旧版 Gitea 没有 tasksVersion 机制，Runner 会将 0 误认为是不支持该特性的旧服务端
+   > 注："Runner 会将 0 误认为旧服务端"是基于代码注释的合理推断，不在仓内可证范围内
 
 ##### 2.1.2.2 三层版本递增对任务可见性的影响
 
@@ -169,11 +178,11 @@ func IncreaseTaskVersion(ctx context.Context, ownerID, repoID int64) error {
 | 组织下某仓库作业就绪 | 全局 + 组织 + 仓库 | 全局 Runner + 该组织 Runner + 该仓库 Runner |
 | Runner 读取版本 | 仅读取自身作用域 | 按 Runner.OwnerID/RepoID 匹配对应层级 |
 
-**设计意图**:
-- **全局递增**: 确保全局 Runner 能感知所有新任务
-- **组织/仓库递增**: 实现"任务可见性隔离"，专属 Runner 只需要感知自己作用域内的任务
+**设计意图（通知信号与可分配性明确区分）**:
+- **全局递增（通知信号）**: 任何作业就绪都会触发全局版本递增，让全局 Runner **感知到可能有新任务**，但不保证一定有可分配的任务
+- **组织/仓库递增（通知信号）**: 实现"任务可见性隔离"，专属 Runner 只需要感知自己作用域内的任务通知，但同样不保证任务可分配
 - **事务性**: 三层递增在同一事务中完成，保证版本变更的原子性
-- **通知广播**: 任何作业就绪都会触发全局版本递增，确保全局 Runner 不会错过任务
+- **可分配性独立判断**: 版本递增只是通知信号，任务能否实际分配需要经过 `PickTask` 中的多重独立检查（Runner 禁用、标签匹配、乐观锁等）
 
 **实际运行示例**:
 1. 组织 `Org1` 下的仓库 `Repo1` 有新作业就绪
@@ -468,9 +477,10 @@ Gitea Actions 采用 **三层令牌体系**，各层职责分明：
   ```go
   ExpiresAt: jwt.NewNumericDate(now.Add(1*time.Hour + setting.Actions.EndlessTaskTimeout))
   ```
-  - 基础时效：1 小时
-  - 附加时效：`EndlessTaskTimeout`（防止超长任务令牌过期）
-- **用途**: Runner 调用 Gitea API 时的 Authorization 头，用于 artifact 上传、cache 操作等
+  - 基础时效：1 小时 ✅
+  - 附加时效：`EndlessTaskTimeout`（防止超长任务令牌过期）✅
+- **用途** ⚠️【推断】: Runner 调用 Gitea API 时的 Authorization 头，用于 artifact 上传、cache 操作等
+  > 注：具体用途是基于 JWT 的 `Scp` 声明和 `Ac` 权限字段的合理推断
 
 ##### 3.3.3 Task Token 与 `gitea_runtime_token` 生成注入完整流程
 
@@ -493,9 +503,9 @@ PickTask 分配任务
     ↓
 ⑥ Task 对象通过 FetchTaskResponse 返回给 Runner
     ↓
-⑦ Runner 解析 task.Context 获取两个 Token
-    ├─ token: 用于 Git 认证 (actions/checkout)
-    └─ gitea_runtime_token: 用于 Gitea API 调用 (artifact/cache)
+⑦ Runner 解析 task.Context 获取两个 Token ⚠️【推断】
+    ├─ token: 用于 Git 认证 (actions/checkout) ⚠️【推断】
+    └─ gitea_runtime_token: 用于 Gitea API 调用 (artifact/cache) ⚠️【推断】
 ```
 
 **步骤 1：Task Token 生成** (`models/actions/utils.go:21-27` → `models/actions/task.go:147-149`)
@@ -1059,20 +1069,20 @@ User/System                             Gitea                                  R
   |                                        | 检查 Runner Cancelling 支持              |
   |                                        | 更新 task.Status = Cancelling           |
   |                                        |                                        |
-  |                                        | 🔄 Runner 定期调用 UpdateTask 上报状态    |
+  |                                        | 🔄 Runner 定期调用 UpdateTask 上报状态 ⚠️【推断】 |
   |                                        |<---------------------------------------|
   |                                        |                                        |
-  |                                        | UpdateTaskResponse.State.Result        |
+  |                                        | UpdateTaskResponse.State.Result ✅      |
   |                                        |   = task.Status.AsResult()              |
   |                                        |   = RESULT_CANCELLED                    |
   |                                        |--------------------------------------->|
 ```
 
 **推断边界标注**：
-- ⚠️ **【推断】** Runner 收到 `RESULT_CANCELLED` 后会终止当前步骤执行
-- ⚠️ **【推断】** Runner 会执行 `post:` 和 `always:` 清理步骤
-- ⚠️ **【推断】** Runner 会通过下一次 `UpdateTask` 上报最终结果
-- > 注：正在运行任务的取消信号 **仅通过 UpdateTaskResponse 返回**，FetchTask 不参与此流程
+- ⚠️【推断】Runner 收到 `RESULT_CANCELLED` 后会终止当前步骤执行
+- ⚠️【推断】Runner 会执行 `post:` 和 `always:` 清理步骤
+- ⚠️【推断】Runner 会通过下一次 `UpdateTask` 上报最终结果
+- ✅ 仓内可证：正在运行任务的取消信号 **仅通过 UpdateTaskResponse 返回**，FetchTask 不参与此流程
 
 **后续服务端处理（仓内代码可证）**：
 ```
@@ -1123,10 +1133,10 @@ User/System                             Gitea                                  R
 ### 8.2 推断边界说明（仓内代码不可证部分）
 
 以下内容基于 Gitea Actions 协议约定的合理推断，不在当前仓内代码范围内：
-- Runner 收到 `RESULT_CANCELLED` 后会终止当前步骤并执行 `post:`/`always:` 清理
-- Runner 将 `gitCtx["token"]` 设为 `GIT_AUTH_TOKEN` 环境变量
-- Runner 将 `gitCtx["gitea_runtime_token"]` 设为 `GITEA_RUNTIME_TOKEN` 环境变量
-- `actions/checkout`/`actions/upload-artifact` 等第三方 Action 使用相应 Token
+- ⚠️【推断】Runner 收到 `RESULT_CANCELLED` 后会终止当前步骤并执行 `post:`/`always:` 清理
+- ⚠️【推断】Runner 将 `gitCtx["token"]` 设为 `GIT_AUTH_TOKEN` 环境变量
+- ⚠️【推断】Runner 将 `gitCtx["gitea_runtime_token"]` 设为 `GITEA_RUNTIME_TOKEN` 环境变量
+- ⚠️【推断】`actions/checkout`/`actions/upload-artifact` 等第三方 Action 使用相应 Token
 
 ### 8.3 关键边界说明（避免误推）
 

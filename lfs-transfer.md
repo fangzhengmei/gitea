@@ -336,7 +336,7 @@ Pure SSH 传输底层**复用大部分 HTTP API 的业务逻辑**，但存在重
 - **权限检查差异**: Pure SSH 路径下**不触发仓库 Scope 检查**（非 API Token 场景），但仍会执行其他所有权限校验
 
 ### 5.5 上传校验流程
-Pure SSH 上传与 HTTP 上传走完全相同的校验链路：
+Pure SSH 上传与 HTTP 上传**在核心校验逻辑层面走相同的代码路径**（满足条件时）：
 
 ```
 SSH Upload Flow:
@@ -433,7 +433,7 @@ req.Body(r) // 流式传输数据
 3. **服务端处理一致性**：
    - 无论哪种路径，`UploadHandler` 都从 URL 路径参数解析 size (`services/lfs/server.go:315`)
    - 无论哪种传输编码，`hashingReader` 都会实时校验实际传输字节数与声明 size 是否一致
-   - 所以最终的完整性校验逻辑是完全相同的
+   - **在数据完整性校验层面**，最终的哈希和大小校验逻辑走相同的代码路径
 
 #### 5.7.3 完整链路对比表
 
@@ -449,7 +449,116 @@ req.Body(r) // 流式传输数据
 | **8. 跨仓库检查** | `LFSObjectAccessible` | 复用 `LFSObjectAccessible` 相同逻辑 |
 | **9. 元数据创建** | `NewLFSMetaObject` | 复用 `NewLFSMetaObject` 相同逻辑 |
 
-**核心结论**：Pure SSH 传输在**传输层**（请求头、编码方式）与 HTTP 路径不同，但在**业务层**（认证、配额、校验、存储）100% 复用相同的代码逻辑，确保了两种传输方式的行为一致性。
+**核心结论**：Pure SSH 传输在**传输层**（请求头、编码方式）与 HTTP 路径不同，在**核心业务层**（配额校验、哈希校验、大小校验、存储操作）**在满足特定条件时**复用相同的代码逻辑；但在部分权限检查（仓库 Scope）和高级功能（ServeDirect、断点续传）层面存在差异，不能简单认为"行为完全一致"。
+
+### 5.7.4 ServeDirect 直链与 Pure SSH 内部 URL 的兼容性边界
+
+⚠️ **重要发现**：`SERVE_DIRECT = true` 与 Pure SSH 传输**完全不兼容**，同时启用会导致下载失败。
+
+#### 兼容性问题分析
+
+**URL 转换逻辑** (`modules/lfstransfer/backend/util.go:92-108`):
+```go
+func toInternalLFSURL(s string) string {
+    pos1 := strings.Index(s, "://")
+    if pos1 == -1 { return "" }
+    
+    appSubURLWithSlash := setting.AppSubURL + "/"
+    pos2 := strings.Index(s[pos1+3:], appSubURLWithSlash)
+    if pos2 == -1 { return "" }  // ⚠️  URL 不包含 AppSubURL 则返回空
+    
+    routePath := s[pos1+3+pos2+len(appSubURLWithSlash):]
+    fields := strings.SplitN(routePath, "/", 3)
+    if len(fields) < 3 || !strings.HasPrefix(fields[2], "info/lfs") { return "" }
+    return setting.LocalURL + "api/internal/repo/" + routePath
+}
+```
+
+**不兼容的完整链路**：
+```
+SERVE_DIRECT = true
+    ↓
+buildObjectResponse() 生成 MinIO/Azure 预签名 URL
+    (如: https://minio.example.com/gitea-lfs/ab/cd/abcdef1234...)
+    ↓
+Batch API 返回给 GiteaBackend.Batch()
+    ↓
+GiteaBackend.Download() 获取 action.Href = 预签名 URL
+    ↓
+toInternalLFSURL(预签名 URL) → 返回空字符串
+    (因为预签名 URL 不包含 setting.AppSubURL)
+    ↓
+newInternalRequestLFS() → 检查 isInternalLFSURL("") → 返回 nil
+    ↓
+req.Response() → nil 指针调用，panic！💥
+```
+
+#### 兼容性矩阵
+
+| 配置组合 | HTTP 下载 | Pure SSH 下载 | 说明 |
+|---------|----------|---------------|------|
+| `SERVE_DIRECT = false` | ✅ Gitea 代理 | ✅ 正常工作 | 推荐组合 |
+| `SERVE_DIRECT = true` | ✅ 对象存储直链 | ❌ panic/失败 | 不兼容，必须关闭 ServeDirect 才能使用 Pure SSH |
+| `LFS_ALLOW_PURE_SSH = true` + `SERVE_DIRECT = true` | ✅ 对象存储直链 | ❌ 完全不可用 | 危险组合，会导致 SSH 下载失败 |
+
+#### 内部 URL 安全检查
+
+为防止 SSRF 攻击，`newInternalRequestLFS` 严格限制只能访问内部 URL：
+```go
+// modules/lfstransfer/backend/util.go:130-133
+func newInternalRequestLFS(ctx context.Context, internalURL, method string, ...) *httplib.Request {
+    if !isInternalLFSURL(internalURL) {
+        return nil  // ⚠️  非内部 URL 直接拒绝
+    }
+    // ...
+}
+```
+
+**安全设计权衡**：
+- ✅ 防止 SSRF 攻击，确保 Pure SSH 只能调用 Gitea 内部 API
+- ❌ 导致无法使用对象存储直链，必须经过 Gitea 代理下载
+
+### 5.7.5 HTTP 与 Pure SSH 共用配额校验机制的条件
+
+两种传输方式**在满足以下全部条件时**，可视为共用同一套配额和校验机制：
+
+| 条件 | 说明 |
+|------|------|
+| **1. HTTP 路径不使用 API Token 认证** | 使用 JWT/Session/Basic Auth，而非 Personal Access Token |
+| **2. 关闭 SERVE_DIRECT** | 不使用对象存储直链下载 |
+| **3. 不依赖 HTTP Range 断点续传** | 接受从头开始下载整个文件 |
+| **4. 核心校验逻辑位于 handler 内部** | 而非路由中间件 |
+
+#### 共用的配额和校验机制（满足条件时）
+
+| 校验项 | HTTP 路径 | Pure SSH 路径 | 复用位置 |
+|--------|----------|---------------|----------|
+| MaxBatchSize | ✅ | ✅ | `BatchHandler` L215 |
+| MaxFileSize | ✅ | ✅ | `BatchHandler` L258 |
+| Actions 用户权限 | ✅ | ✅ | `authenticate` L544 |
+| 常规用户权限 | ✅ | ✅ | `authenticate` L554 |
+| LFS JWT Token 校验 | ✅ | ✅ | `parseToken` / `handleLFSToken` |
+| 令牌写约束 | ✅ | ✅ | `handleLFSToken` L600 |
+| 仓库绑定校验 | ✅ | ✅ | `handleLFSToken` L596 |
+| 用户状态校验 | ✅ | ✅ | `handleLFSToken` L609 |
+| 最终权限校验 | ✅ | ✅ | `handleLFSToken` L613 |
+| 跨仓库访问检查 | ✅ | ✅ | `UploadHandler` L340 |
+| 哈希实时校验 | ✅ | ✅ | `contentStore.Put` |
+| 大小完整性校验 | ✅ | ✅ | `contentStore.Put` |
+| 对象存在性检查 | ✅ | ✅ | `BatchHandler` 内 |
+
+#### 不共用的机制（始终存在差异）
+
+| 校验项 | HTTP 路径 | Pure SSH 路径 | 差异原因 |
+|--------|----------|---------------|----------|
+| 仓库 Scope 检查 | ✅ API Token 场景 | ❌ 不生效 | Pure SSH 使用 LFS JWT Token，`IsApiToken != true` |
+| Range 断点续传 | ✅ 支持 | ❌ 不支持 | `GiteaBackend.Download` 不传递 Range 头 |
+| ServeDirect 直链 | ✅ 支持 | ❌ 不支持 | 预签名 URL 无法转换为内部 URL |
+| Transfer-Encoding: chunked | ✅ 通知客户端 | ❌ 不使用 | Pure SSH 显式设置 Content-Length |
+
+#### 关键判定标准
+
+> **可视为共用一套机制的判定条件**：当且仅当 HTTP 路径使用 JWT/Session/Basic Auth 认证，且不依赖 ServeDirect 和 Range 断点续传时，两种传输方式在配额校验、权限认证、数据完整性校验等核心业务逻辑层面才是等价的。
 
 ## 六、凭据隔离机制
 
@@ -765,16 +874,18 @@ type Link struct {
 
 ## 九、配置项汇总
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `LFS_START_SERVER` | false | 是否启用 LFS 服务 |
-| `LFS_ALLOW_PURE_SSH` | false | 是否启用 Pure SSH LFS 传输 |
-| `LFS_MAX_FILE_SIZE` | 0 (无限制) | 单文件最大大小（字节） |
-| `LFS_MAX_BATCH_SIZE` | 0 (无限制) | 单次批量请求最大对象数 |
-| `LFS_HTTP_AUTH_EXPIRY` | 24h | JWT Token 有效期 |
-| `SERVE_DIRECT` | false | 是否启用对象存储直链 |
-| `LFSClient.BATCH_SIZE` | 20 | 内部客户端每批处理对象数 |
-| `LFSClient.BATCH_OPERATION_CONCURRENCY` | 8 | 内部客户端并发传输数 |
+| 配置项 | 默认值 | 说明 | 兼容性说明 |
+|--------|--------|------|------------|
+| `LFS_START_SERVER` | false | 是否启用 LFS 服务 | - |
+| `LFS_ALLOW_PURE_SSH` | false | 是否启用 Pure SSH LFS 传输 | ⚠️ 与 `SERVE_DIRECT = true` 不兼容 |
+| `LFS_MAX_FILE_SIZE` | 0 (无限制) | 单文件最大大小（字节） | HTTP 与 Pure SSH 共用 |
+| `LFS_MAX_BATCH_SIZE` | 0 (无限制) | 单次批量请求最大对象数 | HTTP 与 Pure SSH 共用 |
+| `LFS_HTTP_AUTH_EXPIRY` | 24h | JWT Token 有效期 | HTTP 与 Pure SSH 共用 |
+| `SERVE_DIRECT` | false | 是否启用对象存储直链 | ⚠️ 与 `LFS_ALLOW_PURE_SSH = true` 不兼容 |
+| `LFSClient.BATCH_SIZE` | 20 | 内部客户端每批处理对象数 | 仅内部镜像同步使用 |
+| `LFSClient.BATCH_OPERATION_CONCURRENCY` | 8 | 内部客户端并发传输数 | 仅内部镜像同步使用 |
+
+> **重要兼容性警告**：`LFS_ALLOW_PURE_SSH = true` 与 `SERVE_DIRECT = true` 不能同时启用。同时启用会导致 Pure SSH 下载时 `toInternalLFSURL` 无法转换对象存储预签名 URL，最终引发 nil 指针 panic。
 
 ## 十、安全边界总结
 
@@ -788,6 +899,7 @@ type Link struct {
 8. **预签名 URL**: 对象存储签名 URL 有效期仅 5 分钟，且不暴露 Gitea 凭据
 9. **内部 API 认证**: Pure SSH 传输通过 `X-Gitea-Internal-Auth` 头进行内部服务间认证
 10. **传输通道安全**: SSH 传输使用 pkt-line 格式在加密通道内传输，避免额外暴露 HTTP 端点
+11. **配置兼容性**: `SERVE_DIRECT = true` 与 Pure SSH 完全不兼容，同时启用会导致下载 panic
 
 ## 十一、传输机制对比总结
 
@@ -800,24 +912,27 @@ type Link struct {
 | **上传请求头** | 由 git-lfs 客户端决定 | 显式设置 Content-Length / Content-Type |
 | **内部认证** | 不需要 | `X-Gitea-Internal-Auth` 头 |
 | **认证方式** | Basic Auth / JWT Token / Session / API Token | SSH Key + 内部 JWT Token |
-| **Actions 支持** | ✅ 支持（authenticate 优先检查） | ✅ 支持（复用相同 authenticate 逻辑） |
+| **Actions 支持** | ✅ 支持（authenticate 优先检查） | ✅ 支持（调用相同 authenticate 函数） |
 | **仓库 Scope 检查** | ✅ API Token 场景生效 | ❌ 不生效（非 API Token 场景） |
 | **凭据有效期** | JWT 默认 24h | JWT 默认 24h |
-| **配额校验** | ✅ BatchHandler 入口 | ✅ 复用 BatchHandler 逻辑 |
-| **完整性校验** | ✅ hashingReader 实时校验 | ✅ 复用 hashingReader 逻辑 |
+| **配额校验** | ✅ BatchHandler 入口 | ✅ 调用相同 BatchHandler 代码 |
+| **完整性校验** | ✅ hashingReader 实时校验 | ✅ 调用相同 hashingReader 代码 |
+| **ServeDirect 兼容** | ✅ 支持对象存储直链 | ❌ 不兼容（会导致 panic） |
 | **适用场景** | 大部分用户、CI/CD | SSH 环境偏好者、纯内网部署 |
 | **客户端配置** | `git config lfs.url` | `git config lfs.sshtransfer always` |
 
 ### 11.1 关键代码路径对照
 
-| 功能 | HTTP 路径 | SSH 路径 | 复用逻辑 |
-|------|----------|----------|----------|
-| 批量请求 | `POST /info/lfs/objects/batch` | `GiteaBackend.Batch()` | `BatchHandler` |
-| 下载 | `GET /info/lfs/objects/{oid}` | `GiteaBackend.Download()` | `DownloadHandler` |
-| 上传 | `PUT /info/lfs/objects/{oid}/{size}` | `GiteaBackend.Upload()` | `UploadHandler` |
-| 验证 | `POST /info/lfs/verify` | `GiteaBackend.Verify()` | `VerifyHandler` |
-| 权限校验 | `getAuthenticatedRepository()` | `getAuthenticatedRepository()` | 完全相同 |
-| 配额校验 | `BatchHandler` L215/L258 | `BatchHandler` L215/L258 | 完全相同 |
+| 功能 | HTTP 路径 | SSH 路径 | 复用逻辑 | 条件性说明 |
+|------|----------|----------|----------|------------|
+| 批量请求 | `POST /info/lfs/objects/batch` | `GiteaBackend.Batch()` | `BatchHandler` | 核心逻辑相同，URL 不同 |
+| 下载 | `GET /info/lfs/objects/{oid}` | `GiteaBackend.Download()` | `DownloadHandler` | 仅数据读取相同，Range 不传递 |
+| 上传 | `PUT /info/lfs/objects/{oid}/{size}` | `GiteaBackend.Upload()` | `UploadHandler` | 仅业务逻辑相同，请求头不同 |
+| 验证 | `POST /info/lfs/verify` | `GiteaBackend.Verify()` | `VerifyHandler` | 核心逻辑相同 |
+| 权限校验 | `getAuthenticatedRepository()` | `getAuthenticatedRepository()` | 大部分相同 | 仓库 Scope 检查在 Pure SSH 下不生效 |
+| 配额校验 | `BatchHandler` L215/L258 | `BatchHandler` L215/L258 | 核心逻辑相同 | 触发条件一致 |
+
+> **重要说明**："复用逻辑"仅指最终调用的 handler 函数相同，不代表行为完全一致。实际行为还受传输层参数（如请求头、URL 类型）的影响。
 
 ### 11.2 Pure SSH 下载链路中 Range 请求的实际传递分析
 
@@ -976,3 +1091,62 @@ Pure SSH 下载路径 (不支持断点续传):
 | Pure SSH 路径支持断点续传 | **不支持**，GiteaBackend 不传递 Range 头 | `modules/lfstransfer/backend/backend.go:181-185` 未设置 Range 头 |
 | 复用 DownloadHandler 就支持断点续传 | 上层协议不传递 Range，底层能力无法发挥 | `modules/lfstransfer/backend/backend.go:200-202` 只接受 200 OK |
 | Pure SSH 与 HTTP 权限检查完全相同 | 仓库 Scope 检查在 Pure SSH 下被跳过 | 对比 `ctx.Data["IsApiToken"]` 设置场景 |
+| ServeDirect 与 Pure SSH 可以同时启用 | **完全不兼容**，同时启用会导致下载 panic | `modules/lfstransfer/backend/util.go:92-108` `toInternalLFSURL` 无法转换预签名 URL |
+| 业务层 100% 复用相同代码逻辑 | **在满足特定条件时**核心业务逻辑复用相同代码 | 见 5.7.5 节共用条件判定标准 |
+| 两种传输方式行为完全一致 | 仅在配额/校验/存储层面等价，传输层/部分权限/高级功能存在差异 | 见 11.2 节 Range 传递分析 |
+
+### 12.6 最终可判定标准汇总
+
+#### 12.6.1 ServeDirect 与 Pure SSH 兼容性判定
+
+**可同时启用**：❌ 绝对不可
+
+| 判定项 | 结果 |
+|--------|------|
+| `SERVE_DIRECT = true` + `LFS_ALLOW_PURE_SSH = true` | ❌ 危险组合，SSH 下载会 panic |
+| `SERVE_DIRECT = false` + `LFS_ALLOW_PURE_SSH = true` | ✅ 安全组合，推荐 |
+| `SERVE_DIRECT = true` + `LFS_ALLOW_PURE_SSH = false` | ✅ 安全组合 |
+| `SERVE_DIRECT = false` + `LFS_ALLOW_PURE_SSH = false` | ✅ 默认安全 |
+
+**根本原因**：Pure SSH 的 URL 转换机制无法处理对象存储预签名 URL，导致 nil 指针 panic。
+
+#### 12.6.2 配额与校验机制等价性判定
+
+**可视为共用一套机制**：✅ 当且仅当以下全部条件满足
+
+1. ✅ HTTP 路径使用 JWT/Session/Basic Auth 认证（非 API Token）
+2. ✅ `SERVE_DIRECT = false`（不使用对象存储直链）
+3. ✅ 不依赖 HTTP Range 断点续传功能
+4. ✅ 核心校验逻辑位于 handler 函数内部（非路由中间件）
+
+**满足条件时，以下校验完全等价**：
+- MaxBatchSize / MaxFileSize 配额检查
+- Actions 用户权限检查
+- 常规用户仓库权限检查
+- LFS JWT Token 仓库绑定与操作约束
+- 跨仓库对象访问控制
+- SHA256 哈希与文件大小完整性校验
+- 对象存储读写操作
+
+**不满足条件时的差异**：
+| 不满足的条件 | 差异表现 |
+|-------------|----------|
+| 使用 API Token | HTTP 路径额外触发仓库 Scope 检查，Pure SSH 不触发 |
+| `SERVE_DIRECT = true` | HTTP 路径使用对象存储直链，Pure SSH 完全不可用 |
+| 依赖 Range 续传 | HTTP 路径支持断点续传，Pure SSH 从头下载 |
+
+#### 12.6.3 传输行为一致性判定
+
+**完全一致**：❌ 不存在这样的场景
+
+**核心业务层一致**：✅ 满足 12.6.2 节全部条件时，配额、校验、存储行为一致
+
+**始终存在差异**：
+| 层面 | 差异项 | HTTP 路径 | Pure SSH 路径 |
+|------|--------|----------|---------------|
+| 传输层 | 请求头设置 | 由客户端决定 | 固定设置 Content-Length |
+| 传输层 | 传输编码 | Transfer-Encoding: chunked | Content-Length: {size} |
+| 传输层 | 断点续传 | 支持 Range | 不支持 |
+| 传输层 | URL 类型 | 可能是外部预签名 URL | 始终是内部 API URL |
+| 权限层 | 仓库 Scope | API Token 场景生效 | 永不生效 |
+| 安全层 | 内部认证头 | 不需要 | 需要 X-Gitea-Internal-Auth |

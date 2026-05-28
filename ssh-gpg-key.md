@@ -730,7 +730,17 @@ committerUser := emailUsers.GetByEmail(c.Committer.Email)
 
 ## 六、信任状态判定分支与页面文案对应关系
 
-### 6.1 四种信任模型
+### 6.1 TrustStatus 统一总览定义（代码行为为准）
+
+> **前置条件**：TrustStatus 仅在 `verification.Verified == true` 时被设置；Verified=false 时 TrustStatus 保持空字符串。
+
+| TrustStatus | CSS 类 | 代码行为定义 |
+|------------|--------|-------------|
+| `trusted` | `sign-trusted`（绿底） | 签名可信：根据信任模型规则，签名者身份被认可 |
+| `untrusted` | `sign-untrusted`（黄底） | 签名不可信：签名者不是仓库成员，或实例密钥与提交者不匹配 |
+| `unmatched` | `sign-unmatched`（橙底） | 签名者与提交者不是同一人 |
+
+### 6.2 四种信任模型简介
 
 **文件**: `models/repo/repo.go:105`
 
@@ -1058,19 +1068,11 @@ if keyMap != nil {
 - **仓库首页**（`routers/web/repo/view.go:129`）：传入 `nil`，不使用缓存
 - **Graph 页面**（`gitgraph/graph_models.go:120`）：传入 `&keyMap`，使用缓存
 
-### 6.7 三种 TrustStatus 含义
-
-| TrustStatus | 含义 | CSS 类 |
-|------------|------|--------|
-| `trusted` | 签名可信：密钥属于仓库成员，且与提交者匹配 | `sign-trusted` |
-| `untrusted` | 签名不可信：密钥不属于仓库成员 | `sign-untrusted` |
-| `unmatched` | 签名者与提交者不匹配 | `sign-unmatched` |
-
-### 6.8 前端模板分支与文案映射
+### 6.7 前端模板分支与文案映射
 
 **文件**: `templates/repo/commit_sign_badge.tmpl` (行 21-56)
 
-#### 6.8.1 Verified = true 分支
+#### 6.7.1 Verified = true 分支
 
 ```go
 {{- if $verification.Verified -}}
@@ -1090,7 +1092,7 @@ if keyMap != nil {
 {{- end -}}
 ```
 
-#### 6.8.2 Verified = false 分支
+#### 6.7.2 Verified = false 分支
 
 ```go
 {{- else -}}
@@ -1104,7 +1106,7 @@ if keyMap != nil {
 {{- end -}}
 ```
 
-#### 6.8.3 文案拼接逻辑
+#### 6.7.3 文案拼接逻辑
 
 ```go
 {{- if $msgReasonPrefix -}}
@@ -1117,7 +1119,7 @@ if keyMap != nil {
 - `untrusted`: `"Signed by untrusted user: Alice / 3AA5C34371567BD2"`
 - `unmatched`: `"Signed by untrusted user who does not match committer: Alice / 3AA5C34371567BD2"`
 
-### 6.9 本地化文案对照表
+### 6.8 本地化文案对照表
 
 | 文案 Key | 英文原文 | Warning | CSS 状态 |
 |---------|---------|---------|----------|
@@ -1140,9 +1142,9 @@ if keyMap != nil {
 > 模板中 `$extraClass` 被重置为空字符串，不会触发 `sign-warning` 样式。
 > 唯一触发 `Warning=true` 的原因是 `BadSignature`（密钥在 DB 中找到但签名不匹配）。
 
-### 6.10 原视觉映射矩阵的修正（三场景逐项验证）
+### 6.9 原视觉映射矩阵的修正（三场景逐项验证）
 
-#### 6.10.1 模板核心判断条件还原
+#### 6.9.1 模板核心判断条件还原
 
 `commit_sign_badge.tmpl` 的渲染逻辑分三层嵌套：
 
@@ -1170,7 +1172,7 @@ if keyMap != nil {
 
 ---
 
-#### 6.10.2 场景 A：未签名（c.Signature == nil）
+#### 6.9.2 场景 A：未签名（c.Signature == nil）
 
 **后端触发路径**：
 ```
@@ -1205,7 +1207,7 @@ services/asymkey/commit.go:ParseCommitWithSignatureCommitter (行 44)
 
 ---
 
-#### 6.10.3 场景 B：无密钥（签名存在但数据库中找不到匹配密钥）
+#### 6.9.3 场景 B：无密钥（签名存在但数据库中找不到匹配密钥）
 
 **GPG 后端触发路径**：
 ```
@@ -1254,7 +1256,7 @@ services/asymkey/commit.go:parseCommitWithSSHSignature (行 430)
 
 ---
 
-#### 6.10.4 场景 C：Warning（签名存在，密钥在 DB 中找到但验证失败）
+#### 6.9.4 场景 C：Warning（签名存在，密钥在 DB 中找到但验证失败）
 
 **GPG 触发路径 1** — HashAndVerifyForKeyID 返回 BadSignature：
 ```
@@ -1315,7 +1317,7 @@ services/asymkey/commit.go:verifyWithGPGSettings (行 340)
 
 ---
 
-#### 6.10.5 修正后的完整视觉映射矩阵
+#### 6.9.5 修正后的完整视觉映射矩阵
 
 | 状态 | Verified | Warning | $extraClass | 列表页徽章 | 详情页徽章 | 图标 | Tooltip |
 |------|----------|---------|-------------|-----------|-----------|------|---------|
@@ -1344,7 +1346,7 @@ services/asymkey/commit.go:verifyWithGPGSettings (行 340)
 
 ---
 
-#### 6.10.6 Warning=false 的 Verified=false 场景为何不显示徽章
+#### 6.9.6 Warning=false 的 Verified=false 场景为何不显示徽章
 
 设计意图解读（模板行 42 注释：`the commit is not signed`）：
 
@@ -1355,7 +1357,7 @@ services/asymkey/commit.go:verifyWithGPGSettings (行 340)
 **统一规则**：只有 `Verified=true`（签名有效）或 `Warning=true`（签名可疑）时才在列表页展示徽章；
 其余 Verified=false + Warning=false 的情况只在详情页（独立渲染时）显示 unlock 图标。
 
-#### 6.10.7 CSS 样式细节
+#### 6.9.7 CSS 样式细节
 
 **文件**: `web_src/css/repo/commit-sign.css`
 

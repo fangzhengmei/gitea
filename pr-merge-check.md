@@ -557,7 +557,295 @@ PR 页面加载
 
 ---
 
-## 十一、关键代码位置速查表
+## 十一、InfoSections 选择规则与展示优先级
+
+### 11.1 InfoSections 构建逻辑
+
+**位置**: `routers/web/repo/pull_merge_box.go:190-195`
+
+```go
+if len(data.infoCommitBlockers.items) > 0 {
+    data.InfoSections = append(data.InfoSections, &pullInfoSection{data.infoCommitBlockers.items})
+} else {
+    data.InfoSections = append(data.InfoSections, &pullInfoSection{data.infoProtectionBlockers.items})
+}
+data.InfoSections = append(data.InfoSections, &pullInfoSection{data.infoMergePrompts.items})
+```
+
+**核心规则：commit blocker 与 protection blocker 互斥展示**
+
+| 条件 | Section 1 | Section 2 |
+|------|-----------|-----------|
+| 有 commit blocker | `infoCommitBlockers` | `infoMergePrompts` |
+| 无 commit blocker | `infoProtectionBlockers` | `infoMergePrompts` |
+
+**设计意图**：commit blocker（冲突/损坏/检查中/祖先）意味着 PR 尚未完成基础检查，此时展示 protection blocker 无意义；反之若 commit 层面没问题，才需展示保护规则阻断。
+
+### 11.2 三个集合的填充顺序
+
+**prepareMergeBoxInfoItems** (`pull_merge_box.go:91-195`) 按以下顺序填充：
+
+```
+1. infoCommitBlockers（按顺序添加）
+   ├─ IsFilesConflicted()     → 冲突文件列表
+   ├─ IsPullRequestBroken     → 数据损坏
+   ├─ IsChecking()            → 检查中
+   └─ IsAncestor()            → 祖先提交
+
+2. infoProtectionBlockers（按顺序添加）
+   ├─ !IsStatusMergeable()    → 不可合并 / 空 PR
+   ├─ !hasPermToMerge         → 无合并权限
+   ├─ [prepareMergeBoxStatusCheckData 添加]
+   │   ├─ RequiredChecksState.IsError/Failure  → "Required status checks have failed"
+   │   └─ !RequiredChecksState.IsSuccess       → "Required status checks are missing"
+   ├─ [prepareMergeBoxProtectedRules 添加]
+   │   ├─ isBlockedByApprovals                → 审批不足
+   │   ├─ isBlockedByRejection                → 被拒绝审查阻塞
+   │   ├─ isBlockedByOfficialReviewRequests   → 官方审查请求阻塞
+   │   ├─ isBlockedByOutdatedBranch           → 分支过时
+   │   └─ isBlockedByChangedProtectedFiles    → 受保护文件变更
+   └─ [checkSigningRequirements 添加]
+       └─ requireSigned && !willSign          → 签名要求未满足
+
+3. infoMergePrompts（按顺序添加）
+   ├─ [checkSigningRequirements 添加]
+   │   ├─ willSign                            → "Will sign with ..."
+   │   └─ !requireSigned && wontSignReason    → "Won't sign: ..."
+   ├─ canMergeNow && hasOverridableBlockers   → 管理员/绕过白名单提示
+   └─ canMergeNow && !hasOverridableBlockers  → "Can be merged automatically"
+```
+
+### 11.3 模板渲染顺序
+
+**位置**: `templates/repo/issue/view_content/pull_merge_box.tmpl`
+
+```
+Merge Box DOM 结构（从上到下）：
+┌─────────────────────────────────────────────┐
+│ ① Timeline Icon (颜色由 prepareMergeBoxIconColor 决定)    │
+├─────────────────────────────────────────────┤
+│ ② Status Check 摘要区 (ShowStatusCheck 时)                 │
+│   ├─ CommitStatusCheckPrompt 文案                          │
+│   ├─ RequireApprovalRunCount 提示                          │
+│   └─ 各 commit status 详情列表                             │
+├─────────────────────────────────────────────┤
+│ ③ ClosedInfo (已合并/已关闭时，替代后续内容)               │
+├─────────────────────────────────────────────┤
+│ ④ InfoSections[0] (commit blocker 或 protection blocker)  │
+│   └─ 每个 InfoItem: 图标 + 文案 + 可选列表                 │
+├─────────────────────────────────────────────┤
+│ ⑤ InfoSections[1] (infoMergePrompts)                      │
+│   └─ 可合并/可绕过提示                                     │
+├─────────────────────────────────────────────┤
+│ ⑥ Update Branch (ShowUpdatePullInfo 时)                    │
+├─────────────────────────────────────────────┤
+│ ⑦ WIP 提示 (IsPullWorkInProgress 时)                      │
+├─────────────────────────────────────────────┤
+│ ⑧ Merge Form (MergeFormProps 不为空时)                     │
+│   └─ Vue 组件 PullRequestMergeForm                         │
+├─────────────────────────────────────────────┤
+│ ⑨ Pull Commands (ShowPullCommands 时)                      │
+└─────────────────────────────────────────────┘
+```
+
+**关键渲染规则**：
+- ② Status Check 区域**独立于** InfoSections，始终在最上方
+- ③ ClosedInfo 存在时**替代** ④⑤⑥⑦⑧⑨
+- ④ 互斥：commit blocker 存在时不显示 protection blocker
+
+### 11.4 Status Check 摘要文案决策
+
+**位置**: `routers/web/repo/pull.go:521-537` (`CommitStatusCheckPrompt`)
+
+```
+CommitStatusCheckPrompt 决策树：
+├─ RequiredChecksState.IsPending() || len(MissingRequiredChecks) > 0
+│   → "Waiting for status checks to succeed"        (黄色)
+├─ RequiredChecksState.IsSuccess()
+│   ├─ pullCommitStatusState.IsFailure()
+│   │   → "All required checks have passed, but some other checks are failing"  (绿色+警告)
+│   └─ 否则
+│       → "All checks have passed"                   (绿色)
+├─ RequiredChecksState.IsWarning()
+│   → "All required checks have passed, but some with warnings"  (黄色)
+├─ RequiredChecksState.IsFailure()
+│   → "Required status checks have failed"           (红色)
+├─ RequiredChecksState.IsError()
+│   → "Required status checks have errored"          (红色)
+└─ 其他
+    → "Waiting for status checks to succeed"          (黄色)
+```
+
+**注意**：`RequiredChecksState` 与 `pullCommitStatusState` 是两个独立状态：
+- `RequiredChecksState` = 只看**必填** context 的合并状态（决定是否阻断合并）
+- `pullCommitStatusState` = **所有** commit status 的合并状态（仅用于信息展示）
+
+---
+
+## 十二、排查误判场景
+
+### 12.1 "明明有审批却显示审批不足"
+
+**根因**：审批计数只统计 `official=true` 的 review
+
+**排查步骤**：
+
+1. **确认审查者是否在审批白名单**
+   - `EnableApprovalsWhitelist=false` → 所有有写权限的用户都是官方审查者
+   - `EnableApprovalsWhitelist=true` → 只有白名单内的用户/团队才是官方审查者
+   - 代码位置：`models/git/protected_branch.go:234` `IsUserOfficialReviewer`
+
+2. **确认 review 的 official 字段**
+   - review 创建时根据 `IsUserOfficialReviewer` 结果设置 `official`
+   - **如果后续修改了白名单，已存在的 review 不会重新计算 official**
+   - 需要审查者重新提交 review
+
+3. **确认是否有 dismissed review**
+   - `DismissStaleApprovals=true` 时，新提交后旧 review 被自动 dismissed
+   - 手动 Dismiss Review 也会设置 `dismissed=true`
+   - 代码位置：`models/issues/pull.go:782` `GetGrantedApprovalsCount`
+
+4. **确认 IgnoreStaleApprovals 的影响**
+   - `IgnoreStaleApprovals=true` 时，stale review 不计入
+   - 与 `DismissStaleApprovals` 不同：stale 只是标记，dismissed 才是驳回
+   - 代码位置：`models/issues/pull.go:788`
+
+### 12.2 "Status Check 通过了但合并按钮仍禁用"
+
+**根因**：`pullCommitStatusState`（全部状态）与 `RequiredChecksState`（必填状态）不一致
+
+**排查步骤**：
+
+1. **确认 RequiredChecksState 的值**
+   - 前端 Status Check 摘要文案由 `RequiredChecksState` 决定
+   - 即使 `pullCommitStatusState=success`，如果必填 context 中有 pending 的，`RequiredChecksState` 仍为 pending
+   - 代码位置：`routers/web/repo/pull.go:485`
+
+2. **检查 glob 匹配问题**
+   - 必填 context 支持 glob 模式（如 `ci-*`）
+   - 旧版存储的 context 可能不是合法 glob，会触发 `log.Error` 但不中断匹配
+   - 代码位置：`routers/web/repo/pull.go:474`
+
+3. **检查缺失的 required checks**
+   - `MissingRequiredChecks` 列出了配置了但没找到匹配 status 的 context
+   - 只要有一个缺失，整体为 pending
+   - 代码位置：`routers/web/repo/pull.go:452-466`
+
+4. **检查 commit SHA 是否正确**
+   - status 是按 commit SHA 查询的，如果 PR 有新推送但 status 还在旧 SHA 上，看不到
+   - 代码位置：`routers/web/repo/pull.go:423`
+
+### 12.3 "Merge Box 显示红色图标但找不到错误"
+
+**根因**：图标颜色逻辑与 InfoSections 展示逻辑是独立的
+
+**排查步骤**：
+
+1. **检查 hasBlockers 变量**
+   - 图标颜色：`hasBlockers = len(infoCommitBlockers.items) > 0 || len(infoProtectionBlockers.items) > 0`
+   - 即使有 blocker，如果属于 commit blocker 类型，InfoSections 只展示 commit blocker
+   - protection blocker 的内容可能被隐藏
+   - 代码位置：`pull_merge_box.go:71,82-83`
+
+2. **检查 IsStatusMergeable 状态**
+   - `!pull.IsStatusMergeable() && !pull.IsEmpty()` 会添加 "can't be merged" 到 protection blocker
+   - 但如果同时有 commit blocker（如检查中），只会展示 commit blocker
+   - 这导致用户看到红色图标，但展示的是 "still being checked" 而非 "can't be merged"
+
+3. **检查 Status Check 状态对图标的影响**
+   - 图标颜色优先看 `statusCheckData`，即使 `hasBlockers=false` 也会因 CI 失败变红
+   - 但 CI 失败的信息在 Status Check 区域展示，不在 InfoSections
+   - 代码位置：`pull_merge_box.go:62-68`
+
+### 12.4 "管理员无法强制合并"
+
+**根因**：`canBypassProtection` 和 `canMergeNow` 计算链中的多个条件
+
+**排查步骤**：
+
+1. **区分 commit blocker vs protection blocker**
+   - 只有 protection blocker 可绕过
+   - 冲突、检查中、数据损坏 = commit blocker = 不可绕过
+   - 代码位置：`pull_merge_box.go:190-194`
+
+2. **检查 BlockAdminMergeOverride**
+   - `BlockAdminMergeOverride=true` → 即使是仓库管理员也不能绕过
+   - 代码位置：`models/git/protected_branch.go`
+
+3. **检查 EnableBypassAllowlist**
+   - `EnableBypassAllowlist=true` → 管理员不再自动拥有绕过权，需在白名单中
+   - `EnableBypassAllowlist=false` → 管理员自动拥有绕过权
+   - 代码位置：`models/git/protected_branch.go:212`
+
+4. **检查签名要求的与运算**
+   - `canMergeNow = (!hasOverridableBlockers || canBypassProtection) && (!requireSigned || willSign)`
+   - 签名要求是独立条件，即使能绕过保护规则，签名不满足也无法合并
+   - 代码位置：`routers/web/repo/issue_view.go:969`
+
+### 12.5 "Status Check 摘要文案与详情不一致"
+
+**根因**：摘要由 `CommitStatusCheckPrompt` 决定，详情由 `status_items` 模板渲染
+
+**排查步骤**：
+
+1. **摘要说 "All checks have passed" 但详情有红色项**
+   - `RequiredChecksState=success` 且 `pullCommitStatusState=failure`
+   - 摘要文案："All required checks have passed, but some other checks are failing"
+   - 如果该文案被截断或用户没注意后半句，会误以为全部通过
+   - 代码位置：`routers/web/repo/pull.go:525-527`
+
+2. **摘要说 "Waiting" 但详情全部绿色**
+   - 可能存在 `MissingRequiredChecks`，即配置了必填 context 但还没上报
+   - 摘要由 `RequiredChecksState.IsPending() || len(MissingRequiredChecks) > 0` 决定
+   - 即使所有已上报的 check 都是 success，缺失的 check 仍使整体为 pending
+   - 代码位置：`routers/web/repo/pull.go:522`
+
+3. **Status Check 摘要与 InfoSections 阻断项重复**
+   - Status Check 失败时，既在 Status Check 区域展示详情，又在 InfoSections[0] 展示 "Required status checks have failed"
+   - 这是**双重展示**而非 bug，前者是详细信息，后者是阻断汇总
+   - 代码位置：`routers/web/repo/pull.go:487-498` 和 `pull_merge_box.go:190-194`
+
+### 12.6 "PR 可合并但合并表单不显示"
+
+**根因**：MergeFormProps 为空导致 Vue 组件不挂载
+
+**排查步骤**：
+
+1. **检查 canMergeNow 和 hasPermToMerge**
+   - `MergeFormProps` 在 `canMergeNow || hasPermToMerge` 时才生成
+   - 代码位置：`routers/web/repo/pull_merge_form.go`
+
+2. **检查仓库合并方式配置**
+   - `AllowMerge`/`AllowRebase`/`AllowSquash`/`AllowFastForwardOnly` 至少一个为 true
+   - 全部为 false 时不生成合并表单
+   - 代码位置：`routers/web/repo/pull_merge_form.go:18-48`
+
+3. **检查 Manually Merged 权限**
+   - 即使 `canMergeNow=false`，如有手动合并权限，仍可显示手动合并选项
+   - 但需 `AllowManualMerge=true` 且用户有写权限
+
+### 12.7 "分支保护规则更新后合并状态未刷新"
+
+**根因**：保护规则变更后的重检机制
+
+**排查步骤**：
+
+1. **检查保护规则更新是否触发了 PR 重检**
+   - `services/pull/protected_branch.go` 中的 `OnProtectedBranchRuleChange`
+   - 应对所有受影响的 PR 调用 `StartPullRequestCheckImmediately`
+
+2. **检查前端自动刷新**
+   - Merge Box 有 `data-pull-merge-box-reloading-interval` 属性
+   - PR 处于 `IsChecking` 状态时，前端会定时拉取最新状态
+   - 代码位置：`pull_merge_box.tmpl:5-8`
+
+3. **检查缓存问题**
+   - `GetLatestCommitStatus` 查询结果可能受 DB 缓存影响
+   - 保护规则变更不会使 commit status 缓存失效
+
+---
+
+## 十三、关键代码位置速查表
 
 | 功能 | 文件位置 | 行号 |
 |------|---------|------|
@@ -581,3 +869,12 @@ PR 页面加载
 | Merge Box 信息条目 | `routers/web/repo/pull_merge_box.go` | 91 |
 | 合并表单属性 | `routers/web/repo/pull_merge_form.go` | 18 |
 | 前端 Merge Box 组件 | `web_src/js/components/PullRequestMergeForm.vue` | 1 |
+| InfoSections 互斥选择 | `routers/web/repo/pull_merge_box.go` | 190 |
+| Status Check 摘要文案 | `routers/web/repo/pull.go` | 521 |
+| Status Check 缺失检查收集 | `routers/web/repo/pull.go` | 452 |
+| Status Check glob 匹配 | `routers/web/repo/pull.go` | 469 |
+| RequiredChecksState 计算 | `routers/web/repo/pull.go` | 485 |
+| 保护规则变更触发重检 | `services/pull/protected_branch.go` | - |
+| Merge Box 模板 | `templates/repo/issue/view_content/pull_merge_box.tmpl` | 1 |
+| Status Check 详情模板 | `templates/repo/issue/view_content/pull_merge_status_checks.tmpl` | 1 |
+| 签名要求检查 | `routers/web/repo/issue_view.go` | 497 |

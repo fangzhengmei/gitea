@@ -874,32 +874,257 @@ CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
 
 ### 6.5 本地化文案对照表
 
-| 文案 Key | 英文原文 | CSS 状态 |
-|---------|---------|----------|
-| **已签名且可信** | | |
-| `repo.commits.signed_by` | Signed by | (无额外类) |
-| `repo.commits.signed_by_untrusted_user` | Signed by untrusted user | `sign-untrusted` |
-| `repo.commits.signed_by_untrusted_user_unmatched` | Signed by untrusted user who does not match committer | `sign-unmatched` |
-| **验证失败** | | |
-| `gpg.error.not_signed_commit` | Not a signed commit | (无徽章) |
-| `gpg.error.no_gpg_keys_found` | No known key found for this signature in database | (无徽章或警告) |
-| `gpg.error.probable_bad_signature` | WARNING! Although there is a key with this ID in the database, it does not verify this commit! This commit is SUSPICIOUS. | `sign-warning` |
-| `gpg.error.extract_sign` | Failed to extract signature | `sign-warning` |
-| `gpg.error.generate_hash` | Failed to generate hash of commit | `sign-warning` |
-| `gpg.error.failed_retrieval_gpg_keys` | Failed to retrieve any key attached to the committer's account | `sign-warning` |
-| `gpg.error.no_committer_account` | No account linked to committer's email address | `sign-warning` |
+| 文案 Key | 英文原文 | Warning | CSS 状态 |
+|---------|---------|---------|----------|
+| **已签名且可信** | | | |
+| `repo.commits.signed_by` | Signed by | - | `sign-trusted` |
+| `repo.commits.signed_by_untrusted_user` | Signed by untrusted user | - | `sign-untrusted` |
+| `repo.commits.signed_by_untrusted_user_unmatched` | Signed by untrusted user who does not match committer | - | `sign-unmatched` |
+| **签名可疑（Warning=true）** | | | |
+| `gpg.error.probable_bad_signature` | WARNING! Although there is a key with this ID in the database, it does not verify this commit! This commit is SUSPICIOUS. | **true** | `sign-warning` |
+| **无签名信息（Warning=false，列表页不渲染徽章）** | | | |
+| `gpg.error.not_signed_commit` | Not a signed commit | false | 列表页:无 / 详情页:默认灰 |
+| `gpg.error.no_gpg_keys_found` | No known key found for this signature in database | false | 列表页:无 / 详情页:默认灰 |
+| `gpg.error.extract_sign` | Failed to extract signature | false | 列表页:无 / 详情页:默认灰 |
+| `gpg.error.generate_hash` | Failed to generate hash of commit | false | 列表页:无 / 详情页:默认灰 |
+| `gpg.error.failed_retrieval_gpg_keys` | Failed to retrieve any key attached to the committer's account | false | 列表页:无 / 详情页:默认灰 |
+| `gpg.error.no_committer_account` | No account linked to committer's email address | false | 列表页:无 / 详情页:默认灰 |
 
-### 6.6 完整视觉映射矩阵
+> **注意**：原文档将 `extract_sign`/`generate_hash`/`failed_retrieval_gpg_keys`/`no_committer_account`
+> 错误标注为 `sign-warning`。实际上这些场景的后端代码未设置 `Warning=true`，
+> 模板中 `$extraClass` 被重置为空字符串，不会触发 `sign-warning` 样式。
+> 唯一触发 `Warning=true` 的原因是 `BadSignature`（密钥在 DB 中找到但签名不匹配）。
 
-| 状态 | Verified | Warning | TrustStatus | CSS 类 | 图标 | Tooltip |
-|------|----------|---------|------------|--------|------|---------|
-| **可信签名** | true | - | trusted | `sign-trusted` | 🔒 (gitea-lock) | 用户名 / KeyID |
-| **不可信签名** | true | - | untrusted | `sign-untrusted` | 🔒 | Signed by untrusted user: ... |
-| **不匹配签名** | true | - | unmatched | `sign-unmatched` | 🔒 | Signed by untrusted user who does not match committer: ... |
-| **可疑签名** | false | true | - | `sign-warning` | 🔓 | WARNING! Although there is a key... |
-| **提取失败** | false | true | - | `sign-warning` | 🔓 | Failed to extract signature |
-| **未签名** | false | false | - | (无) | (无) | Not a signed commit |
-| **无密钥** | false | false | - | (无) | 🔓 | No known key found... |
+### 6.6 原视觉映射矩阵的修正（三场景逐项验证）
+
+#### 6.6.1 模板核心判断条件还原
+
+`commit_sign_badge.tmpl` 的渲染逻辑分三层嵌套：
+
+```
+1. if $verification （CommitVerification 非 nil）
+   ├── 进入后先设 $extraClass = "commit-is-signed"
+   ├── if Verified
+   │   └── 按TrustStatus 分 sign-trusted / sign-untrusted / sign-unmatched
+   └── else（Verified=false）
+       ├── if Warning  → 追加 "sign-warning"
+       └── else        → $extraClass = ""（重置为空，撤销 "commit-is-signed"）
+
+2. 徽章元素是否渲染
+   if or (not $commit) $extraClass
+   └── $extraClass 非空时才渲染 <span class="commit-sign-badge">
+
+3. 徽章内部图标选择
+   ├── if $verified  → gitea-lock / gitea-lock-cog + 头像
+   └── else          → gitea-unlock（无头像）
+```
+
+**关键发现**：当 `Verified=false && Warning=false` 时，`$extraClass` 被重置为空字符串 `""`，
+导致 `or (not $commit) $extraClass` 为 false（在列表页 $commit 非 nil），
+**徽章元素完全不渲染**——既不显示图标也不显示 Tooltip。
+
+---
+
+#### 6.6.2 场景 A：未签名（c.Signature == nil）
+
+**后端触发路径**：
+```
+services/asymkey/commit.go:ParseCommitWithSignatureCommitter (行 44)
+└── c.Signature == nil →
+    return &CommitVerification{
+        CommittingUser: committer,
+        Verified:       false,
+        Warning:        false,      // 默认零值
+        Reason:         "gpg.error.not_signed_commit",
+    }
+```
+
+**Verified=false, Warning=false**
+
+**模板推导**：
+1. 进入 `if $verification` → `$extraClass = "commit-is-signed"`
+2. `if $verification.Verified` → false，进入 else
+3. `if $verification.Warning` → false → `$extraClass = ""`（重置）
+4. `$msgReason = ctx.Locale.Tr "gpg.error.not_signed_commit"` → "Not a signed commit"
+
+**渲染结果**：
+
+| 页面 | $commit | `or (not $commit) $extraClass` | 徽章 | 图标 | Tooltip |
+|------|---------|-------------------------------|------|------|---------|
+| 提交列表 | 非 nil | `or false ""` = false | **不渲染** | 无 | 无 |
+| 提交详情 | nil | `or true ""` = true | **渲染** | 🔓 gitea-unlock | "Not a signed commit" |
+| 仓库首页 latest_commit | 非 nil | `or false ""` = false | **不渲染** | 无 | 无 |
+| PR 提交列表 | 非 nil | `or false ""` = false | **不渲染** | 无 | 无 |
+
+**修正**：原文档标注"未签名 → (无) 图标"，在列表页正确，但详情页**会**显示 unlock 图标。
+
+---
+
+#### 6.6.3 场景 B：无密钥（签名存在但数据库中找不到匹配密钥）
+
+**GPG 后端触发路径**：
+```
+services/asymkey/commit.go:parseCommitWithGPGSignature (行 180)
+└── 所有验证步骤都没匹配 → 兜底返回
+    return &CommitVerification{
+        CommittingUser: committer,
+        Verified:       false,
+        Warning:        defaultReason != NoKeyFound,  // NoKeyFound时Warning=false
+        Reason:         defaultReason,                // "gpg.error.no_gpg_keys_found"
+        SigningKey:     &GPGKey{KeyID: keyID},
+    }
+```
+
+**SSH 后端触发路径**：
+```
+services/asymkey/commit.go:parseCommitWithSSHSignature (行 430)
+└── 用户密钥/可信密钥/实例密钥都没匹配 →
+    return &CommitVerification{
+        CommittingUser: committerUser,
+        Verified:       false,
+        Reason:         NoKeyFound,      // "gpg.error.no_gpg_keys_found"
+        // Warning 未显式设置 → 默认零值 false
+    }
+```
+
+**Verified=false, Warning=false**
+
+**模板推导**：与场景 A 完全相同——`$extraClass` 被重置为 `""`，徽章不渲染。
+
+**渲染结果**：
+
+| 页面 | $commit | 徽章 | 图标 | Tooltip |
+|------|---------|------|------|---------|
+| 提交列表 | 非 nil | **不渲染** | 无 | 无 |
+| 提交详情 | nil | **渲染** | 🔓 gitea-unlock | "No known key found for this signature in database" |
+| 仓库首页 | 非 nil | **不渲染** | 无 | 无 |
+| PR 提交列表 | 非 nil | **不渲染** | 无 | 无 |
+
+**修正**：原文档标注"无密钥 → 🔓 图标"，在列表页是**错误**的，列表页不渲染任何徽章元素；
+仅在详情页（$commit=nil）才会显示 unlock 图标和 Tooltip。
+
+**注意**：此场景 CommitVerification.SigningKey 不为 nil（含 KeyID），但模板中
+`$verification.SigningKey.PaddedKeyID` 只在 Verified=true 时才被读取到 `$msgSigningKey`，
+所以 SigningKey 信息不会出现在 Tooltip 中。
+
+---
+
+#### 6.6.4 场景 C：Warning（签名存在，密钥在 DB 中找到但验证失败）
+
+**GPG 触发路径 1** — HashAndVerifyForKeyID 返回 BadSignature：
+```
+services/asymkey/commit.go:HashAndVerifyForKeyID (行 278)
+└── 密钥 KeyID 在 DB 中找到，但签名不匹配 →
+    return &CommitVerification{
+        CommittingUser: committer,
+        Verified:       false,
+        Warning:        true,
+        Reason:         BadSignature,  // "gpg.error.probable_bad_signature"
+    }
+```
+
+**GPG 触发路径 2** — verifyWithGPGSettings 中默认密钥 KeyID 匹配但签名不匹配：
+```
+services/asymkey/commit.go:verifyWithGPGSettings (行 340)
+└── keyID == k.KeyID 但签名不匹配 →
+    return &CommitVerification{
+        CommittingUser: committer,
+        Verified:       false,
+        Warning:        true,
+        Reason:         BadSignature,  // 同样是 "gpg.error.probable_bad_signature"
+    }
+```
+
+**其他 Warning 场景**：
+| 触发条件 | Reason | Warning |
+|---------|--------|---------|
+| ExtractSignature 失败 | `gpg.error.extract_sign` | false (隐式) |
+| GetUserByEmail 内部错误 | `gpg.error.no_committer_account` | false (隐式) |
+| LoadSubKeys 失败 | `gpg.error.failed_retrieval_gpg_keys` | false (隐式) |
+| CheckArmoredGPGKeyString 失败 | `gpg.error.generate_hash` | false (隐式) |
+| DB 中有 KeyID 但签名不匹配 | `gpg.error.probable_bad_signature` | **true** |
+| 默认密钥 KeyID 匹配但签名不匹配 | `gpg.error.probable_bad_signature` | **true** |
+
+**重要发现**：除了 `BadSignature` 外，其他 Verified=false 的返回中 Warning 均为 false（零值）。
+只有密钥在数据库中存在但签名验证失败时 Warning=true——这才是 `sign-warning` 的真正触发条件。
+
+**Verified=false, Warning=true**
+
+**模板推导**：
+1. 进入 `if $verification` → `$extraClass = "commit-is-signed"`
+2. `if $verification.Verified` → false，进入 else
+3. `if $verification.Warning` → true → `$extraClass = "commit-is-signed sign-warning"`
+4. `$msgReason = ctx.Locale.Tr "gpg.error.probable_bad_signature"`
+   → "WARNING! Although there is a key with this ID in the database, it does not verify this commit! This commit is SUSPICIOUS."
+
+**渲染结果**：
+
+| 页面 | $commit | `or (not $commit) $extraClass` | 徽章 | 图标 | Tooltip |
+|------|---------|-------------------------------|------|------|---------|
+| 提交列表 | 非 nil | `or false "commit-is-signed sign-warning"` = true | **渲染** | 🔓 gitea-unlock | "WARNING! Although there is a key..." |
+| 提交详情 | nil | `or true "..."` = true | **渲染** | 🔓 gitea-unlock | "WARNING! Although there is a key..." |
+| 仓库首页 | 非 nil | true | **渲染** | 🔓 gitea-unlock | "WARNING! Although there is a key..." |
+| PR 提交列表 | 非 nil | true | **渲染** | 🔓 gitea-unlock | "WARNING! Although there is a key..." |
+
+**CSS 效果**：`commit-is-signed sign-warning` → 红色边框 + 红色背景（`--color-red-badge` / `--color-red-badge-bg`）
+
+---
+
+#### 6.6.5 修正后的完整视觉映射矩阵
+
+| 状态 | Verified | Warning | $extraClass | 列表页徽章 | 详情页徽章 | 图标 | Tooltip |
+|------|----------|---------|-------------|-----------|-----------|------|---------|
+| **可信签名** | true | - | `commit-is-signed sign-trusted` | ✅ 绿底 | ✅ 绿底 | 🔒 lock | 用户名 / KeyID |
+| **不可信签名** | true | - | `commit-is-signed sign-untrusted` | ✅ 黄底 | ✅ 黄底 | 🔒 lock | Signed by untrusted user: ... |
+| **不匹配签名** | true | - | `commit-is-signed sign-unmatched` | ✅ 橙底 | ✅ 橙底 | 🔒 lock | ...who does not match committer: ... |
+| **可疑签名** | false | true | `commit-is-signed sign-warning` | ✅ 红底 | ✅ 红底 | 🔓 unlock | WARNING! Although there is a key... |
+| **未签名** | false | false | `""` (重置) | ❌ 不渲染 | ✅ 无底色 | 🔓 unlock | Not a signed commit |
+| **无密钥(GPG)** | false | false | `""` (重置) | ❌ 不渲染 | ✅ 无底色 | 🔓 unlock | No known key found... |
+| **无密钥(SSH)** | false | false | `""` (重置) | ❌ 不渲染 | ✅ 无底色 | 🔓 unlock | No known key found... |
+| **提取签名失败** | false | false | `""` (重置) | ❌ 不渲染 | ✅ 无底色 | 🔓 unlock | Failed to extract signature |
+| **获取密钥失败** | false | false | `""` (重置) | ❌ 不渲染 | ✅ 无底色 | 🔓 unlock | Failed to retrieve any key... |
+| **无提交者账户** | false | false | `""` (重置) | ❌ 不渲染 | ✅ 无底色 | 🔓 unlock | No account linked to committer's... |
+
+**列表页 vs 详情页差异的根本原因**：
+
+模板行 62：
+```html
+{{- if or (not $commit) $extraClass -}}
+```
+- **列表页/仓库首页/PR提交列表**：传入 `Commit` 字段（非 nil），条件变为 `or false $extraClass`
+  - 当 $extraClass 为空时（未签名/无密钥/提取失败等），条件为 false → 徽章不渲染
+  - 当 $extraClass 非空时（Warning/Verified），条件为 true → 徽章渲染
+- **详情页**：不传 `Commit` 字段（nil），条件变为 `or true $extraClass`
+  - 始终为 true → 徽章始终渲染，包括未签名/无密钥场景
+
+---
+
+#### 6.6.6 Warning=false 的 Verified=false 场景为何不显示徽章
+
+设计意图解读（模板行 42 注释：`the commit is not signed`）：
+
+1. **未签名提交**：`c.Signature == nil`，本质上没有签名 → 不需要展示签名状态
+2. **无密钥提交**：有签名但找不到密钥 → 在列表页也被视为"无有效签名信息可展示"，与未签名同等处理
+3. **提取/获取失败**：内部错误，不应向普通用户展示为签名问题 → 同等处理
+
+**统一规则**：只有 `Verified=true`（签名有效）或 `Warning=true`（签名可疑）时才在列表页展示徽章；
+其余 Verified=false + Warning=false 的情况只在详情页（独立渲染时）显示 unlock 图标。
+
+#### 6.6.7 CSS 样式细节
+
+**文件**: `web_src/css/repo/commit-sign.css`
+
+| CSS 类组合 | 边框色 | 背景色 | 使用场景 |
+|-----------|--------|--------|---------|
+| `.commit-is-signed.sign-trusted` | `--color-green-badge` | `--color-green-badge-bg` | 签名可信 |
+| `.commit-is-signed.sign-untrusted` | `--color-yellow-badge` | `--color-yellow-badge-bg` | 签名者非成员 |
+| `.commit-is-signed.sign-unmatched` | `--color-orange-badge` | `--color-orange-badge-bg` | 签名者与提交者不匹配 |
+| `.commit-is-signed.sign-warning` | `--color-red-badge` | `--color-red-badge-bg` | 签名可疑 |
+| `.commit-sign-badge`（无 sign-* 附加类） | `--color-light-border` | 默认 | 详情页的未签名/无密钥 |
+
+**注意**：所有 sign-* 状态样式都要求同时具有 `commit-is-signed` 类。
+当 $extraClass 被重置为空时，`commit-is-signed` 也被移除，所以即使徽章元素被渲染（详情页），
+也不会命中任何颜色样式，回退到默认的浅灰边框。
 
 ## 七、代码调用关系总图
 
@@ -916,26 +1141,33 @@ CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
     └── services/asymkey/ssh_key_authorized_keys.go:RewriteAllPublicKeys
         └── models/asymkey/ssh_key_authorized_keys.go:RegeneratePublicKeys
 
-Git 提交展示
-├── modules/git/commit.go:Commit (数据结构)
-├── services/convert/git_commit.go:ToCommit
-│   ├── 查找 Author/Committer 对应的系统用户
-│   └── services/convert/convert.go:ToVerification
-│       └── services/asymkey/commit.go:ParseCommitWithSignature
-│           ├── GPG: parseCommitWithGPGSignature
-│           │   ├── HashAndVerifyForKeyID
-│           │   └── models/asymkey/gpg_key_commit_verification.go:hashAndVerifyWithSubKeys
-│           │       └── verifySign (密码学验证)
-│           └── SSH: parseCommitWithSSHSignature
-│               └── verifySSHCommitVerification
-│                   └── sshsig.Verify (密码学验证)
-├── 信任状态: CalculateTrustStatus
-│   └── 输出: TrustStatus (trusted/untrusted/unmatched)
-└── 模板层
-    ├── 数据: .Verification (CommitVerification)
-    └── templates/repo/commit_sign_badge.tmpl
-        ├── 分支: Verified ?
-        │   ├── true → 信任状态分支
-        │   └── false → Warning ? 显示/隐藏徽章
-        └── 输出: HTML 签名徽章
+Git 提交展示（提交列表页）
+├── routers/web/repo/commit.go:Commits
+│   └── processGitCommits → ConvertFromGitCommit
+│       ├── ValidateCommitsWithEmails (Author.Email → User)
+│       ├── ParseCommitsWithSignature (Committer.Email → CommitVerification)
+│       │   └── ParseCommitWithSignatureCommitter
+│       │       ├── c.Signature==nil → {Verified:false, Warning:false, Reason:"not_signed_commit"}
+│       │       ├── GPG签名 → parseCommitWithGPGSignature
+│       │       │   ├── 验证成功 → {Verified:true, ...}
+│       │       │   ├── BadSignature → {Verified:false, Warning:true, Reason:"probable_bad_signature"}
+│       │       │   └── 无密钥兜底 → {Verified:false, Warning:false, Reason:"no_gpg_keys_found"}
+│       │       └── SSH签名 → parseCommitWithSSHSignature
+│       │           ├── 验证成功 → {Verified:true, ...}
+│       │           └── 无密钥兜底 → {Verified:false, Warning:false, Reason:"no_gpg_keys_found"}
+│       └── CalculateTrustStatus → TrustStatus
+└── 模板渲染
+    ├── commits_list.tmpl → commit_sign_badge(Commit=有值, ..., Verification)
+    ├── graph/commits.tmpl → commit_sign_badge(Commit=有值, ..., Verification)
+    ├── commits_list_small.tmpl → commit_sign_badge(Commit=有值, ..., Verification)
+    └── latest_commit.tmpl → commit_sign_badge(Commit=有值, ..., Verification)
+
+Git 提交展示（单提交详情页）
+├── routers/web/repo/commit.go:Diff
+│   ├── ParseCommitWithSignature → CommitVerification
+│   ├── ValidateCommitWithEmail (Author.Email → User)
+│   └── CalculateTrustStatus → TrustStatus
+└── 模板渲染
+    └── commit_page.tmpl → commit_sign_badge(Commit=nil, CommitSignVerification=Verification)
+        └── Commit=nil → or(not nil, $extraClass) 恒为 true → 徽章始终渲染
 ```

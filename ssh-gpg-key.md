@@ -730,90 +730,335 @@ committerUser := emailUsers.GetByEmail(c.Committer.Email)
 
 ## 六、信任状态判定分支与页面文案对应关系
 
-### 6.1 信任状态判定逻辑
+### 6.1 四种信任模型
 
-**文件**: `models/asymkey/gpg_key_commit_verification.go:CalculateTrustStatus` (行 117)
+**文件**: `models/repo/repo.go:105`
 
-#### 6.1.1 CommitterTrustModel 模式
+```go
+const (
+    DefaultTrustModel               = iota  // 回退为 CollaboratorTrustModel
+    CommitterTrustModel                      // 只看签名者与提交者是否匹配
+    CollaboratorTrustModel                   // 签名者必须是仓库成员
+    CollaboratorCommitterTrustModel          // 签名者必须是仓库成员且与提交者匹配
+)
+```
+
+**DefaultTrustModel 的解析**（`models/repo/repo.go:731`）：
+```
+repo.GetTrustModel()
+├── 如果 repo.TrustModel == DefaultTrustModel
+│   ├── 读取全局配置: setting.Repository.Signing.DefaultTrustModel
+│   │   └── 默认值: "collaborator"（modules/setting/repository.go:285）
+│   ├── 如果全局配置仍为 "default" → 回退为 CollaboratorTrustModel
+│   └── 否则使用全局配置值
+└── 否则使用 repo.TrustModel
+```
+
+### 6.2 CalculateTrustStatus 逐行精讲
+
+**文件**: `models/asymkey/gpg_key_commit_verification.go:117`
+
+函数签名：
+```go
+func CalculateTrustStatus(
+    verification *CommitVerification,
+    repoTrustModel repo_model.TrustModelType,
+    isOwnerMemberCollaborator func(*user_model.User) (bool, error),
+    keyMap *map[string]bool,
+) error
+```
+
+**参数说明**：
+- `isOwnerMemberCollaborator`：闭包函数，调用 `repo_model.IsOwnerMemberCollaborator`，
+  判断用户是否为仓库所有者 / 有 Code 权限的团队成员 / 协作者
+- `keyMap`：`map[string]bool` 缓存，以 GPG KeyID 为 key 避免重复查库
+
+#### 6.2.1 前置守卫
+
+```go
+if !verification.Verified {
+    return nil  // Verified=false 时直接返回，TrustStatus 保持空字符串
+}
+```
+
+**关键**：只有密码学验证通过的提交才进入信任判定。
+
+#### 6.2.2 CommitterTrustModel 分支（行 125-138）
 
 ```go
 if repoTrustModel == repo_model.CommitterTrustModel {
-    verification.TrustStatus = "unmatched"  // 默认
-    
-    // 检查签名用户与提交用户是否匹配
-    if (SigningUser.ID != 0 && CommittingUser.ID == SigningUser.ID) ||
-       (SigningUser.ID == 0 && CommittingUser.ID == 0 && 
-        SigningUser.Email == CommittingUser.Email) {
+    verification.TrustStatus = "unmatched"  // 默认不匹配
+
+    if (verification.SigningUser.ID != 0 &&
+        verification.CommittingUser.ID == verification.SigningUser.ID) ||
+       (verification.SigningUser.ID == 0 && verification.CommittingUser.ID == 0 &&
+        verification.SigningUser.Email == verification.CommittingUser.Email) {
         verification.TrustStatus = "trusted"
     }
     return nil
 }
 ```
 
-**判定逻辑**:
-- 签名用户 ID == 提交用户 ID → `trusted`
-- 或两者都是外部用户（ID=0）且邮箱相同 → `trusted`
-- 其他情况 → `unmatched`
+**判定逻辑**：
 
-#### 6.1.2 其他信任模式（CollaboratorCommitterTrustModel 等）
+| 条件 | SigningUser.ID | CommittingUser.ID | 结果 |
+|------|---------------|-------------------|------|
+| 系统用户匹配 | ≠0 | == SigningUser.ID | `trusted` |
+| 外部用户邮箱匹配 | 0 | 0 | 且 Email 相同 → `trusted` |
+| 其他 | 任意 | 任意 | `unmatched` |
+
+**CommitterTrustModel 不关心成员关系**，只看签名者是否就是提交者。
+实例密钥签名（SigningUser.ID==0）时，如果提交者也不是系统用户，且邮箱相同，也算 trusted。
+
+#### 6.2.3 非 CommitterTrustModel 分支（行 140-183）
+
+此分支覆盖 `CollaboratorTrustModel` 和 `CollaboratorCommitterTrustModel`。
 
 ```go
-// 默认假设是可信的
-verification.TrustStatus = "trusted"
+verification.TrustStatus = "trusted"  // 默认可信
+```
 
-// 1. 实例默认密钥签名（无系统用户）
+**第一层：实例密钥签名（SigningUser.ID == 0）**（行 143-153）
+
+```go
 if verification.SigningUser.ID == 0 {
     if repoTrustModel == CollaboratorCommitterTrustModel &&
-       (CommittingUser.ID != 0 || SigningUser.Email != CommittingUser.Email) {
+       (verification.CommittingUser.ID != 0 ||
+        verification.SigningUser.Email != verification.CommittingUser.Email) {
         verification.TrustStatus = "untrusted"
     }
     return nil
 }
+```
 
-// 2. 检查签名用户是否为仓库成员
-isMember, _ := isOwnerMemberCollaborator(SigningUser)
+| 信任模型 | CommittingUser.ID | 邮箱匹配 | 结果 |
+|---------|-------------------|---------|------|
+| CollaboratorTrustModel | 任意 | 任意 | `trusted` |
+| CollaboratorCommitterTrustModel | 0 | == | `trusted` |
+| CollaboratorCommitterTrustModel | 0 | ≠ | `untrusted` |
+| CollaboratorCommitterTrustModel | ≠0 | 任意 | `untrusted` |
+
+**设计意图**：CollaboratorTrustModel 下实例密钥总是可信的；
+CollaboratorCommitterTrustModel 要求实例密钥的邮箱与提交者邮箱一致（且提交者不是系统用户）。
+
+**第二层：系统用户签名（SigningUser.ID ≠ 0）+ 成员校验**（行 155-181）
+
+```go
+if verification.SigningKey != nil {
+    var isMember bool
+    if keyMap != nil {
+        var has bool
+        isMember, has = (*keyMap)[verification.SigningKey.KeyID]
+        if !has {
+            isMember, err = isOwnerMemberCollaborator(verification.SigningUser)
+            (*keyMap)[verification.SigningKey.KeyID] = isMember
+        }
+    } else {
+        isMember, err = isOwnerMemberCollaborator(verification.SigningUser)
+    }
+    // ... 后续判定
+}
+```
+
+**⚠️ 关键发现：成员校验以 `verification.SigningKey != nil` 为守卫条件**
+
+这意味着：
+- **GPG 签名**：`HashAndVerifyWithSubKeysCommitVerification` 在 `Verified=true` 时一定设置 `SigningKey`，
+  所以 GPG 签名**总是会进入成员校验**
+- **SSH 签名**：`verifySSHCommitVerification` 在 `Verified=true` 时设置的是 `SigningSSHKey`（而非 `SigningKey`），
+  所以 `verification.SigningKey` 为 **nil**，**整个成员校验分支被跳过**！
+
+这是 SSH 签名和 GPG 签名在信任判定上的根本差异。
+
+**成员校验后的判定逻辑**：
+
+```go
 if !isMember {
     verification.TrustStatus = "untrusted"
-    if CommittingUser.ID != SigningUser.ID {
-        verification.TrustStatus = "unmatched"  // 更严重
+    if verification.CommittingUser.ID != verification.SigningUser.ID {
+        verification.TrustStatus = "unmatched"
     }
-}
-
-// 3. 检查提交者与签名者是否匹配
-else if repoTrustModel == CollaboratorCommitterTrustModel &&
-        CommittingUser.ID != SigningUser.ID {
+} else if repoTrustModel == CollaboratorCommitterTrustModel &&
+          verification.CommittingUser.ID != verification.SigningUser.ID {
     verification.TrustStatus = "unmatched"
 }
 ```
 
-### 6.2 判定分支全景图
+| 成员状态 | 信任模型 | CommittingUser == SigningUser | 结果 |
+|---------|---------|-------------------------------|------|
+| 不是成员 | 任意 | == (同一人) | `untrusted` |
+| 不是成员 | 任意 | ≠ (不同人) | `unmatched` |
+| 是成员 | Collaborator | 任意 | `trusted` |
+| 是成员 | CollaboratorCommitter | == | `trusted` |
+| 是成员 | CollaboratorCommitter | ≠ | `unmatched` |
 
-```
-CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
-│
-├── 未验证 (Verified=false) → 直接返回，TrustStatus 为空
-│
-├── CommitterTrustModel 模式
-│   ├── 签名用户与提交用户匹配 → TrustStatus = "trusted"
-│   └── 不匹配 → TrustStatus = "unmatched"
-│
-└── 其他模式（如 CollaboratorCommitterTrustModel）
-    ├── 默认 → TrustStatus = "trusted"
-    │
-    ├── 签名用户为实例密钥（ID=0）
-    │   └── 提交用户不匹配 → TrustStatus = "untrusted"
-    │
-    └── 签名用户为系统用户（ID≠0）
-        ├── 不是仓库成员
-        │   ├── 且提交者 != 签名者 → TrustStatus = "unmatched"
-        │   └── 提交者 == 签名者 → TrustStatus = "untrusted"
-        │
-        └── 是仓库成员
-            ├── Collaborator 模式 且 提交者 != 签名者 → TrustStatus = "unmatched"
-            └── 其他情况 → 保持 "trusted"
+### 6.3 SigningKey vs SigningSSHKey 对信任判定的影响
+
+#### 6.3.1 GPG 签名验证成功时的 CommitVerification 构造
+
+**`HashAndVerifyWithSubKeysCommitVerification`**（行 92-113）：
+```go
+return &CommitVerification{
+    CommittingUser: committer,
+    Verified:       true,
+    Reason:         fmt.Sprintf("%s / %s", signer.Name, key.KeyID),
+    SigningUser:    signer,
+    SigningKey:     key,       // ← GPGKey 非 nil
+    SigningEmail:   email,
+}
 ```
 
-### 6.3 三种 TrustState 含义
+`SigningKey` 字段**非 nil** → `CalculateTrustStatus` 中 `if verification.SigningKey != nil` 为 true → 进入成员校验分支。
+
+#### 6.3.2 SSH 签名验证成功时的 CommitVerification 构造
+
+**`verifySSHCommitVerification`**（行 437-450）：
+```go
+return &CommitVerification{
+    CommittingUser: committer,
+    Verified:       true,
+    Reason:         fmt.Sprintf("%s / %s", signer.Name, k.Fingerprint),
+    SigningUser:    signer,
+    SigningSSHKey:  k,           // ← PublicKey 非 nil
+    SigningEmail:   email,
+    // SigningKey 未设置 → 默认 nil
+}
+```
+
+`SigningKey` 字段为 **nil** → `if verification.SigningKey != nil` 为 false → **跳过整个成员校验分支**。
+
+#### 6.3.3 SSH 签名的信任状态实际结果
+
+因为成员校验分支被跳过，SSH 签名的信任状态**只受前面两层逻辑影响**：
+
+1. CommitterTrustModel → 按 SigningUser vs CommittingUser 匹配
+2. SigningUser.ID == 0（实例密钥） → 按 CollaboratorCommitterTrustModel 邮箱匹配
+3. SigningUser.ID ≠ 0（系统用户） → **直接保持默认的 `"trusted"`**
+
+**结论**：SSH 签名由系统用户签发时，无论该用户是否为仓库成员，TrustStatus 始终为 `"trusted"`。
+这是当前代码的一个潜在问题——SSH 签名绕过了成员校验。
+
+### 6.4 实例密钥场景 vs 仓库成员场景的差异
+
+#### 6.4.1 实例密钥签名的身份构造
+
+实例密钥签名时，SigningUser 由配置构造，而非从数据库查询：
+
+**GPG 实例密钥**（`verifyWithGPGSettings` 行 332-335）：
+```go
+signer := &user_model.User{
+    Name:  gpgSettings.Name,   // setting.Repository.Signing.SigningName
+    Email: gpgSettings.Email,  // setting.Repository.Signing.SigningEmail
+}
+```
+
+**SSH 实例密钥**（`parseCommitWithSSHSignature` 行 416-418）：
+```go
+signerUser := &user_model.User{
+    Name:  gpgSettings.Name,   // setting.Repository.Signing.SigningName
+    Email: gpgSettings.Email,  // setting.Repository.Signing.SigningEmail
+}
+```
+
+两种实例密钥构造的 signer 都**没有数据库 ID**（`ID == 0`），因此 SigningUser.ID == 0。
+
+#### 6.4.2 信任状态来源对比
+
+| 维度 | 实例密钥场景 | 仓库成员场景 |
+|------|------------|------------|
+| **SigningUser 来源** | 配置文件构造（无 DB ID） | 数据库查询（有 DB ID） |
+| **SigningUser.ID** | 0 | > 0 |
+| **SigningKey** | GPG:非 nil / SSH:nil | GPG:非 nil / SSH:nil |
+| **CommitterTrustModel** | CommittingUser.ID==0 且邮箱匹配 → trusted；否则 unmatched | SigningUser.ID==CommittingUser.ID → trusted；否则 unmatched |
+| **CollaboratorTrustModel** | **始终 trusted**（SigningUser.ID==0 提前返回） | 进入成员校验 → 成员→trusted / 非成员→untrusted/unmatched |
+| **CollaboratorCommitterTrustModel** | CommittingUser.ID==0 且邮箱匹配 → trusted；否则 untrusted | 进入成员校验 + 提交者匹配双重检查 |
+| **SSH 签名 + 系统用户** | 不适用 | **SigningKey==nil，跳过成员校验，始终 trusted** |
+
+#### 6.4.3 差异总结图
+
+```
+实例密钥签名 (SigningUser.ID == 0)
+│
+├── CommitterTrustModel
+│   ├── CommittingUser.ID == 0 且邮箱匹配 → trusted
+│   └── 其他 → unmatched
+│
+├── CollaboratorTrustModel
+│   └── 始终 trusted（不检查成员关系）
+│
+└── CollaboratorCommitterTrustModel
+    ├── CommittingUser.ID == 0 且邮箱匹配 → trusted
+    └── 其他 → untrusted
+
+仓库成员签名 (SigningUser.ID != 0)
+│
+├── CommitterTrustModel
+│   ├── SigningUser.ID == CommittingUser.ID → trusted
+│   └── 其他 → unmatched
+│
+├── CollaboratorTrustModel
+│   ├── [GPG] SigningKey!=nil → 进入成员校验
+│   │   ├── 是成员 → trusted
+│   │   └── 不是成员 → untrusted / unmatched
+│   └── [SSH] SigningKey==nil → 跳过成员校验 → 始终 trusted ⚠️
+│
+└── CollaboratorCommitterTrustModel
+    ├── [GPG] SigningKey!=nil → 成员校验 + 提交者匹配
+    │   ├── 是成员 且 提交者==签名者 → trusted
+    │   ├── 是成员 且 提交者≠签名者 → unmatched
+    │   ├── 不是成员 且 提交者==签名者 → untrusted
+    │   └── 不是成员 且 提交者≠签名者 → unmatched
+    └── [SSH] SigningKey==nil → 跳过成员校验 → 始终 trusted ⚠️
+```
+
+### 6.5 IsOwnerMemberCollaborator 成员判定
+
+**文件**: `models/repo/collaboration.go:161`
+
+```go
+func IsOwnerMemberCollaborator(ctx context.Context, repo *Repository, userID int64) (bool, error) {
+    // 1. 仓库所有者
+    if repo.OwnerID == userID {
+        return true, nil
+    }
+    // 2. 有 Code 权限的团队成员
+    teamMember, _ := db.GetEngine(ctx).
+        Join("INNER", "team_repo", "team_repo.team_id = team_user.team_id").
+        Join("INNER", "team_unit", "team_unit.team_id = team_user.team_id").
+        Where("team_repo.repo_id = ?", repo.ID).
+        And("team_unit.`type` = ?", unit.TypeCode).
+        And("team_user.uid = ?", userID).
+        Table("team_user").Exist()
+    if teamMember {
+        return true, nil
+    }
+    // 3. 直接协作者
+    return db.GetEngine(ctx).Get(&Collaboration{RepoID: repo.ID, UserID: userID})
+}
+```
+
+判定优先级：仓库所有者 → 有 Code 单元权限的团队成员 → 直接协作者。
+
+### 6.6 keyMap 缓存机制
+
+`CalculateTrustStatus` 的 `keyMap` 参数用于在同一次请求中批量处理多个提交时缓存成员判定结果：
+
+```go
+if keyMap != nil {
+    isMember, has = (*keyMap)[verification.SigningKey.KeyID]
+    if !has {
+        isMember, _ = isOwnerMemberCollaborator(verification.SigningUser)
+        (*keyMap)[verification.SigningKey.KeyID] = isMember
+    }
+}
+```
+
+- **提交列表页**（`ParseCommitsWithSignature`）：传入 `&keyMap`，同一 KeyID 只查一次
+- **提交详情页**（`routers/web/repo/commit.go:388`）：传入 `nil`，不使用缓存
+- **仓库首页**（`routers/web/repo/view.go:129`）：传入 `nil`，不使用缓存
+- **Graph 页面**（`gitgraph/graph_models.go:120`）：传入 `&keyMap`，使用缓存
+
+### 6.7 三种 TrustStatus 含义
 
 | TrustStatus | 含义 | CSS 类 |
 |------------|------|--------|
@@ -821,11 +1066,11 @@ CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
 | `untrusted` | 签名不可信：密钥不属于仓库成员 | `sign-untrusted` |
 | `unmatched` | 签名者与提交者不匹配 | `sign-unmatched` |
 
-### 6.4 前端模板分支与文案映射
+### 6.8 前端模板分支与文案映射
 
 **文件**: `templates/repo/commit_sign_badge.tmpl` (行 21-56)
 
-#### 6.4.1 Verified = true 分支
+#### 6.8.1 Verified = true 分支
 
 ```go
 {{- if $verification.Verified -}}
@@ -845,7 +1090,7 @@ CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
 {{- end -}}
 ```
 
-#### 6.4.2 Verified = false 分支
+#### 6.8.2 Verified = false 分支
 
 ```go
 {{- else -}}
@@ -859,7 +1104,7 @@ CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
 {{- end -}}
 ```
 
-#### 6.4.3 文案拼接逻辑
+#### 6.8.3 文案拼接逻辑
 
 ```go
 {{- if $msgReasonPrefix -}}
@@ -872,7 +1117,7 @@ CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
 - `untrusted`: `"Signed by untrusted user: Alice / 3AA5C34371567BD2"`
 - `unmatched`: `"Signed by untrusted user who does not match committer: Alice / 3AA5C34371567BD2"`
 
-### 6.5 本地化文案对照表
+### 6.9 本地化文案对照表
 
 | 文案 Key | 英文原文 | Warning | CSS 状态 |
 |---------|---------|---------|----------|
@@ -895,9 +1140,9 @@ CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
 > 模板中 `$extraClass` 被重置为空字符串，不会触发 `sign-warning` 样式。
 > 唯一触发 `Warning=true` 的原因是 `BadSignature`（密钥在 DB 中找到但签名不匹配）。
 
-### 6.6 原视觉映射矩阵的修正（三场景逐项验证）
+### 6.10 原视觉映射矩阵的修正（三场景逐项验证）
 
-#### 6.6.1 模板核心判断条件还原
+#### 6.10.1 模板核心判断条件还原
 
 `commit_sign_badge.tmpl` 的渲染逻辑分三层嵌套：
 
@@ -925,7 +1170,7 @@ CalculateTrustStatus(verification, trustModel, isOwnerMemberCollaborator)
 
 ---
 
-#### 6.6.2 场景 A：未签名（c.Signature == nil）
+#### 6.10.2 场景 A：未签名（c.Signature == nil）
 
 **后端触发路径**：
 ```
@@ -960,7 +1205,7 @@ services/asymkey/commit.go:ParseCommitWithSignatureCommitter (行 44)
 
 ---
 
-#### 6.6.3 场景 B：无密钥（签名存在但数据库中找不到匹配密钥）
+#### 6.10.3 场景 B：无密钥（签名存在但数据库中找不到匹配密钥）
 
 **GPG 后端触发路径**：
 ```
@@ -1009,7 +1254,7 @@ services/asymkey/commit.go:parseCommitWithSSHSignature (行 430)
 
 ---
 
-#### 6.6.4 场景 C：Warning（签名存在，密钥在 DB 中找到但验证失败）
+#### 6.10.4 场景 C：Warning（签名存在，密钥在 DB 中找到但验证失败）
 
 **GPG 触发路径 1** — HashAndVerifyForKeyID 返回 BadSignature：
 ```
@@ -1070,7 +1315,7 @@ services/asymkey/commit.go:verifyWithGPGSettings (行 340)
 
 ---
 
-#### 6.6.5 修正后的完整视觉映射矩阵
+#### 6.10.5 修正后的完整视觉映射矩阵
 
 | 状态 | Verified | Warning | $extraClass | 列表页徽章 | 详情页徽章 | 图标 | Tooltip |
 |------|----------|---------|-------------|-----------|-----------|------|---------|
@@ -1099,7 +1344,7 @@ services/asymkey/commit.go:verifyWithGPGSettings (行 340)
 
 ---
 
-#### 6.6.6 Warning=false 的 Verified=false 场景为何不显示徽章
+#### 6.10.6 Warning=false 的 Verified=false 场景为何不显示徽章
 
 设计意图解读（模板行 42 注释：`the commit is not signed`）：
 
@@ -1110,7 +1355,7 @@ services/asymkey/commit.go:verifyWithGPGSettings (行 340)
 **统一规则**：只有 `Verified=true`（签名有效）或 `Warning=true`（签名可疑）时才在列表页展示徽章；
 其余 Verified=false + Warning=false 的情况只在详情页（独立渲染时）显示 unlock 图标。
 
-#### 6.6.7 CSS 样式细节
+#### 6.10.7 CSS 样式细节
 
 **文件**: `web_src/css/repo/commit-sign.css`
 

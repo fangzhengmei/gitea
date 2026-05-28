@@ -350,7 +350,214 @@ const (
 
 ---
 
-## 八、关键代码位置速查表
+## 八、Merge Box 状态映射与按钮逻辑
+
+### 8.1 后端状态 → UI 文案映射
+
+**核心位置**: `routers/web/repo/issue_view.go:1040-1083`
+
+| 阻断器变量 | 判断逻辑 | UI 文案 | 图标 |
+|-----------|---------|---------|------|
+| `isBlockedByApprovals` | `!HasEnoughApprovals(ctx, pb, pull)` | "1/2 Approvals" (实际数量) | ✗ 红色 |
+| `isBlockedByRejection` | `MergeBlockedByRejectedReview(ctx, pb, pull)` | "Blocked by rejection" | ✗ 红色 |
+| `isBlockedByOfficialReviewRequests` | `MergeBlockedByOfficialReviewRequests(ctx, pb, pull)` | "Blocked by official review requests" | ✗ 红色 |
+| `isBlockedByOutdatedBranch` | `MergeBlockedByOutdatedBranch(pb, pull)` | "The head branch is behind the base branch" | ✗ 红色 |
+| `isBlockedByChangedProtectedFiles` | `len(pull.ChangedProtectedFiles) != 0` | "Changed 1 protected file" (列表) | ✗ 红色 |
+| `hasStatusCheckBlocker` | `enableStatusCheck && !RequiredChecksState.IsSuccess()` | 各 status check 单独显示 | ✗/○/✓ |
+
+**附加信息提示**:
+- `hasPermToMerge=false` → "You're not authorized to merge this pull request" (ℹ️ 灰色)
+- `hasOverridableBlockers && canBypassProtectionAsAdmin` → "Only administrators can merge this pull request with failing checks" (⚫)
+- `hasOverridableBlockers && !canBypassProtectionAsAdmin` → "Only users in the bypass allowlist can merge this pull request with failing checks" (⚫)
+- `canMergeNow && !hasOverridableBlockers` → "This pull request can be merged automatically" (✓ 绿色)
+
+### 8.2 Commit-level 阻断（不可绕过）
+
+**位置**: `routers/web/repo/pull_merge_box.go:109-144`
+
+| 状态 | 判断逻辑 | UI 文案 |
+|------|---------|---------|
+| 冲突 | `pull.IsFilesConflicted()` | "This branch has conflicts that must be resolved" + 文件列表 |
+| 数据损坏 | `prInfo.IsPullRequestBroken` | "Data broken" |
+| 检查中 | `pull.IsChecking()` | "This pull request is still being checked" |
+| 祖先提交 | `pull.IsAncestor()` | "The head commit is already in the base branch" |
+| 不可合并 | `!pull.IsStatusMergeable() && !pull.IsEmpty()` | "This pull request can't be merged" + "Ask someone with write access to merge this pull request manually" |
+| 空 PR | `pull.IsEmpty()` | "This pull request is empty" |
+
+**关键区别**: Commit-level 阻断（冲突、检查中、祖先）属于 `infoCommitBlockers`，**不可通过管理员权限绕过**；Protection-level 阻断（审批、status check 等）属于 `infoProtectionBlockers`，**可绕过**。
+
+### 8.3 按钮禁用状态逻辑
+
+**前端组件**: `web_src/js/components/PullRequestMergeForm.vue`
+
+**核心变量传递**:
+```go
+// routers/web/repo/issue_view.go:968-970
+data.canMergeNow = (!data.hasOverridableBlockers || data.canBypassProtection) &&
+    (!data.requireSigned || data.willSign)
+```
+
+| 场景 | `canMergeNow` | 按钮行为 | 可用操作 |
+|------|--------------|---------|---------|
+| 无任何阻断 | `true` | 启用（绿色） | 立即合并 |
+| 有阻断但可绕过 | `true` | 启用（红色 "Force Merge"） | 强制合并 |
+| 有阻断不可绕过 | `false` | 禁用/隐藏 | 仅可设置自动合并 |
+| 正在检查中 | 取决于 `hasOverridableBlockers` | 检查中状态 | 等待 |
+| 有冲突 | `false` (commit blocker) | 禁用 | 手动合并（如启用） |
+
+**按钮样式逻辑** (`PullRequestMergeForm.vue:33-37`):
+```typescript
+const mergeButtonStyleClass = computed(() => {
+  if (mergeStyle.value === mergeStyleManuallyMerged) return 'red';
+  if (mergeForm.allOverridableChecksOk) return 'primary';
+  return autoMergeWhenSucceed.value ? 'primary' : 'red';
+});
+```
+
+**强制合并标志** (`PullRequestMergeForm.vue:45-47`):
+```typescript
+const forceMerge = computed(() => {
+  return mergeForm.canMergeNow && !mergeForm.allOverridableChecksOk;
+});
+```
+
+### 8.4 Merge Box 图标颜色规则
+
+**位置**: `routers/web/repo/pull_merge_box.go:54-88`
+
+```
+颜色优先级（从高到低）：
+├─ 已合并 → 紫色
+├─ 已关闭 / WIP / 空 PR / 有冲突 → 灰色
+├─ Status Check 失败 (error/failure) → 红色
+├─ 有 commit/protection blockers → 红色
+├─ 检查中 / Status Check pending/warning → 黄色
+├─ 可合并 (IsStatusMergeable) → 绿色
+└─ 其他 → 灰色
+```
+
+---
+
+## 九、状态断点排查清单
+
+### 9.1 Status Check 失败排查
+
+**现象**: 合并按钮禁用，显示 "Required status checks have failed"
+
+| 检查项 | 位置 | 验证方法 |
+|-------|------|---------|
+| 保护规则是否启用 | `ProtectedBranch.EnableStatusCheck` | 仓库设置 → 分支保护 → 状态检查 |
+| 必填 Contexts 配置 | `ProtectedBranch.StatusCheckContexts` | 检查 glob 模式是否匹配实际 status |
+| Commit SHA 正确性 | `pr.CompareInfo.HeadCommitID` | 确认 status 是针对最新 HEAD 的 |
+| 状态合并结果 | `MergeRequiredContextsCommitStatus()` | 调试：检查各必填 context 的匹配结果 |
+| 是否有未出现的检查 | - | 如配置了 context 但无对应 status，整体为 pending |
+
+**代码断点**:
+- `services/pull/commit_status.go:69` - `IsPullCommitStatusPass` 入口
+- `services/pull/commit_status.go:22` - `MergeRequiredContextsCommitStatus` 匹配逻辑
+- `routers/web/repo/pull.go:452-470` - 缺失 required checks 收集
+
+### 9.2 审批数量不足排查
+
+**现象**: 显示 "1/2 Approvals" 但看起来有足够审批
+
+| 检查项 | 位置 | 验证方法 |
+|-------|------|---------|
+| Review 是否为 Official | `Review.Official=true` | 审查者需在审批白名单中 或 有写权限 |
+| Review 是否已被驳回 | `Review.Dismissed=false` | 检查是否有 Dismiss Review 操作 |
+| 是否忽略过期审批 | `ProtectedBranch.IgnoreStaleApprovals` | 新提交后旧审批是否被标记为 stale |
+| Review 类型 | `Review.Type=Approve` | Comment/Request 类型不计入 |
+| 审批白名单配置 | `ProtectedBranch.EnableApprovalsWhitelist` | 审查者是否在白名单中 |
+
+**代码断点**:
+- `models/issues/pull.go:769` - `GetGrantedApprovalsCount` SQL 查询
+- `models/git/protected_branch.go:234` - `IsUserOfficialReviewer` 判断
+
+### 9.3 按钮禁用但无明确错误
+
+**现象**: 合并按钮灰色/隐藏，无明显错误提示
+
+| 检查项 | 位置 | 验证方法 |
+|-------|------|---------|
+| 合并权限 | `hasPermToMerge` | 用户是否在合并白名单 或 有写权限 |
+| Commit 状态 | `pull.Status` | 是否为 `Conflict`/`Error`/`Checking` |
+| WIP 状态 | `pr.IsWorkInProgress()` | 标题是否含 WIP 标记 |
+| PR 是否已关闭 | `issue.IsClosed` | |
+| 合并方式配置 | `prConfig.AllowMerge/AllowRebase/...` | 仓库是否启用了合并方式 |
+| 签名要求 | `requireSigned && !willSign` | 是否配置了签名要求但无法签名 |
+
+**代码断点**:
+- `routers/web/repo/issue_view.go:910` - `IsUserAllowedToMerge` 权限判断
+- `routers/web/repo/pull_merge_form.go:18-48` - 合并方式筛选逻辑
+
+### 9.4 强制合并不可用
+
+**现象**: 有阻断但无 "Force Merge" 选项
+
+| 检查项 | 位置 | 验证方法 |
+|-------|------|---------|
+| 是否为仓库管理员 | `isRepoAdmin` | 用户是否是仓库 admin 或 site admin |
+| 绕过白名单配置 | `ProtectedBranch.EnableBypassAllowlist` | 是否启用绕过白名单 |
+| 管理员绕过阻止 | `ProtectedBranch.BlockAdminMergeOverride` | 是否阻止管理员强制合并 |
+| 阻断类型 | `infoCommitBlockers` vs `infoProtectionBlockers` | Commit 级阻断（冲突）不可绕过 |
+
+**代码断点**:
+- `routers/web/repo/issue_view.go:961-966` - `canBypassProtection` 判断
+- `models/git/protected_branch.go:212` - `CanBypassBranchProtection`
+
+### 9.5 自动合并不工作
+
+**现象**: 设置了 "Merge when checks succeed" 但未自动合并
+
+| 检查项 | 位置 | 验证方法 |
+|-------|------|---------|
+| 自动合并调度记录 | `pull_model.GetScheduledMergeByPullID` | DB 中是否有 auto_merge 记录 |
+| Status Check 是否全部通过 | `IsPullCommitStatusPass` | 所有必填检查是否 success |
+| 审批是否满足 | `HasEnoughApprovals` | 审批数量是否达标 |
+| 检查队列是否运行 | `prPatchCheckerQueue` | 后台 worker 是否正常 |
+| 合并权限 | `IsUserAllowedToMerge` | 调度者是否仍有合并权限 |
+
+**代码断点**:
+- `services/pull/check.go:298-305` - 自动合并触发逻辑
+- `services/automergequeue/` - 自动合并队列处理
+
+---
+
+## 十、完整状态决策树
+
+```
+PR 页面加载
+│
+├─ 加载 PR 基础信息
+│  ├─ HasMerged? → 显示已合并状态
+│  ├─ IsClosed? → 显示已关闭状态
+│  └─ IsWorkInProgress? → 标记 WIP
+│
+├─ prepareMergeBoxProtectionChecks()
+│  ├─ 加载 ProtectedBranch 规则
+│  ├─ prepareMergeBoxStatusCheckData() → 计算 status check 状态
+│  └─ prepareMergeBoxProtectedRules() → 计算各阻断标志
+│
+├─ 计算核心标志
+│  ├─ hasStatusCheckBlocker = enableStatusCheck && !RequiredChecksState.IsSuccess()
+│  ├─ hasOverridableBlockers = isBlockedByApprovals || isBlockedByRejection || ...
+│  ├─ canBypassProtection = isRepoAdmin || (in bypass allowlist)
+│  └─ canMergeNow = (!hasOverridableBlockers || canBypassProtection) && (!requireSigned || willSign)
+│
+├─ 组装信息条目
+│  ├─ infoCommitBlockers (冲突、检查中、祖先、空PR、数据损坏)
+│  ├─ infoProtectionBlockers (审批、拒绝、status check 等)
+│  └─ infoMergePrompts (可合并提示、可绕过提示)
+│
+└─ 渲染 Merge Box
+   ├─ 图标颜色判定 (prepareMergeBoxIconColor)
+   ├─ 合并表单属性 (prepareMergeBoxFormProps)
+   └─ 信息条目展示 (prepareMergeBoxInfoItems)
+```
+
+---
+
+## 十一、关键代码位置速查表
 
 | 功能 | 文件位置 | 行号 |
 |------|---------|------|
@@ -368,3 +575,9 @@ const (
 | 官方审查者判断 | `models/git/protected_branch.go` | 234 |
 | 检查队列 worker | `services/pull/check.go` | 462 |
 | 执行合并操作 | `services/pull/merge.go` | 223 |
+| Merge Box 阻断器计算 | `routers/web/repo/issue_view.go` | 1040 |
+| canMergeNow 计算 | `routers/web/repo/issue_view.go` | 969 |
+| Merge Box 图标颜色 | `routers/web/repo/pull_merge_box.go` | 54 |
+| Merge Box 信息条目 | `routers/web/repo/pull_merge_box.go` | 91 |
+| 合并表单属性 | `routers/web/repo/pull_merge_form.go` | 18 |
+| 前端 Merge Box 组件 | `web_src/js/components/PullRequestMergeForm.vue` | 1 |

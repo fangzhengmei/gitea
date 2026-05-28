@@ -745,22 +745,30 @@ func checkContextUser(ctx *context.Context, uid int64) *user_model.User {
 }
 ```
 
-### 6.2 检查项详细对比表
+### 6.2 检查项详细对比表（经代码逐项校准）
+
+> 以下每一行均通过源码核实。API 端的 `repoAssignment()` 中间件和 `reqToken()` 已计入对应列。
 
 | 检查阶段 | 检查项 | Web 端 | API 端 (fork到个人) | API 端 (fork到组织) | 服务层 |
 |---------|--------|--------|---------------------|---------------------|--------|
-| **全局中间件** | 必须登录 | ✅ `reqSignIn` | ❌ 可选（token 认证） | ❌ |
-| | 源仓库读权限 | ✅ `reqUnitCodeReader` | ✅ `reqRepoReader` | ❌ |
-| | 仓库上下文赋值 | ✅ `RepoAssignment` | ✅ (通过路由组) | ❌ |
-| **目标所有者检查** | 目标所有者存在 | ✅ | ❌ | ✅ `GetOrgByName` | ❌ |
-| | 目标对用户可见 | ✅ `checkContextUser` | ❌ | ✅ `HasOrgOrUserVisible` | ❌ |
-| | 目标组织创建权限 | ✅ `CanCreateOrgRepo` | ❌ (个人不需要) | ✅ `CanCreateOrgRepo` | ❌ |
-| **业务规则检查** | 同一所有者限制 | ✅ 对每个祖先 | ❌ **完全不检查** | ❌ **完全不检查** | ❌ |
-| | 祖先链重复 fork | ✅ 遍历所有祖先 | ❌ **完全不检查** | ❌ **完全不检查** | ❌ |
-| | 直接父仓库重复 fork | ✅ 祖先链中包含 | ❌ | ❌ | ✅ `GetUserFork` |
-| **安全边界检查** | 用户未被源所有者封禁 | ❌ | ❌ | ❌ | ✅ `IsUserBlockedBy` |
+| **身份与源仓库** | 必须认证 | ✅ `reqSignIn` | ✅ `reqToken()` | ✅ `reqToken()` | ❌ |
+| | 源仓库代码读权限 | ✅ `reqUnitCodeReader` | ✅ `reqRepoReader(TypeCode)` | ✅ `reqRepoReader(TypeCode)` | ❌ |
+| | 源仓库上下文赋值 | ✅ `RepoAssignment` + `GetDoerRepoPermission` | ✅ `repoAssignment()` + `GetDoerRepoPermission` + `HasAnyUnitAccessOrPublicAccess` | ✅ 同左 | ❌ |
+| **目标所有者** | 目标所有者存在 | ✅ `checkContextUser` → `GetUserByID` | ✅ 个人即 `ctx.Doer`，必然存在 | ✅ `GetOrgByName` | ❌ |
+| | 目标对用户可见 | ✅ `checkContextUser` → `CanCreateOrgRepo` 隐含可见 | ✅ 个人空间即自己，天然可见 | ✅ `HasOrgOrUserVisible` | ❌ |
+| | 目标组织创建权限 | ✅ `CanCreateOrgRepo` | N/A（个人空间无需） | ✅ `CanCreateOrgRepo` | ❌ |
+| **业务规则** | 同一所有者限制 | ✅ 对每个祖先检查 `CanUserForkBetweenOwners` | ❌ **完全不检查** | ❌ **完全不检查** | ❌ |
+| | 祖先链重复 fork | ✅ 遍历所有祖先 `GetForkedRepo` | ❌ **完全不检查** | ❌ **完全不检查** | ❌ |
+| | 直接父仓库重复 fork | ✅ 祖先链遍历中覆盖 | ✅ 服务层 `GetUserFork` 兜底 | ✅ 服务层 `GetUserFork` 兜底 | ✅ `GetUserFork` |
+| | 同一所有者同名仓库 | ✅ 服务层 `IsRepositoryModelExist` | ✅ 服务层 `IsRepositoryModelExist` | ✅ 服务层 `IsRepositoryModelExist` | ✅ |
+| **安全边界** | 用户未被源所有者封禁 | ❌ | ❌ | ❌ | ✅ `IsUserBlockedBy` |
 | | 未达创建上限 | ❌ | ❌ | ❌ | ✅ `CanForkRepoIn` |
-| | 仓库名可用 | ✅ 服务层保证 | ✅ 服务层保证 | ✅ 服务层保证 | ✅ |
+| | 仓库名可用 | ✅ 服务层 `IsUsableRepoName` | ✅ 服务层 `IsUsableRepoName` | ✅ 服务层 `IsUsableRepoName` | ✅ |
+
+**校准说明**：
+- "必须登录"：API 端路由注册了 `reqToken()`（`api.go:1240`），该函数验证请求携带有效 token，等价于必须认证。之前版本标 ❌ 不准确，已修正为 ✅。
+- "源仓库上下文赋值"：API 端 `repoAssignment()` 中间件（`api.go:134-220`）做了完整的 owner 查找、repo 查找、`GetDoerRepoPermission` 计算权限、`HasAnyUnitAccessOrPublicAccess` 检查访问性。之前版本对此未充分标注。
+- "直接父仓库重复 fork"：服务层 `ForkRepository`（`fork.go:74-84`）调用 `GetUserFork(opts.BaseRepo.ID, owner.ID)` 检查 owner 是否已 fork 了直接父仓库。Web 和 API 端均经过此路径，因此 API 端对直接重复 fork 并非"完全不检查"，而是由服务层兜底。之前版本标 ❌ 不准确，已修正为 ✅。
 
 ### 6.3 同一所有者限制详细分析
 
@@ -776,27 +784,69 @@ func CanUserForkBetweenOwners(id1, id2 int64) bool {
 ```
 
 **Web 端执行位置**（3次检查）：
-1. GET `/fork` 渲染时 - 控制 UI 显示
-2. GET `/fork` 渲染时 - 对每个可 fork 组织检查
-3. POST `/fork` 提交时 - 遍历祖先链再次验证
+1. GET `/fork` 渲染时 - `getForkRepository` 中对当前用户检查（`fork.go:52`）
+2. GET `/fork` 渲染时 - 遍历祖先链排除不可 fork 的组织（`fork.go:68-89`）
+3. POST `/fork` 提交时 - `ForkPost` 中遍历祖先链再次验证（`fork.go:160-164`）
 
-**API 端执行位置**：0 次！完全没有检查。
+**API 端执行位置**：0 次。`CreateFork`（`api/v1/repo/fork.go:149-178`）中没有调用 `CanUserForkBetweenOwners`。
 
-**风险场景 1：fork 到个人空间**
+#### 6.3.1 同一所有者 + 默认仓库名：重名失败的天然屏障
+
+当同一所有者 fork 到自己名下且使用**默认仓库名**时，存在一道隐式屏障：同名仓库检测。
+
+**API 端默认名称逻辑** (`api/v1/repo/fork.go:160`)：
+```go
+name := optional.FromPtr(form.Name).ValueOrDefault(repo.Name)
+```
+当 `form.Name` 为 nil（未指定）时，`name` 默认等于源仓库名。
+
+**服务层重名检测** (`services/repository/create.go:344-352`)：
+```go
+has, err := repo_model.IsRepositoryModelExist(ctx, u, repo.Name)
+if has {
+    return repo_model.ErrRepoAlreadyExist{Uname: u.Name, Name: repo.Name}
+}
+```
+
+**同一所有者 + 默认名称的执行路径**：
+```
+源仓库：org1/repo
+目标：org1（同一所有者），名称：repo（默认）
+
+服务层 ForkRepository
+    → GetUserFork(org1, repoID) → 已存在（就是自己）
+    → 返回 ErrForkAlreadyExist ← 第一道拦截
+```
+
+**因此，同一所有者场景下的风险路径实际是：**
+
+| 场景 | 默认名称 | 自定义名称（`form.Name = "repo-copy"`） |
+|------|---------|----------------------------------------|
+| 同一所有者 fork 到自己 | ❌ `GetUserFork` 返回已有 fork → `ErrForkAlreadyExist` | ⚠️ `GetUserFork` 检查通过（新名称）→ `IsRepositoryModelExist` 通过（不同名）→ **创建成功** |
+| 同一所有者（不同仓库）| N/A | ⚠️ 如果祖先链中有同一所有者的仓库，`GetUserFork` 只检查直接父仓库，可能漏检 |
+
+**关键结论**：API 端缺少 `CanUserForkBetweenOwners` 检查，但同一所有者 + 默认名称时会被 `GetUserFork` 拦截（返回 `ErrForkAlreadyExist`）。**只有使用自定义名称时**，才能绕过此屏障，在同一所有者下创建出多余的 fork。而 Web 端的 `CanUserForkBetweenOwners` 检查不依赖仓库名，无论默认还是自定义名称都会拦截。
+
+#### 6.3.2 风险场景修正
+
+**风险场景 1：fork 到个人空间（使用自定义名称）**
 ```
 源仓库：userA/repo (个人仓库)
-用户：userA
+API 请求：POST /repos/userA/repo/forks, body: {"name": "repo-copy"}
 ```
 - Web 端：`CanUserForkBetweenOwners(userA, userA) = false` → 被阻止
-- API 端：无检查 → **允许创建**（除非 `AllowForkIntoSameOwner=true`）
+- API 端：无 `CanUserForkBetweenOwners` 检查 → `GetUserFork` 检查直接父仓库 → 通过（新名称） → **允许创建**
+- 如果使用默认名称：`GetUserFork` 发现已 fork → `ErrForkAlreadyExist` → 被拦截
 
-**风险场景 2：fork 到同一组织**
+**风险场景 2：fork 到同一组织（使用自定义名称）**
 ```
 源仓库：org1/repo
 目标组织：org1
+API 请求：POST /repos/org1/repo/forks, body: {"organization": "org1", "name": "repo-copy"}
 ```
 - Web 端：`CanUserForkBetweenOwners(org1, org1) = false` → 被阻止
-- API 端：无检查 → **允许创建**
+- API 端：无检查 → `GetUserFork(baseRepoID, org1)` → 已存在 → `ErrForkAlreadyExist` → 被拦截
+- 但如果之前已删除了旧的 fork：`GetUserFork` 检查通过 → **允许创建**
 
 ### 6.4 祖先链重复 fork 检查详细分析
 
@@ -865,7 +915,7 @@ if forkedRepo != nil {
 - Web 端：❌ 拒绝（正确）
 - API 端：✅ 允许（错误，造成 org1 下有两个相同来源的仓库）
 
-### 6.5 两层防御架构分析
+### 6.5 两层防御架构分析（校准后）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -875,16 +925,17 @@ if forkedRepo != nil {
 │  ┌──────────────────────────────┐   ┌──────────────────────────────┐   │
 │  │  Web 端 (ForkPost)           │   │  API 端 (CreateFork)         │   │
 │  ├──────────────────────────────┤   ├──────────────────────────────┤   │
-│  │ ✅ reqSignIn                 │   │ ❌ 可选登录                  │   │
-│  │ ✅ RepoAssignment            │   │ ✅ 仓库上下文                │   │
-│  │ ✅ reqUnitCodeReader         │   │ ✅ reqRepoReader             │   │
+│  │ ✅ reqSignIn                 │   │ ✅ reqToken                  │   │
+│  │ ✅ RepoAssignment + 权限     │   │ ✅ repoAssignment + 权限     │   │
+│  │ ✅ reqUnitCodeReader         │   │ ✅ reqRepoReader(TypeCode)   │   │
 │  │                              │   │                              │   │
-│  │ ✅ 目标可见性 checkContextUser│   │ ⚠️ 仅组织目标时检查         │   │
-│  │ ✅ 目标创建权限              │   │ ⚠️ 仅组织目标时检查         │   │
+│  │ ✅ 目标可见性 checkContextUser│   │ ✅ 个人: 天然可见            │   │
+│  │ ✅ 目标创建权限              │   │ ✅ 组织: HasOrgOrUserVisible │   │
+│  │                              │   │ ✅ 组织: CanCreateOrgRepo    │   │
 │  │                              │   │                              │   │
 │  │ ✅ 同一所有者限制 (祖先链)    │   │ ❌ 完全缺失                  │   │
 │  │ ✅ 祖先链重复 fork           │   │ ❌ 完全缺失                  │   │
-│  │ ✅ 直接重复 fork (祖先链)    │   │ ❌ 缺失                      │   │
+│  │ ✅ 直接重复 fork (祖先链)    │   │ ✅ 服务层兜底 GetUserFork    │   │
 │  └──────────────────────────────┘   └──────────────────────────────┘   │
 │                                       │                                  │
 └───────────────────────────────────────┼──────────────────────────────────┘
@@ -896,6 +947,8 @@ if forkedRepo != nil {
 │  ✅ IsUserBlockedBy(doer, baseRepoOwner)      - 用户封禁检查              │
 │  ✅ CanForkRepoIn(doer, owner)               - 创建上限检查              │
 │  ✅ GetUserFork(baseRepoID, ownerID)         - 直接父仓库重复检查        │
+│  ✅ IsRepositoryModelExist(owner, name)       - 同名仓库检查              │
+│  ✅ IsUsableRepoName(name)                   - 仓库名可用性检查          │
 │  ❌ 同一所有者限制                           - 完全缺失                   │
 │  ❌ 祖先链重复 fork                          - 完全缺失                   │
 │  ❌ 目标可见性                               - 完全缺失                   │
@@ -906,9 +959,8 @@ if forkedRepo != nil {
 
 **设计缺陷总结**：
 1. **职责划分不清晰**：入口层承担了过多业务规则检查，服务层缺少核心防御
-2. **API 端防御薄弱**：缺少同一所有者、祖先链重复等关键检查
+2. **API 端缺少同一所有者和祖先链检查**：但服务层的 `GetUserFork` + `IsRepositoryModelExist` 在默认名称场景下提供了隐式屏障，自定义名称场景才是真正的风险路径
 3. **服务层信任过度**：假定入口层已做了所有检查，导致防御缺口
-4. **个人目标 vs 组织目标**：API 端 fork 到个人空间时跳过可见性检查，与 Web 端不一致
 
 ---
 

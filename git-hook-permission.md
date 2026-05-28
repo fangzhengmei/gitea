@@ -191,6 +191,108 @@ Gitea 内部操作（如 UI 合并 PR）推送时使用 `InternalPushingEnvironm
    - **AGit 特殊处理**：若 Git 支持 `proc-receive` 且 verb 为 `receive-pack`，则将写权限降级为读权限（因为 `refs/for` 推送的真正写入由 `proc-receive` hook 控制）
 6. **Push-to-create**：仓库不存在时，若配置允许则自动创建
 
+### 4.4 HTTP receive-pack 推送（完整闭环）
+
+**代码位置**：`routers/web/repo/githttp.go::ServiceReceivePack()` → `serviceRPC()` → `httpBase()`
+
+与 SSH 推送通过 `gitea serv` 中转不同，HTTP 推送的权限校验和环境变量注入完全在 Gitea Web 进程内完成。
+
+**路由**：
+```
+POST /{username}/{reponame}/git-receive-pack  →  repo.ServiceReceivePack
+POST /{username}/{reponame}/info/refs         →  repo.GetInfoRefs (带 service=git-receive-pack 参数)
+```
+
+**完整执行流程**：
+
+```
+  git push http://...
+        │
+        ▼
+  ServiceReceivePack(ctx)
+        │
+        ▼
+  serviceRPC(ctx, "receive-pack")
+        │
+        ├── httpBase(ctx, "git-receive-pack")
+        │    │
+        │    ├── 解析服务类型：git-receive-pack → ServiceTypeReceivePack, accessMode=Write
+        │    ├── 身份认证：
+        │    │   ├── 公开仓库 pull 操作免认证
+        │    │   ├── 否则需 Basic Auth / OAuth / PAT
+        │    │   ├── 2FA 用户不能用密码（需 PAT）
+        │    │   └── 检查 repo-scoped token 权限
+        │    │
+        │    ├── 仓库加载与状态检查：镜像只读、归档不可推
+        │    ├── AGit 权限降级（同 SSH）：ReceivePack + SupportProcReceive → accessMode 改为 Read
+        │    ├── 权限校验：GetDoerRepoPermission → CanAccess(accessMode, unitType)
+        │    ├── Push-to-create（仓库不存在时）
+        │    │
+        │    └── 环境变量注入：
+        │         h.environ = repo_module.DoerPushingEnvironment(ctx.Doer, repo, isWiki)
+        │             │
+        │             ├── GITEA_ROOT_URL=<AppURL>
+        │             ├── GITEA_REPO_NAME=<repo> + (".wiki" if wiki)
+        │             ├── GITEA_REPO_USER_NAME=<owner>
+        │             ├── GITEA_REPO_ID=<repoID>
+        │             ├── GITEA_REPO_IS_WIKI=true/false
+        │             ├── GITEA_PUSHER_NAME=<doer.Name>
+        │             ├── GITEA_PUSHER_ID=<doer.ID>
+        │             ├── GITEA_PUSHER_EMAIL=<doer.Email>  # 若 !KeepEmailPrivate
+        │             └── GITEA_ACTIONS_TASK_ID=<taskID>    # 若为 Actions 用户
+        │
+        ├── 额外环境变量追加：
+        │    h.environ = append(h.environ, "SSH_ORIGINAL_COMMAND=receive-pack")  # 用于 hook 层判断非匿名
+        │    h.environ = append(h.environ, "GIT_PROTOCOL=<version>")            # 若请求头有 Git-Protocol
+        │
+        ├── 构建 git 命令：
+        │    git receive-pack --stateless-rpc .
+        │        ├── WithEnv(append(os.Environ(), h.environ...))
+        │        ├── WithStdinCopy(ctx.Req.Body)       # 客户端推送的 pack 数据
+        │        └── WithStdoutCopy(ctx.Resp)          # 结果直接写回 HTTP 响应
+        │
+        └── 运行命令：
+             gitrepo.RunCmdWithStderr(ctx, repo, cmd)
+        │
+        ▼
+  git-receive-pack 启动
+        │
+        ▼
+  调用 hooks/pre-receive
+        │
+        ▼
+  调用 gitea hook pre-receive （cmd/hook.go::runHookPreReceive）
+        │  从环境变量读取上述注入的所有变量
+        │  同 SSH 路径一致：批量收集 → 内部 API → 权限校验 → 返回结果
+        ▼
+  后续流程与 SSH 完全一致
+```
+
+**HTTP vs SSH 环境变量对比**：
+
+| 环境变量 | SSH 推送 | HTTP 推送 | 说明 |
+|---------|---------|----------|------|
+| `GITEA_PUSHER_ID` | ✓ | ✓ | 推送者 ID |
+| `GITEA_PUSHER_NAME` | ✓ | ✓ | 推送者用户名 |
+| `GITEA_PUSHER_EMAIL` | ✓ | ✓ | 推送者邮箱（非私密时） |
+| `GITEA_REPO_USER_NAME` | ✓ | ✓ | 仓库所有者 |
+| `GITEA_REPO_NAME` | ✓ | ✓ | 仓库名 |
+| `GITEA_REPO_IS_WIKI` | ✓ | ✓ | 是否 wiki |
+| `GITEA_REPO_ID` | ✓ | ✓ | 仓库 ID |
+| `GITEA_ROOT_URL` | ✓ | ✓ | App URL |
+| `GITEA_ACTIONS_TASK_ID` | ✓ | ✓ | Actions 用户任务 ID |
+| `GITEA_PR_ID` | ✓ (初始=0) | ✗ | PR ID（HTTP 场景不需要，内部推送时设置） |
+| `GITEA_DEPLOY_KEY_ID` | ✓ | ✗ | Deploy Key ID（HTTP 不使用 Deploy Key） |
+| `GITEA_KEY_ID` | ✓ | ✗ | SSH 公钥 ID |
+| `SSH_ORIGINAL_COMMAND` | 完整命令（如 `git-receive-pack...`） | `"receive-pack"` | HTTP 场景仅设置为服务名，用于 hook 层跳过匿名检查 |
+| `GIT_PROTOCOL` | ✗ | ✓（若有请求头） | Git 协议版本 |
+
+**关键设计点**：
+1. HTTP 场景复用 `SSH_ORIGINAL_COMMAND` 环境变量来标记"非匿名推送"，但值仅为服务名而非完整命令
+2. `runHookPreReceive` 中的检查逻辑 `len(os.Getenv("SSH_ORIGINAL_COMMAND")) == 0` 对 HTTP 推送同样生效
+3. HTTP 推送不经过 `gitea serv`，直接由 Web 进程启动 `git-receive-pack`，权限校验在 `httpBase` 中完成
+4. HTTP 推送的环境变量注入入口是 `repo_module.DoerPushingEnvironment`，SSH 推送是在 `runServ` 中手动拼接
+
 ---
 
 ## 五、Hook 进程内权限校验实现
@@ -229,9 +331,52 @@ type preReceiveContext struct {
 canWriteCode = CanMaintainerWriteToBranch(userPerm, branchName, user) || deployKeyAccessMode >= Write
 ```
 
-`CanMaintainerWriteToBranch`（`models/issues/pull_list.go:73`）的判断逻辑：
-1. 若用户有 `Code` 单元的 `Write` 权限 → 允许
-2. 若用户对仓库有 `Maintainer` 权限且存在由其维护者编辑（`AllowMaintainerEdit`）的未合并 PR 指向该分支 → 允许
+**函数名误导性说明**：`CanMaintainerWriteToBranch` 名称具有误导性，代码注释（`services/context/repo.go:152`）明确指出：
+> "CanMaintainerWriteToBranch is a bad name, but it really does what 'CanWriteToBranch' does"
+
+实际上该函数的作用是**判断用户在任何前提下是否对分支有写入权限**，而不仅限于 "maintainer" 场景。它在多处被用作通用的分支可写性判断（如 `Repository.CanWriteToBranch` 直接调用它）。
+
+`CanMaintainerWriteToBranch`（`models/issues/pull_list.go:73`）的真实判断逻辑：
+
+```
+1. 快速路径：headPerm.CanWrite(unit.TypeCode) == true
+   │
+   ├── 直接返回 true（99% 场景在此返回）
+   │
+   └── false → 进入 maintainer 编辑模式检查
+
+2. Maintainer 编辑模式检查（仅当用户无直接 Write 权限时触发）：
+   │
+   ├── 从 headPerm 中提取仓库 ID（GetFirstUnitRepoID）
+   ├── 查询该仓库中 headBranch 作为源分支的所有未合并 PR（GitHub Flow 类型）
+   │
+   └── 遍历 PR，寻找满足以下所有条件的 PR：
+       │
+       ├── PR.AllowMaintainerEdit == true
+       ├── PR.Issue.Poster 对 HeadRepo 有 Code Write 权限（防止 Poster 是 Reader 的情况）
+       └── 当前 doer 对 BaseRepo 有 Code Write 权限
+       │
+       └── 找到任一满足的 PR → 返回 true
+
+3. 以上均不满足 → 返回 false
+```
+
+**Hook 场景下的上下文**：
+- 在 `pre-receive` hook 中，`headPerm` 是 doer 对**目标仓库**（被 push 的仓库）的权限，不是 PR HeadRepo 的权限
+- 因此 "maintainer 编辑" 路径只有在以下极特殊场景才会触发：
+  - doer 对目标仓库只有 Read 权限
+  - 但存在一个从 fork 仓库的 `branchName` 指向目标仓库的未合并 PR
+  - PR 开启了 `AllowMaintainerEdit`
+  - doer 对目标仓库（BaseRepo）有 Write 权限
+
+**完整调用链**：
+- `routers/private/hook_pre_receive.go:62` — hook 中的分支写权限判断
+- `services/context/repo.go:107` — 通用 `CanWriteToBranch`
+- `services/context/repo.go:153` — web 编辑器分支可写性判断
+- `services/context/repo.go:1110` — PR 上下文分支可写性
+- `routers/web/repo/editor.go:144` — 在线编辑分支权限
+- `routers/web/repo/pull.go:925` — PR 页面分支可写性
+- `services/convert/convert.go:79` — API 响应分支可写性
 
 ### 5.4 按 ref 类型的权限分发
 
@@ -385,11 +530,11 @@ verifyCommits(oldCommitID, newCommitID, gitRepo, env)
     │
     ├── 新建分支（oldCommitID == EmptyObjectID）:
     │   git rev-list <newCommitID> --not --all
-    │   列出所有新接收的提交（排除仓库中已有的）
+    │   列出所有新接收的提交（排除仓库中已有的所有 ref 指向的提交）
     │
     └── 已有分支:
         git rev-list <old>...<new>
-        列出 old..new 范围内的提交
+        列出对称差集范围内的提交
     │
     ▼ 逐个提交验证
 readAndVerifyCommit(sha, repo, env)
@@ -408,6 +553,58 @@ readAndVerifyCommit(sha, repo, env)
     │
     verification.Verified == false → 返回 errUnverifiedCommit{sha}
 ```
+
+#### `old...new` 三点范围的语义澄清
+
+**代码位置**：`routers/private/hook_verification.go:27`
+
+`git rev-list <old>...<new>` 使用**三点范围**（三重点号 `...`），其语义是**对称差集**（symmetric difference）：
+
+```
+     old                         new
+      o                           o
+     / \                         / \
+    o   o                       o   o
+     \ /                         \ /
+      o                           o
+       \                         /
+        o---------o---------o---o
+        A         B         C   D
+
+old...new = {A} ∪ {D} （同时包含两侧独有的提交）
+old..new  = {D}        （仅 new 侧独有的提交）
+```
+
+具体来说：
+- **提交可达性**：列出所有可从 `old` 或 `new` 到达，但**不能同时**从两者到达的提交
+- **等价命令**：`git rev-list old new --not $(git merge-base old new)`
+
+**在不同推送场景下的实际范围**：
+
+| 推送场景 | old...new 实际包含 | 语义合理性 |
+|---------|-------------------|-----------|
+| **Fast-forward 推送**（普通推送，old 是 new 的祖先） | 仅 new 侧的新提交（等同于 `old..new`） | ✅ 合理 |
+| **Force push**（非 Fast-forward，old 不是 new 的祖先） | old 侧被丢弃的提交 + new 侧新引入的提交 | ⚠️ 过于宽泛 |
+| **新建分支**（old = 0000000） | 使用 `new --not --all`（完全独立逻辑） | ✅ 合理 |
+
+**与强推检测的顺序依赖**：
+
+在 `preReceiveBranch` 中，强推检测（步骤 5）在签名验证（步骤 6）**之前**执行：
+```go
+// hook_pre_receive.go:197-221
+if len(output) > 0 {  // 检测到强推
+    if protectBranch.CanForcePush {
+        isForcePush = true  // 标记，继续后续检查
+    } else {
+        return error  // 拒绝，不执行签名验证
+    }
+}
+// hook_verification.go:29 注释："This is safe as force pushes are already forbidden"
+```
+
+**注释的局限性**：`hook_verification.go:29` 的注释 "This is safe as force pushes are already forbidden" 只说对了一半：
+- 当 `CanForcePush == false` 时，强推在签名验证前就被拒绝，注释成立
+- 当 `CanForcePush == true` 时，强推被允许，签名验证**仍然执行**，此时 `old...new` 包含已被丢弃的 old 侧提交
 
 **代码位置**：`services/asymkey/commit.go::ParseCommitWithSignature()`
 
@@ -487,16 +684,20 @@ Gitea 内部操作（UI 合并 PR、同步分支等）通过 `GITEA_INTERNAL_PUS
 | Hook 子命令入口 | `cmd/hook.go` | `runHookPreReceive:184`, `runHookUpdate:314`, `runHookPostReceive:331`, `runHookProcReceive:518` |
 | 内部 API 客户端 | `modules/private/hook.go` | `HookPreReceive:96`, `HookPostReceive:103`, `HookProcReceive:109` |
 | 内部 API 路由 | `routers/private/internal.go` | L67-69 |
-| pre-receive 权限校验 | `routers/private/hook_pre_receive.go` | `HookPreReceive:109`, `preReceiveBranch:142`, `preReceiveTag:406`, `preReceiveFor:442` |
+| pre-receive 权限校验 | `routers/private/hook_pre_receive.go` | `HookPreReceive:109`, `preReceiveBranch:142`, `preReceiveTag:406`, `preReceiveFor:442`, `loadPusherAndPermission:493` |
 | 签名验证 | `routers/private/hook_verification.go` | `verifyCommits:18`, `readAndVerifyCommit:58` |
 | 签名解析 | `services/asymkey/commit.go` | `ParseCommitWithSignature:26` |
 | post-receive 处理 | `routers/private/hook_post_receive.go` | `HookPostReceive:33` |
 | proc-receive / AGit | `services/agit/agit.go` | `ProcReceive:65` |
-| Serv 命令 | `cmd/serv.go` | `runServ:135` |
-| ServCommand 权限 | `routers/private/serv.go` | `ServCommand:79` |
+| SSH Serv 命令 | `cmd/serv.go` | `runServ:135` |
+| SSH ServCommand 权限 | `routers/private/serv.go` | `ServCommand:79` |
+| **HTTP receive-pack** | `routers/web/repo/githttp.go` | `ServiceReceivePack:437`, `serviceRPC:369`, `httpBase:60`, `GetInfoRefs:454` |
+| **HTTP 路由注册** | `routers/web/githttp.go` | `addOwnerRepoGitHTTPRouters:11` |
 | 受保护分支模型 | `models/git/protected_branch.go` | `CanUserPush:125`, `CanUserForcePush:162`, `CanBypassBranchProtection:212` |
 | 受保护标签模型 | `models/git/protected_tag.go` | `IsUserAllowedToControlTag:127` |
-| Maintainer 写入权限 | `models/issues/pull_list.go` | `CanMaintainerWriteToBranch:73` |
+| Maintainer 写入权限 | `models/issues/pull_list.go` | `CanMaintainerWriteToBranch:73`, `canMaintainerWriteToBranch:82` |
+| Maintainer 权限调用链 | `services/context/repo.go` | `CanWriteToBranch:106`, L153, L1110 |
+| Doer 推送环境 | `modules/repository/env.go` | `DoerPushingEnvironment:58` |
 | Hook 脚本生成 | `modules/gitrepo/hooks.go` | `getHookTemplates:17`, `CreateDelegateHooks:110` |
 | 环境变量常量 | `modules/repository/env.go` | L19-33 |
 | 推送环境构建 | `modules/repository/env.go` | `InternalPushingEnvironment:47`, `FullPushingEnvironment:78` |

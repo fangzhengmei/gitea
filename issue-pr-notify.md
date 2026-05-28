@@ -1484,13 +1484,443 @@ if notification.Status == NotificationStatusRead {
 
 ---
 
-## 十一、核心文件索引
+## 十一、Notification-Service 并发执行边界
+
+notification-service 的并发模型存在多层竞态风险。先查后写的逻辑去重依赖于内存状态，而数据库层面缺乏唯一性约束，在高并发场景下可能产生重复通知。
+
+### 11.1 notification-service Queue 并发模型
+
+#### 队列创建：非唯一队列
+
+**位置**：`services/uinotification/notify.go:46`
+
+```go
+ns.issueQueue = queue.CreateSimpleQueue(
+    graceful.GetManager().ShutdownContext(),
+    "notification-service",
+    handler,
+)
+```
+
+`CreateSimpleQueue` 调用 `createWorkerPoolQueue` 时传入 `unique=false`（`modules/queue/manager.go:94`）：
+
+```go
+func CreateSimpleQueue[T any](ctx, name, handler) *WorkerPoolQueue[T] {
+    return createWorkerPoolQueue(ctx, name, setting.CfgProvider, handler, false)
+}
+```
+
+**unique=false 的意义**：
+- 底层队列（channel/redis/leveldb）不做去重
+- 相同内容的 item 可以被多次 Push
+- 队列层面没有重复检测机制
+
+#### Worker 池并发模型
+
+**位置**：`modules/queue/workerqueue.go + workergroup.go`
+
+```
+配置参数（来自 app.ini [queue.notification-service]）:
+  MAX_WORKERS  = N    # 默认 10
+  BATCH_LENGTH = M    # 默认 20
+
+运行时结构:
+  WorkerPoolQueue
+    ├─ workerNum       : 当前运行的 worker 数
+    ├─ workerMaxNum    : MAX_WORKERS 上限
+    ├─ workerActiveNum : 正在处理 batch 的 worker 数
+    └─ batchChan       : chan []T，worker 从此读取 batch
+```
+
+**并发执行流**：
+
+```
+doRun() 主循环 (单 goroutine)
+    ├─ 从 baseQueue.PopItem() 读取数据 → popItemChan
+    ├─ 积累到 batchBuffer，达到 BATCH_LENGTH 或 100ms 超时
+    ├─ doDispatchBatchToWorker()
+    │   ├─ 尝试将 batch 发送到 batchChan
+    │   ├─ 如果 batchChan 满且 workerNum < workerMaxNum:
+    │   │   └─ doStartNewWorker()  ← 启动新 goroutine
+    │   └─ 新 worker 运行 doWorker() 循环
+    │       ├─ 从 batchChan 读取 batch
+    │       ├─ doWorkerHandle(batch)  ← 调用 safeHandler
+    │       └─ 空闲 1s 后退出（最后一个 worker 不退出）
+    └─ 多个 worker 可并发处理不同 batch
+```
+
+**关键并发特征**：
+1. **多 worker 并发**：不同 batch 被不同 worker goroutine 并发处理
+2. **同一 batch 串行**：batch 内的 items 被 `handler` 串行处理（`for _, opts := range items`）
+3. **无顺序保证**：不同 batch 之间没有执行顺序保证
+4. **动态伸缩**：worker 数随负载在 1 ~ MAX_WORKERS 之间动态调整
+
+#### notification-service handler
+
+**位置**：`services/uinotification/notify.go:53-60`
+
+```go
+func handler(items ...issueNotificationOpts) []issueNotificationOpts {
+    for _, opts := range items {
+        if err := activities_model.CreateOrUpdateIssueNotifications(
+            graceful.GetManager().ShutdownContext(),
+            opts.IssueID, opts.CommentID,
+            opts.NotificationAuthorID, opts.ReceiverID,
+        ); err != nil {
+            log.Error("Was unable to create issue notification: %v", err)
+        }
+    }
+    return nil
+}
+```
+
+**每个 opts 独立调用**：batch 内的每个 `issueNotificationOpts` 独立调用一次 `CreateOrUpdateIssueNotifications`，每次调用是一个独立的数据库事务。
+
+### 11.2 `CreateOrUpdateIssueNotifications` 先查后写流程
+
+**位置**：`models/activities/notification_list.go:78-162`
+
+完整流程的事务边界与竞态窗口：
+
+```
+CreateOrUpdateIssueNotifications(ctx, issueID, commentID, authorID, receiverID)
+    │
+    ├─ db.WithTx(ctx, func(ctx) error {    ← 数据库事务开始
+    │
+    │   ① 查询现有通知（事务内的一致性读）
+    │   ────────────────────────────────────────────────────
+    │   notifications, err := GetNotifications(ctx, GetNotificationsOptions{
+    │       UserID:  receiverID,   // 如果 receiverID=0 则不填
+    │       IssueID: issueID,
+    │       ...
+    │   })
+    │   // 返回 []*Notification：当前事务视角下的已有通知
+    │
+    │   ② 计算收件人集合 toNotify
+    │   ────────────────────────────────────────────────────
+    │   if receiverID > 0:
+    │       toNotify = {receiverID}        // 定向推送，跳过 unwatch 检查
+    │   else:
+    │       toNotify = issueWatchers + repoWatchers + participants
+    │       delete(toNotify, authorID)
+    │       toNotify.Remove(issueUnWatchIDs)
+    │
+    │   ③ 逐个处理收件人（先查后写）
+    │   ────────────────────────────────────────────────────
+    │   for userID := range toNotify {
+    │       ├─ permissionCheck(userID)
+    │       │
+    │       ├─ if notificationExists(notifications, issueID, userID):
+    │       │       // ④ 逻辑去重：内存中的存在性检查
+    │       │       updateIssueNotification(ctx, userID, issueID, commentID, authorID)
+    │       │   else:
+    │       │       // ⑤ 插入新通知
+    │       │       createIssueNotification(ctx, userID, issue, commentID, authorID)
+    │   }
+    │
+    └─ })  ← 事务提交
+```
+
+#### `notificationExists` 逻辑去重
+
+**位置**：`models/activities/notification.go:313-319`
+
+```go
+func notificationExists(notifications []*Notification, issueID, userID int64) bool {
+    for _, notification := range notifications {
+        if notification.IssueID == issueID && notification.UserID == userID {
+            return true  // 只检查 IssueID + UserID，基于内存切片
+        }
+    }
+    return false
+}
+```
+
+**关键点**：
+- 检查完全基于**步骤①查询到的内存切片**，不是数据库实时查询
+- 去重键是 `(IssueID, UserID)`，理论上一个用户对一个 Issue 只有一条通知
+- 这是**逻辑去重**，不是数据库约束
+
+#### `createIssueNotification` 插入逻辑
+
+**位置**：`models/activities/notification.go:81-126`
+
+```go
+func createIssueNotification(ctx, userID, issue, commentID, authorID) error {
+    notification := &Notification{
+        UserID:    userID,
+        RepoID:    issue.RepoID,
+        Status:    NotificationStatusUnread,
+        Source:    source,  // Issue or PullRequest
+        IssueID:   issue.ID,
+        CommentID: commentID,
+        UpdatedBy: authorID,
+    }
+    _, err := db.GetEngine(ctx).Insert(notification)
+    return err
+}
+```
+
+**关键点**：只有 `INSERT`，没有 `ON CONFLICT` 或 `INSERT IGNORE`。
+
+### 11.3 Notification 表的索引约束
+
+**位置**：`models/activities/notification.go:75-112`
+
+```go
+func (n *Notification) TableIndices() []*schemas.Index {
+    indices := make([]*schemas.Index, 0, 8)
+
+    // 组合索引：用于通知列表查询排序
+    usuuIndex := schemas.NewIndex("u_s_uu", schemas.IndexType)
+    usuuIndex.AddColumn("user_id", "status", "updated_unix")
+    indices = append(indices, usuuIndex)
+
+    // 单列普通索引（非唯一）
+    userIDIndex := schemas.NewIndex("idx_notification_user_id", schemas.IndexType)
+    userIDIndex.AddColumn("user_id")
+    indices = append(indices, userIDIndex)
+
+    repoIDIndex := schemas.NewIndex("idx_notification_repo_id", schemas.IndexType)
+    repoIDIndex.AddColumn("repo_id")
+    indices = append(indices, repoIDIndex)
+
+    issueIDIndex := schemas.NewIndex("idx_notification_issue_id", schemas.IndexType)
+    issueIDIndex.AddColumn("issue_id")
+    indices = append(indices, issueIDIndex)
+
+    // ... 其他单列索引
+    return indices
+}
+```
+
+**关键发现**：`notification` 表**没有任何 UNIQUE 约束**。所有索引都是 `schemas.IndexType`（普通非唯一索引）。
+
+| 约束类型 | 是否存在 |
+|---------|---------|
+| `PRIMARY KEY (id)` | ✓（自增主键） |
+| `UNIQUE (user_id, issue_id)` | ✗ **不存在** |
+| `UNIQUE (user_id, issue_id, comment_id)` | ✗ **不存在** |
+| 普通索引 `(user_id, issue_id)` | ✗（只有单列索引） |
+
+**迁移历史确认**：`models/migrations/v1_23/v309.go` 中 `ImproveNotificationTableIndices` 也只添加了普通索引，没有添加任何唯一性约束。
+
+### 11.4 竞态条件分析
+
+#### 竞态场景 1：同一 batch 内的串行重复
+
+同一 batch 中包含两个相同的 `issueNotificationOpts`（同一 IssueID + ReceiverID）：
+
+```
+batch = [
+    {IssueID: 123, ReceiverID: 456, CommentID: 1001},  // opts A
+    {IssueID: 123, ReceiverID: 456, CommentID: 1002},  // opts B
+]
+
+串行处理:
+  ① 处理 opts A:
+     - 查询 notifications → 空
+     - notificationExists → false
+     - INSERT notification(user=456, issue=123, comment=1001)  ✅
+
+  ② 处理 opts B:
+     - **新的事务，新的查询**
+     - 查询 notifications → 找到 user=456, issue=123
+     - notificationExists → true
+     - UPDATE notification → 更新 CommentID=1002  ✅
+
+结果: 1 条通知，CommentID 指向最新评论，正确。
+```
+
+**结论**：同一 batch 内串行执行，事务之间相互可见，不会产生重复。
+
+#### 竞态场景 2：跨 batch 并发（最常见）
+
+两个 worker 并发处理不同 batch，包含对同一 `(IssueID, UserID)` 的操作：
+
+```
+时间线:
+  T0:  notification 表中 user=456, issue=123 无记录
+
+  T1:  Worker A 开始事务 TA，查询 notifications → 空
+       TA 执行 CREATE OR UPDATE 流程:
+         notificationExists → false
+
+  T2:  Worker B 开始事务 TB，查询 notifications → 空
+       TB 执行 CREATE OR UPDATE 流程:
+         notificationExists → false
+
+  T3:  TA 执行 INSERT notification(user=456, issue=123, comment=1001)
+       TA 提交 ✅  插入成功，id=5001
+
+  T4:  TB 执行 INSERT notification(user=456, issue=123, comment=1002)
+       TB 提交 ✅  插入成功，id=5002
+
+  T5:  notification 表中有两条记录:
+       - id=5001, user=456, issue=123, comment=1001
+       - id=5002, user=456, issue=123, comment=1002
+
+结果: **用户收到两条完全相同的站内信通知！**
+```
+
+**事务隔离级别**：Gitea 默认使用数据库的默认隔离级别（MySQL REPEATABLE READ，PostgreSQL READ COMMITTED）。在 REPEATABLE READ 下，步骤 T2 的查询看不到 T3 未提交的插入，所以两个事务都认为记录不存在。
+
+#### 竞态场景 3：同一 UserID 同时在多个队列项中
+
+当 PR 有大量活动时，同一用户可能同时出现在多个通知项中：
+- 队列项 1：广播（ReceiverID=0）→ 计算出包含 user=456
+- 队列项 2：@mention（ReceiverID=456）→ 定向推送给 user=456
+
+如果这两个队列项进入不同 batch 被并发处理，就会触发竞态场景 2。
+
+#### 竞态场景 4：Code Owner 团队重叠
+
+第十章分析的 alice 场景（同时属于两个团队）：
+- 团队 A 展开 → `PullRequestReviewRequest(reviewer=alice)` → 队列项 A
+- 团队 B 展开 → `PullRequestReviewRequest(reviewer=alice)` → 队列项 B
+
+如果 A、B 进入不同 batch 并发处理，就会产生重复通知。
+
+### 11.5 逻辑去重 vs 数据库约束
+
+| 维度 | 逻辑去重（`notificationExists`） | 数据库约束（UNIQUE） |
+|-----|--------------------------------|---------------------|
+| 实现位置 | 应用层内存检查 | 数据库层约束 |
+| 并发安全 | ✗ 不安全（基于查询时的快照） | ✓ 安全（原子性保证） |
+| 错误处理 | 无，竞态时静默产生重复 | 抛出唯一键冲突异常 |
+| 性能 | ✓ 内存操作，O(n) | ✓ 索引查找，O(log n) |
+| 对业务的影响 | 产生重复通知，用户看到多条相同通知 | 需要应用层捕获冲突并重试更新 |
+| 实现成本 | 低 | 中（需要迁移 + 冲突处理） |
+
+### 11.6 重复通知的实际影响
+
+当竞态发生时，用户会看到以下现象：
+
+1. **站内信列表出现两条完全相同的通知**
+   - 同一 Issue，同一用户，两条记录
+   - 可能指向不同的 CommentID
+   - 用户点击时可能跳转到不同的评论
+
+2. **状态不一致**
+   - 一条标记为已读，另一条仍为未读
+   - 通知计数显示错误的未读数
+
+3. **`updateIssueNotification` 的行为不确定性**
+   - 由于有两条记录，后续的更新操作（如标记已读）可能只更新其中一条
+   - `GetIssueNotification` 按 `(user_id, issue_id)` 查询时返回哪条取决于数据库返回顺序（ORDER BY 缺失）
+
+### 11.7 已知的代码注释与风险提示
+
+在 `modules/queue/workerqueue.go:178-179` 有明确的注释提示重复风险：
+
+```go
+// Has only works for unique queues. Keep in mind that this check may not be reliable
+// (due to lacking of proper transaction support)
+// There could be a small chance that duplicate items appear in the queue
+func (q *WorkerPoolQueue[T]) Has(data T) (bool, error) {
+    return q.baseQueue.HasItem(q.ctxRun, q.marshal(data))
+}
+```
+
+在 `modules/queue/workergroup.go:63-67` 也有 worker 并发的数据竞争提示：
+
+```go
+// TODO: the logic could be improved in the future, to avoid a data-race between
+// "doStartNewWorker" and "workerNum"
+// The root problem is that if we skip "doStartNewWorker" here, the "workerNum" might
+// be decreased by other workers later
+// So ideally, it should check whether there are enough workers by some approaches,
+// and start new workers if necessary.
+// This data-race is not serious, as long as a new worker will be started soon to
+// make sure there are enough workers, so no need to hugely refactor at the moment.
+```
+
+### 11.8 可能的修复方向
+
+#### 方案 1：添加数据库唯一约束（推荐）
+
+```sql
+ALTER TABLE notification ADD CONSTRAINT u_notification_user_issue UNIQUE (user_id, issue_id);
+```
+
+配合应用层修改 `createIssueNotification`：
+
+```go
+func createIssueNotification(ctx, userID, issue, commentID, authorID) error {
+    notification := &Notification{...}
+    _, err := db.GetEngine(ctx).Insert(notification)
+    if err != nil && isUniqueConstraintViolation(err) {
+        // 冲突时回退到更新逻辑
+        return updateIssueNotification(ctx, userID, issue.ID, commentID, authorID)
+    }
+    return err
+}
+```
+
+**优点**：从根本上解决并发问题，数据库保证原子性
+**缺点**：需要数据迁移，需要处理现有重复数据
+
+#### 方案 2：队列层去重
+
+将 `CreateSimpleQueue` 改为 `CreateUniqueQueue`：
+
+```go
+// services/uinotification/notify.go:46
+ns.issueQueue = queue.CreateUniqueQueue(...)  // unique=true
+```
+
+**优点**：队列层面防止相同 item 重复入队
+**缺点**：
+- 只能去重完全相同的 item，`CommentID` 不同的 item 仍会并发
+- 注释明确提示 `Has` 检查不可靠，仍有小概率重复
+
+#### 方案 3：应用层分布式锁
+
+基于 `(issueID, userID)` 加锁：
+
+```go
+lockKey := fmt.Sprintf("notify:%d:%d", issueID, userID)
+if err := lock.Acquire(lockKey); err != nil {
+    return err
+}
+defer lock.Release(lockKey)
+// 执行 createOrUpdate
+```
+
+**优点**：不需要数据库迁移
+**缺点**：引入额外依赖，性能开销大，锁粒度和失效时间难以平衡
+
+#### 方案 4：合并同一 Issue 的多个通知项
+
+在 `handler` 层面对同一 batch 内的 `issueNotificationOpts` 按 IssueID 聚合：
+
+```go
+func handler(items ...issueNotificationOpts) []issueNotificationOpts {
+    // 按 IssueID 分组，保留最新的 CommentID
+    grouped := make(map[int64]issueNotificationOpts)
+    for _, opts := range items {
+        existing, ok := grouped[opts.IssueID]
+        if !ok || opts.CommentID > existing.CommentID {
+            grouped[opts.IssueID] = opts
+        }
+    }
+    // 处理聚合后的 items
+    ...
+}
+```
+
+**优点**：不依赖外部系统，无迁移
+**缺点**：只能减少同一 batch 内的重复，无法解决跨 batch 并发问题
+
+---
+
+## 十二、核心文件索引
 
 | 文件 | 职责 |
 |-----|------|
 | `services/notify/notifier.go` | Notifier 接口定义 |
 | `services/notify/notify.go` | Notifier 注册与事件广播 |
-| `services/uinotification/notify.go` | 站内信 Notifier 实现 |
+| `services/uinotification/notify.go` | 站内信 Notifier 实现 + Queue 初始化 |
 | `services/mailer/notify.go` | 邮件 Notifier 实现 |
 | `services/mailer/mail_issue.go` | 邮件收件人计算与批量发送 (`SendIssueAssignedMail`) |
 | `services/mailer/mail_comment.go` | 评论邮件发送 (`MailParticipantsComment`, `MailMentionsComment`) |
@@ -1504,11 +1934,15 @@ if notification.Status == NotificationStatusRead {
 | `services/issue/pull.go` | Code Owner 审查逻辑 (`PullRequestCodeOwnersReview`, `ReviewRequestNotifier`) |
 | `services/issue/review_request.go` | 审查请求处理 (`ReviewRequest`, `TeamReviewRequest`, `ReviewRequestNotify`, `teamReviewRequestNotify`) |
 | `services/issue/commit.go` | 提交关键词关闭/重开 Issue |
-| `models/activities/notification.go` | 通知数据模型与 CRUD |
-| `models/activities/notification_list.go` | 站内信收件人聚合 (`CreateOrUpdateIssueNotifications`) |
+| `models/activities/notification.go` | 通知数据模型 + CRUD + 索引定义 |
+| `models/activities/notification_list.go` | 站内信收件人聚合 (`CreateOrUpdateIssueNotifications`) + 逻辑去重 (`notificationExists`) |
 | `models/issues/issue_watch.go` | Issue 级关注模型 |
 | `models/issues/issue_update.go` | @mention 解析 + Issue 关闭/重开 DB 操作 |
 | `models/issues/pull.go` | PR 模型 + WIP 前缀判断 |
 | `models/issues/review.go` | 审查请求 DB 操作 (`AddReviewRequest`, `AddTeamReviewRequest`) |
 | `models/repo/watch.go` | 仓库级关注模型与 WatchMode |
+| `models/migrations/v1_23/v309.go` | Notification 表索引迁移（确认无 UNIQUE 约束） |
+| `modules/queue/workerqueue.go` | WorkerPoolQueue 实现（Push/Run/Has） |
+| `modules/queue/workergroup.go` | Worker 调度与并发执行（doRun/doDispatchBatchToWorker/doStartNewWorker/doWorkerHandle） |
+| `modules/queue/manager.go` | Queue 管理器（CreateSimpleQueue/CreateUniqueQueue） |
 | `modules/references/references.go` | @mention 正则匹配与 Markdown 剥离 |

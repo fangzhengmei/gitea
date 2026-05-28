@@ -434,17 +434,43 @@ const (
 
 **位置**: `routers/web/repo/pull_merge_box.go:146-170` + `issue_view.go:1040-1080`
 
-| 状态 | 判断逻辑 | UI 文案 |
-|------|---------|---------|
-| 不可合并 | `!pull.IsStatusMergeable() && !pull.IsEmpty()` | "This pull request can't be merged" + "Ask someone with write access to merge this pull request manually" |
-| 空 PR | `pull.IsEmpty()` | "This pull request is empty" |
-| 无合并权限 | `!hasPermToMerge` | "You're not authorized to merge this pull request" |
-| Status Check 失败 | `enableStatusCheck && !RequiredChecksState.IsSuccess()` | "Required status checks have failed" |
-| 审批不足 | `!HasEnoughApprovals()` | "1/2 Approvals" |
-| 拒绝审查 | `MergeBlockedByRejectedReview()` | "Blocked by rejection" |
-| 分支过时 | `MergeBlockedByOutdatedBranch()` | "The head branch is behind the base branch" |
-| 受保护文件变更 | `ChangedProtectedFiles` | "Changed 1 protected file" |
-| 签名要求不满足 | `requireSigned && !willSign` | "Requires signed commits" |
+| 状态 | 判断逻辑 | UI 文案 | 能否绕过 |
+|------|---------|---------|---------|
+| 不可合并 | `!pull.IsStatusMergeable() && !pull.IsEmpty()` | "This pull request can't be merged" + "Ask someone with write access to merge this pull request manually" | 否¹ |
+| 空 PR | `pull.IsEmpty()` | "This pull request is empty" | 否² |
+| 无合并权限 | `!hasPermToMerge` | "You're not authorized to merge this pull request" | 否 |
+| Status Check 失败 | `enableStatusCheck && !RequiredChecksState.IsSuccess()` | "Required status checks have failed" | 是 |
+| 审批不足 | `!HasEnoughApprovals()` | "1/2 Approvals" | 是 |
+| 拒绝审查 | `MergeBlockedByRejectedReview()` | "Blocked by rejection" | 是 |
+| 分支过时 | `MergeBlockedByOutdatedBranch()` | "The head branch is behind the base branch" | 是 |
+| 受保护文件变更 | `ChangedProtectedFiles` | "Changed 1 protected file" | 是 |
+| 签名要求不满足 | `requireSigned && !willSign` | "Requires signed commits" | **否³** |
+
+**重要注释**：
+¹ 注释说"can be bypassed by admin"，但实际受 `mergeStyles` 生成限制
+² 空 PR 状态下 `mergeStyles` 不会生成正常合并选项
+³ **签名要求不能被绕过** - 检查在 `CheckPullMergeable` 的 forceMerge 逻辑之后执行
+
+---
+
+#### 8.2.4 签名要求的特殊处理
+
+**⚠️ 关键发现**：签名要求不被算作 `hasOverridableBlockers`，但通过独立的与运算影响结果。
+
+**代码位置**: `routers/web/repo/issue_view.go:968-970`
+```go
+data.canMergeNow = (!data.hasOverridableBlockers || data.canBypassProtection) &&
+    (!data.requireSigned || data.willSign)
+```
+
+**执行顺序** (`services/pull/check.go:179-221`):
+```
+CheckPullMergeable
+├─ CheckPullBranchProtections → forceMerge 可跳过此检查
+└─ checkSigningRequirements   → forceMerge 不可跳过此检查（在绕过逻辑之后）
+```
+
+**结论**：即使启用了 forceMerge，签名要求仍然必须满足。签名检查是**唯一不能被绕过**的保护规则。
 
 ### 8.3 按钮可用性与 `canMergeNow` 深层解析
 
@@ -499,6 +525,25 @@ const forceMerge = computed(() => {
   return mergeForm.canMergeNow && !mergeForm.allOverridableChecksOk;
 });
 ```
+
+---
+
+#### 8.3.3.1 红色按钮原因的澄清
+
+**⚠️ 常见误判：签名要求不满足导致红色按钮？**
+
+| 状态 | 结果 | 原因 |
+|------|------|------|
+| `requireSigned=true` 且 `willSign=false` | `canMergeNow=false` | 按钮不显示或只显示自动合并（非红色） |
+| `allOverridableChecksOk=false` 且 `canMergeNow=true` | 红色按钮（强制合并） | 有 protection blocker 但可绕过 |
+| `mergeStyle=manually-merged` | 红色按钮 | 手动合并方式 |
+
+**关键结论**：
+- 签名要求不满足 **不会** 导致红色按钮，而是导致 `canMergeNow=false`
+- 红色按钮只在两种情况下出现：
+  1. 有 protection blocker（审批/CI/分支过时等）但可以绕过（forceMerge）
+  2. 选择了手动合并方式（manually-merged）
+- 签名要求不满足时，用户甚至看不到合并按钮（只能设置自动合并）
 
 #### 8.3.4 `hasOverridableBlockers` 的注释提示
 
@@ -1006,6 +1051,75 @@ CommitStatusCheckPrompt 决策树：
 
 ---
 
+### 12.8 "签名要求导致按钮不可用"
+
+**根因**：签名要求不被算作 overridable blocker，但通过独立的与运算影响结果
+
+**排查步骤**：
+
+1. **检查 `requireSigned` 是否为 true**
+   - 确认分支保护规则中 `RequireSignedCommits` 是否启用
+   - 代码位置：`issue_view.go:493`
+
+2. **检查 `willSign` 的值**
+   - 调用 `asymkey_service.SignMerge()` 检查 Gitea 是否能为当前用户签名
+   - 代码位置：`issue_view.go:497`
+
+3. **检查 wontSign 原因**
+   - `ErrWontSign` 的可能原因：
+     - `no-key`: 用户没有配置 GPG 密钥
+     - `not-signing`: Gitea 未配置签名密钥
+     - `email-mismatch`: 用户邮箱与 GPG 密钥邮箱不匹配
+     - `error`: 其他错误
+   - 代码位置：`issue_view.go:501-506`
+
+4. **检查合并方式的签名要求差异**
+   | 合并方式 | 签名要求 |
+   |---------|---------|
+   | fast-forward-only | 用户提交必须全部已签名 |
+   | merge | 用户提交必须全部已签名 + Gitea 必须能签名合并提交 |
+   | rebase/rebase-merge/squash | Gitea 必须能签名生成的提交 |
+   - 代码位置：`services/pull/check.go:256-269`
+
+---
+
+### 12.9 签名问题最小排查流程
+
+**当遇到签名相关的按钮不可用时，按以下顺序快速排查**：
+
+```
+第 1 步：确认现象
+├─ 按钮完全不显示？ → 检查 hasPermToMerge
+├─ 只有 "Auto-merge" 选项？ → canMergeNow=false，检查签名要求
+└─ 按钮显示红色？ → 不是签名问题，检查 overridable blockers
+
+第 2 步：检查签名配置
+├─ 仓库：Repo Settings → Branch Protection → Require Signed Commits
+├─ 用户：User Settings → GPG Keys → 确认密钥存在且邮箱匹配
+└─ Gitea 服务器：app.ini → [repository.signing] 配置
+
+第 3 步：代码层验证（快速断点）
+├─ issue_view.go:493 → data.requireSigned = ?
+├─ issue_view.go:498 → data.willSign = ?
+├─ issue_view.go:502 → wontSignReason = ?
+└─ issue_view.go:969 → canMergeNow 计算结果
+
+第 4 步：验证后端检查
+└─ services/pull/check.go:219 → checkSigningRequirements 能否通过
+```
+
+**常见错误原因对照表**：
+
+| 现象 | 最可能原因 | 解决方法 |
+|------|-----------|---------|
+| `wontSignReason = "no-key"` | 用户未配置 GPG 密钥 | 用户在设置中添加 GPG 密钥 |
+| `wontSignReason = "email-mismatch"` | GPG 密钥邮箱与提交邮箱不匹配 | 更新密钥邮箱或使用匹配的邮箱提交 |
+| `wontSignReason = "not-signing"` | Gitea 未配置签名密钥 | 管理员配置 Gitea 的 [repository.signing] |
+| `requireSigned=true` 但 FF 合并不可用 | 用户提交未全部签名 | 用户需要重新签名提交 |
+| 管理员强制合并也不可用 | 签名要求不能被绕过 | 必须满足签名要求或使用手动合并标记 |
+
+---
+
 ## 十三、关键代码位置速查表
 
 | 功能 | 文件位置 | 行号 |
@@ -1038,4 +1152,8 @@ CommitStatusCheckPrompt 决策树：
 | 保护规则变更触发重检 | `services/pull/protected_branch.go` | - |
 | Merge Box 模板 | `templates/repo/issue/view_content/pull_merge_box.tmpl` | 1 |
 | Status Check 详情模板 | `templates/repo/issue/view_content/pull_merge_status_checks.tmpl` | 1 |
-| 签名要求检查 | `routers/web/repo/issue_view.go` | 497 |
+| 签名要求检查 | `routers/web/repo/issue_view.go` | 488 |
+| 签名要求后端校验 | `services/pull/check.go` | 219 |
+| 合并方式签名差异 | `services/pull/check.go` | 233 |
+| SignMerge 函数 | `services/asymkey/sign.go` | - |
+| ErrWontSign 定义 | `services/asymkey/sign.go` | - |

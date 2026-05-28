@@ -282,6 +282,40 @@ func IsUserOfficialReviewer(ctx context.Context, protectBranch *ProtectedBranch,
 }
 ```
 
+### 5.3 绕过分支保护权限矩阵
+
+**核心函数**: `CanBypassBranchProtection` (`models/git/protected_branch.go:212-231`)
+
+```go
+func CanBypassBranchProtection(ctx context.Context, protectBranch *ProtectedBranch, user *user_model.User, isRepoAdmin bool) bool {
+    if isRepoAdmin && !protectBranch.BlockAdminMergeOverride {
+        return true  // 管理员且未被阻止 → 可以绕过
+    }
+    if !protectBranch.EnableBypassAllowlist {
+        return false  // 未启用绕过白名单 → 不能绕过
+    }
+    // 检查用户/团队是否在绕过白名单中
+    return inBypassAllowlist
+}
+```
+
+**完整条件矩阵**：
+
+| 用户角色 | `BlockAdminMergeOverride` | `EnableBypassAllowlist` | 在绕过白名单中 | `canBypassProtection` | 说明 |
+|---------|--------------------------|------------------------|---------------|----------------------|------|
+| 非管理员 | 任意 | `false` | 任意 | `false` | 非管理员且白名单禁用 → 不能绕过 |
+| 非管理员 | 任意 | `true` | 否 | `false` | 不在白名单中 → 不能绕过 |
+| 非管理员 | 任意 | `true` | 是 | `true` | 在白名单中 → 可以绕过 |
+| 管理员 | `false` | 任意 | 任意 | `true` | 管理员未被阻止 → 可以绕过 |
+| 管理员 | `true` | `false` | 任意 | `false` | 管理员被阻止且白名单禁用 → 不能绕过 |
+| 管理员 | `true` | `true` | 否 | `false` | 管理员被阻止且不在白名单 → 不能绕过 |
+| 管理员 | `true` | `true` | 是 | `true` | 管理员被阻止但在白名单 → 可以绕过 |
+
+**关键点**：
+- 管理员默认可以绕过，除非 `BlockAdminMergeOverride=true`
+- 非管理员只能通过绕过白名单获得绕过权限
+- 绕过权限只影响 `canMergeNow`，不影响 `mergeStyles` 生成（仍需 `IsStatusMergeable()==true`）
+
 ---
 
 ## 六、PR 状态流转与检查队列
@@ -371,7 +405,21 @@ const (
 - `hasOverridableBlockers && !canBypassProtectionAsAdmin` → "Only users in the bypass allowlist can merge this pull request with failing checks" (⚫)
 - `canMergeNow && !hasOverridableBlockers` → "This pull request can be merged automatically" (✓ 绿色)
 
-### 8.2 Commit-level 阻断（不可绕过）
+### 8.2 Blocker 分类与绕过能力
+
+#### 8.2.1 两类 Blocker 的定义
+
+| Blocker 类型 | 包含情况 | 判定代码 | 能否绕过 |
+|-------------|---------|---------|---------|
+| **Commit Blocker** | 冲突、数据损坏、检查中、祖先提交 | `pull_merge_box.go:109-144` | **不可绕过** |
+| **Protection Blocker** | 审批不足、拒绝审查、Status Check 失败、分支过时、受保护文件变更、签名要求不满足 | `issue_view.go:957-959` + `pull_merge_box.go:146-163` | **可绕过**（需要权限） |
+
+**重要修正**：`!IsStatusMergeable() && !IsEmpty()` 被添加到 `infoProtectionBlockers`（代码注释说"can be bypassed by admin"），但这是**半真半假**的说法：
+- 从 `canMergeNow` 的计算看，它确实**不把**非 Mergeable 状态作为 overridable blocker 考虑
+- 但 `mergeStyles` 的生成**要求** `IsStatusMergeable() == true`（`pull_merge_form.go:109`）
+- 实际效果：即使 `canMergeNow == true`，如果 `IsStatusMergeable() == false`，也**没有可用的合并方式**（除手动合并外）
+
+#### 8.2.2 commit blocker 详细列表
 
 **位置**: `routers/web/repo/pull_merge_box.go:109-144`
 
@@ -381,29 +429,60 @@ const (
 | 数据损坏 | `prInfo.IsPullRequestBroken` | "Data broken" |
 | 检查中 | `pull.IsChecking()` | "This pull request is still being checked" |
 | 祖先提交 | `pull.IsAncestor()` | "The head commit is already in the base branch" |
+
+#### 8.2.3 protection blocker 详细列表
+
+**位置**: `routers/web/repo/pull_merge_box.go:146-170` + `issue_view.go:1040-1080`
+
+| 状态 | 判断逻辑 | UI 文案 |
+|------|---------|---------|
 | 不可合并 | `!pull.IsStatusMergeable() && !pull.IsEmpty()` | "This pull request can't be merged" + "Ask someone with write access to merge this pull request manually" |
 | 空 PR | `pull.IsEmpty()` | "This pull request is empty" |
+| 无合并权限 | `!hasPermToMerge` | "You're not authorized to merge this pull request" |
+| Status Check 失败 | `enableStatusCheck && !RequiredChecksState.IsSuccess()` | "Required status checks have failed" |
+| 审批不足 | `!HasEnoughApprovals()` | "1/2 Approvals" |
+| 拒绝审查 | `MergeBlockedByRejectedReview()` | "Blocked by rejection" |
+| 分支过时 | `MergeBlockedByOutdatedBranch()` | "The head branch is behind the base branch" |
+| 受保护文件变更 | `ChangedProtectedFiles` | "Changed 1 protected file" |
+| 签名要求不满足 | `requireSigned && !willSign` | "Requires signed commits" |
 
-**关键区别**: Commit-level 阻断（冲突、检查中、祖先）属于 `infoCommitBlockers`，**不可通过管理员权限绕过**；Protection-level 阻断（审批、status check 等）属于 `infoProtectionBlockers`，**可绕过**。
+### 8.3 按钮可用性与 `canMergeNow` 深层解析
 
-### 8.3 按钮禁用状态逻辑
+**⚠️ 关键修正**：`canMergeNow` 只是一个标志，**不直接决定合并按钮是否显示**。真正决定按钮可用性的是 `mergeStyles` 的生成逻辑。
+
+#### 8.3.1 canMergeNow 的真实含义
+
+**代码位置**: `routers/web/repo/issue_view.go:968-970`
+```go
+// CanMergeNow means: if the doer has write permission, whether the PR can be merged now
+data.canMergeNow = (!data.hasOverridableBlockers || data.canBypassProtection) && // status checks are satisfied
+    (!data.requireSigned || data.willSign) // signing requirement is satisfied
+```
+
+**注意**：`canMergeNow` **不检查** `IsStatusMergeable()`！它只检查 overridable blockers 和签名要求。
+
+#### 8.3.2 mergeStyles 生成条件（真正的可用性闸口）
+
+**代码位置**: `routers/web/repo/pull_merge_form.go:109-168`
+
+| 合并方式 | 生成条件 |
+|---------|---------|
+| 正常合并 (merge/rebase/squash/ff) | `IsStatusMergeable() == true` + 仓库启用对应方式 |
+| 手动合并 (manually-merged) | `!IsWorkInProgress()` + `!IsChecking()` + `AllowManualMerge == true` |
+
+**结论**：即使 `canMergeNow == true`，如果 `IsStatusMergeable() == false`，也只能使用手动合并方式。
+
+#### 8.3.3 前端按钮行为逻辑
 
 **前端组件**: `web_src/js/components/PullRequestMergeForm.vue`
 
-**核心变量传递**:
-```go
-// routers/web/repo/issue_view.go:968-970
-data.canMergeNow = (!data.hasOverridableBlockers || data.canBypassProtection) &&
-    (!data.requireSigned || data.willSign)
-```
-
-| 场景 | `canMergeNow` | 按钮行为 | 可用操作 |
-|------|--------------|---------|---------|
-| 无任何阻断 | `true` | 启用（绿色） | 立即合并 |
-| 有阻断但可绕过 | `true` | 启用（红色 "Force Merge"） | 强制合并 |
-| 有阻断不可绕过 | `false` | 禁用/隐藏 | 仅可设置自动合并 |
-| 正在检查中 | 取决于 `hasOverridableBlockers` | 检查中状态 | 等待 |
-| 有冲突 | `false` (commit blocker) | 禁用 | 手动合并（如启用） |
+| `canMergeNow` | `IsStatusMergeable()` | `mergeStyles` 非空 | 按钮行为 | 可用操作 |
+|--------------|----------------------|-------------------|---------|---------|
+| `true` | `true` | 是 | 启用 | 立即合并 + 自动合并（可选） |
+| `true` | `false` | 仅手动合并 | 启用 | 手动标记为已合并 |
+| `false` | `true` | 是 | 下拉仅显示「自动合并」 | 只能设置自动合并 |
+| `false` | `false` | 仅手动合并 | 启用（如允许） | 手动标记为已合并 |
+| 任意 | 任意 | 否 | Vue 组件不挂载 | 无合并按钮 |
 
 **按钮样式逻辑** (`PullRequestMergeForm.vue:33-37`):
 ```typescript
@@ -421,7 +500,84 @@ const forceMerge = computed(() => {
 });
 ```
 
-### 8.4 Merge Box 图标颜色规则
+#### 8.3.4 `hasOverridableBlockers` 的注释提示
+
+**代码位置**: `routers/web/repo/issue_view.go:954-959`
+
+```go
+// HINT: if a PR's status is not mergeable, then it is a non-overridable blocker, such logic is handled separately (see IsStatusMergeable)
+data.hasOverridableBlockers = data.isBlockedByApprovals || data.isBlockedByRejection ||
+    data.isBlockedByOfficialReviewRequests || data.isBlockedByOutdatedBranch || data.isBlockedByChangedProtectedFiles ||
+    data.hasStatusCheckBlocker
+```
+
+**这段注释非常重要**：它明确说明非 Mergeable 状态是**不可绕过**的，由 `IsStatusMergeable` 单独处理（即通过 `mergeStyles` 生成逻辑）。
+
+### 8.4 完整条件决策矩阵
+
+#### 8.4.1 合并可用性总表
+
+```
+场景 1: 完美可合并
+├─ IsStatusMergeable()  = true
+├─ 无 commit blocker
+├─ hasOverridableBlockers = false
+├─ canMergeNow          = true
+└─ 可用方式: 全部正常合并方式 (merge/rebase/squash/ff)
+
+场景 2: 可强制合并
+├─ IsStatusMergeable()  = true
+├─ 无 commit blocker
+├─ hasOverridableBlockers = true
+├─ canBypassProtection  = true
+├─ canMergeNow          = true
+└─ 可用方式: 强制合并（红色按钮）
+
+场景 3: 仅能自动合并
+├─ IsStatusMergeable()  = true
+├─ 无 commit blocker
+├─ hasOverridableBlockers = true
+├─ canBypassProtection  = false
+├─ canMergeNow          = false
+└─ 可用方式: 下拉菜单仅显示「自动合并」
+
+场景 4: 有 commit blocker
+├─ IsStatusMergeable()  = false 或 检查中/冲突
+├─ 有 commit blocker
+└─ 可用方式: 仅手动合并（如启用）
+
+场景 5: 能 bypass 但状态非 Mergeable
+├─ IsStatusMergeable()  = false
+├─ 无 commit blocker
+├─ canBypassProtection  = true
+├─ canMergeNow          = true
+└─ 可用方式: 仅手动合并（无正常合并选项）
+
+场景 6: 完全无法合并
+├─ IsStatusMergeable()  = false
+├─ 无 commit blocker
+├─ canBypassProtection  = false
+├─ canMergeNow          = false
+└─ 可用方式: 仅手动合并（如启用）
+```
+
+**记忆口诀**：
+- `IsStatusMergeable() == false` → 无正常合并选项（只能手动）
+- `canMergeNow == false` → 无法立即合并（只能自动合并）
+
+#### 8.4.2 常见排查场景速查表
+
+| 现象 | 可能原因 | 验证方法 |
+|------|---------|---------|
+| 🔴 红色图标但只有 "Checking" 文字 | 有 protection blocker 但被 commit blocker 隐藏 | 检查 `infoCommitBlockers` 是否非空 |
+| ⚪ 有审批但计数不足 | Review 的 `official=false` | 检查审查者是否在审批白名单 |
+| 🟢 CI 全绿但按钮禁用 | 必填 context 配置了但未上报 | 检查 `MissingRequiredChecks` |
+| 🔴 管理员无法强制合并 | `BlockAdminMergeOverride=true` 或 `IsStatusMergeable()==false` | 检查保护规则配置 + PR 状态 |
+| ⚪ 能看到按钮但只有 "Auto-merge" | `canMergeNow==false` 但 `mergeStyles` 非空 | 检查 overridable blockers |
+| ❌ 完全看不到合并按钮 | `mergeStyles` 为空 | 检查 `IsStatusMergeable()` 和合并方式配置 |
+| 🟢 显示 "Can be merged" 但按钮红色 | `canMergeNow==true` 但 `allOverridableChecksOk==false` | 这是正常的强制合并状态 |
+
+### 8.5 Merge Box 图标颜色规则
 
 **位置**: `routers/web/repo/pull_merge_box.go:54-88`
 
@@ -770,14 +926,19 @@ CommitStatusCheckPrompt 决策树：
 
 2. **检查 BlockAdminMergeOverride**
    - `BlockAdminMergeOverride=true` → 即使是仓库管理员也不能绕过
-   - 代码位置：`models/git/protected_branch.go`
+   - 代码位置：`models/git/protected_branch.go:213`
 
 3. **检查 EnableBypassAllowlist**
-   - `EnableBypassAllowlist=true` → 管理员不再自动拥有绕过权，需在白名单中
-   - `EnableBypassAllowlist=false` → 管理员自动拥有绕过权
-   - 代码位置：`models/git/protected_branch.go:212`
+   - `EnableBypassAllowlist` 只影响**非管理员**用户的绕过权限
+   - 管理员的绕过权由 `BlockAdminMergeOverride` 单独控制，不受 `EnableBypassAllowlist` 影响
+   - 代码位置：`models/git/protected_branch.go:212-215`
 
-4. **检查签名要求的与运算**
+4. **检查 IsStatusMergeable 状态**
+   - **最常见原因**：`IsStatusMergeable()==false` 时 `mergeStyles` 不会生成正常合并选项
+   - 即使 `canMergeNow==true`，如果 `IsStatusMergeable()==false`，也只能用手动合并
+   - 代码位置：`routers/web/repo/pull_merge_form.go:109`
+
+5. **检查签名要求的与运算**
    - `canMergeNow = (!hasOverridableBlockers || canBypassProtection) && (!requireSigned || willSign)`
    - 签名要求是独立条件，即使能绕过保护规则，签名不满足也无法合并
    - 代码位置：`routers/web/repo/issue_view.go:969`

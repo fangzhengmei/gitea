@@ -924,7 +924,264 @@ func (m *mailNotifier) IssueChangeTitle(ctx, doer, issue, oldTitle) {
 
 ---
 
-## 九、核心文件索引
+## 九、Code Owner 审查请求通知链路
+
+Code Owner 审查请求是 PR 从 WIP 切到 Ready 时自动触发的特殊通知路径，与普通评论/状态变更的广播模式不同，采用**定向分发**模式——只通知指定的评审人，不通知全体关注者。
+
+### 9.1 触发入口与路径
+
+Code Owner 审查请求有两个触发时机：
+
+| 触发场景 | 代码位置 |
+|---------|---------|
+| PR 创建时（非 WIP） | `services/pull/pull.go:144-149` |
+| WIP → Ready 切换时 | `services/issue/issue.go:95-104` |
+
+**核心调用链路**：
+
+```
+PR 创建 或 WIP→Ready
+    │
+    └─ issue_service.PullRequestCodeOwnersReview(ctx, pr)
+        │
+        ├─ ① 读取 CODEOWNERS 文件（查找顺序：CODEOWNERS → docs/CODEOWNERS → .gitea/CODEOWNERS）
+        ├─ ② 解析规则：glob 模式匹配变更文件
+        ├─ ③ 匹配得到 uniqUsers 和 uniqTeams
+        ├─ ④ 过滤：排除 PR 作者、排除已有审查记录的用户
+        ├─ ⑤ 为每个用户调用 AddReviewRequest()
+        │      ├─ 创建 review 记录（ReviewTypeRequest）
+        │      └─ 创建 CommentTypeReviewRequest 评论
+        ├─ ⑥ 为每个团队调用 AddTeamReviewRequest()
+        │      └─ 创建团队 review 记录 + 评论
+        └─ 返回 ReviewRequestNotifier 列表（每个待通知的评审人/团队一条）
+    │
+    └─ issue_service.ReviewRequestNotify(ctx, issue, poster, notifiers)
+        │
+        └─ for each notifier:
+            if 单个用户:
+                notify_service.PullRequestReviewRequest(reviewer=notifier.Reviewer)
+            if 团队:
+                teamReviewRequestNotify(notifier.ReviewTeam)
+                    └─ GetTeamMembers()
+                       for each member:
+                           if member.ID != PosterID:
+                               notify_service.PullRequestReviewRequest(reviewer=member)
+```
+
+### 9.2 关键数据结构
+
+**`services/issue/pull.go:20-25`**
+
+```go
+type ReviewRequestNotifier struct {
+    Comment    *issues_model.Comment   // ReviewRequest 类型的评论
+    IsAdd      bool                    // true=添加审查请求
+    Reviewer   *user_model.User        // 单个评审人（互斥）
+    ReviewTeam *org_model.Team         // 评审团队（互斥）
+}
+```
+
+### 9.3 CODEOWNERS 文件解析与匹配
+
+**`services/issue/pull.go:33-166`** (`PullRequestCodeOwnersReview`)
+
+```go
+// 前置条件检查
+if pr.IsWorkInProgress(ctx)    { return nil, nil }  // WIP 不触发
+if pr.BaseRepo.IsFork            { return nil, nil }  // Fork 仓库不触发
+
+// ① 读取 CODEOWNERS（默认分支）
+for _, file := range ["CODEOWNERS", "docs/CODEOWNERS", ".gitea/CODEOWNERS"] {
+    if blob, err := commit.GetBlobByPath(file); err == nil {
+        data = blob.GetBlobContent()
+        break
+    }
+}
+
+// ② 解析规则
+rules, _ := issues_model.GetCodeOwnersFromContent(ctx, data)
+
+// ③ 获取变更文件列表（mergeBase 与 head 之间）
+mergeBase, _ := gitrepo.MergeBase(ctx, pr.BaseRepo, baseBranch, headRef)
+changedFiles, _ := repo.GetFilesChangedBetween(mergeBase, pr.GetGitHeadRefName())
+
+// ④ 匹配变更文件，收集用户与团队
+uniqUsers := make(map[int64]*user_model.User)
+uniqTeams := make(map[string]*org_model.Team)  // key: "orgID/teamID"
+for _, rule := range rules {
+    for _, f := range changedFiles {
+        matched, _ := rule.Rule.MatchString(f)
+        if matched {
+            for _, u := range rule.Users { uniqUsers[u.ID] = u }
+            for _, t := range rule.Teams { uniqTeams[key(t)] = t }
+        }
+    }
+}
+
+// ⑤ 排除 PR 作者与已有审查记录的用户
+for _, u := range uniqUsers {
+    if u.ID != issue.Poster.ID && !contain(latestReviews, u) {
+        comment, _ := issues_model.AddReviewRequest(ctx, issue, u, poster, true)
+        if comment != nil {
+            notifiers = append(notifiers, &ReviewRequestNotifier{
+                Comment: comment, IsAdd: true, Reviewer: u,
+            })
+        }
+    }
+}
+
+// ⑥ 团队审查请求
+for _, t := range uniqTeams {
+    comment, _ := issues_model.AddTeamReviewRequest(ctx, issue, t, poster, true)
+    if comment != nil {
+        notifiers = append(notifiers, &ReviewRequestNotifier{
+            Comment: comment, IsAdd: true, ReviewTeam: t,
+        })
+    }
+}
+```
+
+**Code Owner 元数据标记**：`AddReviewRequest` 的最后一个参数 `isCodeOwners=true` 时，会在评论元数据中标记 `SpecialDoerNameCodeOwners`，用于前端展示"Requested review by code owners"。
+
+### 9.4 团队审查请求的成员展开
+
+**`services/issue/review_request.go:210-233`** (`teamReviewRequestNotify`)
+
+```go
+func teamReviewRequestNotify(ctx, issue, doer, reviewerTeam, isAdd, comment) error {
+    // ① 获取团队所有成员
+    members, _ := organization.GetTeamMembers(ctx, &SearchMembersOptions{
+        TeamID: reviewerTeam.ID,
+    })
+
+    // ② 逐个成员发送审查请求通知
+    for _, member := range members {
+        if member.ID == comment.Issue.PosterID {
+            continue  // 排除 PR 作者
+        }
+        comment.AssigneeID = member.ID  // 复用 Comment，设置 AssigneeID
+        notify_service.PullRequestReviewRequest(ctx, doer, issue, member, isAdd, comment)
+    }
+    return nil
+}
+```
+
+**注意**：团队审查请求不直接通知团队，而是**展开为每个成员的单独通知**。这与站内信/邮件的实现一致——两者都只处理单个 `reviewer` 用户，不处理团队概念。
+
+### 9.5 站内信：定向通知
+
+**`services/uinotification/notify.go:238-252`**
+
+```go
+func (ns *notificationService) PullRequestReviewRequest(ctx, doer, issue, reviewer, isRequest, comment) {
+    if isRequest {
+        opts := issueNotificationOpts{
+            IssueID:              issue.ID,
+            NotificationAuthorID: doer.ID,
+            ReceiverID:           reviewer.ID,  // 定向推送
+        }
+        if comment != nil {
+            opts.CommentID = comment.ID       // 关联到 ReviewRequest 评论
+        }
+        _ = ns.issueQueue.Push(opts)
+    }
+}
+```
+
+**站内信关键特性**：
+- **定向推送**：`ReceiverID = reviewer.ID`，跳过通用的广播逻辑
+- **跳过 unwatch 检查**：因为 `ReceiverID > 0`，`createOrUpdateIssueNotifications` 会直接创建/更新通知，不检查 Issue 级显式忽略
+- **关联评论**：`CommentID = comment.ID`，站内信可定位到具体的审查请求评论
+- **去重由上游保证**：`AddReviewRequest` 在 DB 层面会检查 reviewer 是否已存在审查请求，重复添加会返回 `comment=nil`，不会触发通知
+
+### 9.6 邮件：定向通知
+
+**`services/mailer/notify.go:129-136`**
+
+```go
+func (m *mailNotifier) PullRequestReviewRequest(ctx, doer, issue, reviewer, isRequest, comment) {
+    if isRequest && doer.ID != reviewer.ID && reviewer.EmailNotificationsPreference != EmailNotificationsDisabled {
+        ct := fmt.Sprintf("Requested to review %s.", issue.HTMLURL(ctx))
+        if err := SendIssueAssignedMail(ctx, issue, doer, ct, comment, []*user_model.User{reviewer}); err != nil {
+            log.Error("Error in SendIssueAssignedMail ...: %v", err)
+        }
+    }
+}
+```
+
+**邮件关键特性**：
+- **定向推送**：收件人列表 `[]*user_model.User{reviewer}` 只有一人
+- **前置过滤三层**：
+  1. `isRequest`：只有添加审查请求才发，移除不发
+  2. `doer.ID != reviewer.ID`：排除自己请求自己审查
+  3. `reviewer.EmailNotificationsPreference != Disabled`：检查邮件偏好
+- **复用 Assigned 邮件模板**：邮件主题/正文模板与分配 Issue 相同，仅 content 文本不同（`"Requested to review ..."`）
+
+### 9.7 邮件发送流程：`SendIssueAssignedMail`
+
+**`services/mailer/mail_issue.go:186-217`**
+
+```go
+func SendIssueAssignedMail(ctx, issue, doer, content, comment, recipients) error {
+    // ① 按语言分组，与批量邮件一致
+    langMap := make(map[string][]*user_model.User)
+    for _, user := range recipients {
+        if !user.IsActive {
+            continue  // 过滤非活跃用户
+        }
+        langMap[user.Language] = append(langMap[user.Language], user)
+    }
+
+    // ② 逐语言发送
+    for lang, tos := range langMap {
+        msgs, err := composeIssueCommentMessages(ctx, &mailComment{
+            Issue:      issue,
+            Doer:       doer,
+            ActionType: ActionType(0),  // 特殊：无 ActionType
+            Content:    content,        // "Requested to review ..."
+            Comment:    comment,
+        }, lang, tos, false, "issue assigned")  // 使用 issue assigned 模板
+        if err == nil {
+            SendAsync(msgs...)
+        }
+    }
+    return nil
+}
+```
+
+### 9.8 去重逻辑对比
+
+| 层级 | 站内信 | 邮件 |
+|-----|--------|------|
+| **DB 层面** | `AddReviewRequest` 检查 reviewer 是否已有审查记录，重复添加返回 `comment=nil` | 同站内信（共享同一 DB 检查） |
+| **用户排除** | 无（因为 `ReceiverID>0` 跳过 unwatch 排除） | `doer.ID != reviewer.ID` + `EmailNotificationsPreference != Disabled` |
+| **团队成员展开** | 无（团队在上游已展开为成员） | 无（团队在上游已展开为成员） |
+| **作者排除** | `teamReviewRequestNotify` 中排除 `member.ID == PosterID` | 同站内信（共享同一上游） |
+| **非活跃用户** | 由 DB JOIN 条件保证 | `SendIssueAssignedMail` 中显式检查 `user.IsActive` |
+
+### 9.9 三种审查请求入口的一致性
+
+审查请求有三个独立入口，最终都走到同一个通知路径：
+
+| 入口 | 触发位置 | 通知路径 |
+|-----|---------|---------|
+| Code Owner 自动请求 | `PullRequestCodeOwnersReview` | `ReviewRequestNotify` → `PullRequestReviewRequest` |
+| 用户手动添加评审人 | `services/issue/review_request.go:ReviewRequest` | 直接 `notify_service.PullRequestReviewRequest` |
+| 用户手动添加评审团队 | `services/issue/review_request.go:TeamReviewRequest` | `teamReviewRequestNotify` → `PullRequestReviewRequest` |
+
+三者共享同一个 `PullRequestReviewRequest` notifier 事件，所以站内信和邮件的行为完全一致。
+
+### 9.10 关键断点与注意事项
+
+1. **WIP 不触发 Code Owner**：`PullRequestCodeOwnersReview` L38-39 明确检查 `pr.IsWorkInProgress(ctx)`，WIP PR 直接返回 nil
+2. **Fork 仓库不触发 Code Owner**：L49-51 检查 `pr.BaseRepo.IsFork`，fork 的目标仓库不触发
+3. **团队审查请求只发添加通知**：`TeamReviewRequest` L191-193 中 `if comment == nil || !isAdd` 直接 return，移除团队审查请求不发通知
+4. **代码作者排除**：团队成员展开时排除 PR 作者（`member.ID == comment.Issue.PosterID`），但 Code Owner 用户过滤时也排除了作者，所以是双重保险
+5. **已有审查者不再通知**：`PullRequestCodeOwnersReview` L133 的 `!contain(latestReviews, u)` 检查避免重复通知已有审查记录的用户
+
+---
+
+## 十、核心文件索引
 
 | 文件 | 职责 |
 |-----|------|
@@ -932,19 +1189,23 @@ func (m *mailNotifier) IssueChangeTitle(ctx, doer, issue, oldTitle) {
 | `services/notify/notify.go` | Notifier 注册与事件广播 |
 | `services/uinotification/notify.go` | 站内信 Notifier 实现 |
 | `services/mailer/notify.go` | 邮件 Notifier 实现 |
-| `services/mailer/mail_issue.go` | 邮件收件人计算与批量发送 |
+| `services/mailer/mail_issue.go` | 邮件收件人计算与批量发送 (`SendIssueAssignedMail`) |
 | `services/mailer/mail_comment.go` | 评论邮件发送 (`MailParticipantsComment`, `MailMentionsComment`) |
 | `services/mailer/mail_issue_common.go` | 邮件公共结构 (`mailComment`, `composeIssueCommentMessages`) |
 | `services/mailer/mailer.go` | 邮件队列与发送 |
 | `services/pull/merge.go` | PR 合并逻辑 (`Merge`, `MergedManually`, `SetMerged`) |
+| `services/pull/pull.go` | PR 创建与 code owner 审查触发 |
 | `services/automerge/automerge.go` | PR 自动合并逻辑 |
 | `services/issue/status.go` | Issue/PR 关闭与重开 (`CloseIssue`, `ReopenIssue`) |
 | `services/issue/issue.go` | Issue 创建与标题变更 (`NewIssue`, `ChangeTitle`) |
+| `services/issue/pull.go` | Code Owner 审查逻辑 (`PullRequestCodeOwnersReview`, `ReviewRequestNotifier`) |
+| `services/issue/review_request.go` | 审查请求处理 (`ReviewRequest`, `TeamReviewRequest`, `ReviewRequestNotify`, `teamReviewRequestNotify`) |
 | `services/issue/commit.go` | 提交关键词关闭/重开 Issue |
 | `models/activities/notification.go` | 通知数据模型与 CRUD |
 | `models/activities/notification_list.go` | 站内信收件人聚合 (`CreateOrUpdateIssueNotifications`) |
 | `models/issues/issue_watch.go` | Issue 级关注模型 |
 | `models/issues/issue_update.go` | @mention 解析 + Issue 关闭/重开 DB 操作 |
 | `models/issues/pull.go` | PR 模型 + WIP 前缀判断 |
+| `models/issues/review.go` | 审查请求 DB 操作 (`AddReviewRequest`, `AddTeamReviewRequest`) |
 | `models/repo/watch.go` | 仓库级关注模型与 WatchMode |
 | `modules/references/references.go` | @mention 正则匹配与 Markdown 剥离 |

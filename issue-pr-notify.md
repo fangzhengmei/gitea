@@ -544,7 +544,387 @@ Issue 级的 `IsWatching=false` 优先级最高，会在：
 
 ---
 
-## 七、核心文件索引
+## 七、PR 状态变更的触发链路与通知路径
+
+PR 有四种关键状态变更——合并、关闭、重开、草稿/Ready 切换——各自走不同的 notify 事件，收件人集合与排除规则也存在微妙差异。
+
+### 7.1 PR 合并（手动 & 自动）
+
+#### 触发入口
+
+| 入口 | 代码位置 |
+|-----|---------|
+| Web UI 手动合并 | `routers/web/repo/pull.go` → `services/pull/merge.go:Merge()` |
+| API 手动合并 | `routers/api/v1/repo/pull.go` → `services/pull/merge.go:Merge()` |
+| 手动标记已合并 | `services/pull/merge.go:MergedManually()` |
+| 自动合并 | `services/automerge/automerge.go:handlePullRequestAutoMerge()` → `services/pull/merge.go:Merge(wasAutoMerged=true)` |
+
+#### 核心逻辑：合并与通知是分离的
+
+**关键断点**：`Merge()` 并不通过 `IssueChangeStatus` 发通知，而是直接调用专属的 `MergePullRequest` / `AutoMergePullRequest`。
+
+```
+services/pull/merge.go:Merge()  (L223-300)
+    │
+    ├─ doMergeAndPush()               # git push 到 base 分支
+    │
+    ├─ pr, _ = GetPullRequestByID()   # 重新加载（post-receive hook 已更新 DB）
+    │
+    ├─ if wasAutoMerged:
+    │   notify_service.AutoMergePullRequest(ctx, doer, pr)    # ← L291
+    │ else:
+    │   notify_service.MergePullRequest(ctx, doer, pr)        # ← L293
+    │
+    └─ handleCloseCrossReferences()   # 关闭关联的 Issue（会触发 IssueChangeStatus）
+```
+
+**注意**：合并时 `SetMerged()` 内部调用 `SetIssueAsClosed()` 关闭关联 Issue，但该操作发生在 DB 事务内（`services/pull/merge.go:700-736`），不会直接触发通知。关联 Issue 的关闭通知由 `handleCloseCrossReferences` → `issue_service.CloseIssue()` → `notify_service.IssueChangeStatus()` 单独触发。
+
+#### 站内信路径（合并）
+
+```
+notify_service.MergePullRequest(ctx, doer, pr)
+    │
+    └─ uinotification.MergePullRequest()             # notify.go:125-130
+        └─ issueQueue.Push({
+               IssueID:              pr.Issue.ID,
+               NotificationAuthorID: doer.ID,
+               ReceiverID:           0,   # 广播：走 createOrUpdateIssueNotifications
+               CommentID:            0,   # 无 Comment
+           })
+```
+
+**收件人集合**（receiverID=0，走 `createOrUpdateIssueNotifications`）：
+1. Issue 级关注者 (`issue_watch.IsWatching=true`)
+2. 仓库级关注者 — **合并不受 WIP 抑制**（`HasWorkInProgressPrefix` 仅在 `createOrUpdateIssueNotifications` 里检查，合并后标题已不含 WIP 前缀）
+3. 参与者（评论者、审查者等）
+4. 排除操作者本人 (`delete(toNotify, notificationAuthorID)`)
+5. 排除 Issue 级显式忽略者
+6. 权限检查：`CheckRepoUnitUser(unit.TypePullRequests)`
+
+#### 邮件路径（合并）
+
+```
+notify_service.MergePullRequest(ctx, doer, pr)
+    │
+    └─ mailNotifier.MergePullRequest()               # notify.go:138-146
+        └─ MailParticipants(ctx, pr.Issue, doer, ActionMergePullRequest, nil)
+            └─ mailIssueCommentToParticipants()
+```
+
+**特殊处理**：
+- `mentions=nil`：合并操作不携带 @mention 列表
+- `content=""`：合并邮件不含 Issue 原文内容（`mail_issue.go:165-168`，对 `ActionMergePullRequest` 清空 content）
+- **WIP 抑制**：合并时 WIP 检查逻辑为 `comment.Issue.IsPull && IsWorkInProgress && ActionType != CreatePullRequest`。对合并操作 `ActionType=ActionMergePullRequest`，如果标题仍含 WIP 前缀，仓库关注者仍会被排除——但正常合并后 PR 标题不含 WIP 前缀，所以实际不受影响。
+
+#### 自动合并 vs 手动合并的差异
+
+| 维度 | `MergePullRequest` | `AutoMergePullRequest` |
+|-----|--------------------|-----------------------|
+| 站内信 | `ReceiverID=0` 广播 | 同 `MergePullRequest`（`ns.AutoMergePullRequest` 直接调用 `ns.MergePullRequest`） |
+| 邮件 | `ForceDoerNotification=false` | **`ForceDoerNotification=true`**（`mail_issue.go:170`） |
+| 操作者邮件 | 正常排除 | **自动合并的操作者也会收到邮件**（除非偏好为 `Disabled`） |
+| 邮件内容 | `content=""` | `content=""` |
+| mentions | `nil` | `nil` |
+
+`ForceDoerNotification` 的效果（`mail_issue.go:79`）：
+```go
+if comment.Doer.EmailNotificationsPreference != EmailNotificationsAndYourOwn && !comment.ForceDoerNotification {
+    visited.Add(comment.Doer.ID)  // ForceDoerNotification=true 时跳过此排除
+}
+```
+
+### 7.2 PR/Issue 关闭
+
+#### 触发入口
+
+| 入口 | 代码位置 |
+|-----|---------|
+| Web UI 评论关闭 | `routers/web/repo/issue_comment.go:163` → `issue_service.CloseIssue()` |
+| API 关闭 | `routers/api/v1/repo/issue.go:706` / `closeOrReopenIssue()` → `issue_service.CloseIssue()` |
+| 提交关键词关闭 | `services/issue/commit.go:221` → `CloseIssue(ctx, refIssue, doer, c.Sha1)` |
+| PR 合并联动关闭 | `services/pull/merge.go:318` → `issue_service.CloseIssue()` |
+
+#### 通知链路
+
+```
+services/issue/status.go:CloseIssue()     (L17-40)
+    │
+    ├─ issues_model.CloseIssue()          # DB: SetIssueAsClosed → CreateComment(Close)
+    │
+    └─ notify_service.IssueChangeStatus(ctx, doer, commitID, issue, comment, true)
+        │
+        ├─ uinotification.IssueChangeStatus()       # notify.go:104-110
+        │   └─ issueQueue.Push({
+        │          IssueID:              issue.ID,
+        │          NotificationAuthorID: doer.ID,
+        │          CommentID:            actionComment.ID,  # ← 关闭操作的 Comment
+        │          ReceiverID:           0,
+        │      })
+        │
+        └─ mailNotifier.IssueChangeStatus()          # notify.go:59-78
+            └─ MailParticipants(ctx, issue, doer, ActionClosePullRequest/ActionCloseIssue, nil)
+                └─ mailIssueCommentToParticipants()
+```
+
+#### 关键差异：关闭走 `IssueChangeStatus` 而非 `MergePullRequest`
+
+PR 的关闭与合并是**两个独立的通知事件**：
+- **合并**：`notify_service.MergePullRequest` / `AutoMergePullRequest`
+- **关闭**（不合并）：`notify_service.IssueChangeStatus(closeOrReopen=true)`
+
+关闭一个 PR 不会合并代码，所以走 `IssueChangeStatus` 通道。
+
+#### 收件人集合（关闭）
+
+**站内信**：同 `createOrUpdateIssueNotifications` 通用逻辑。
+
+**邮件**：
+- `mentions=nil`：关闭操作无 @mention
+- `content=""`：关闭邮件不含原文（`ActionCloseIssue/ActionClosePullRequest` 清空 content）
+- 收集：作者 + Assignee + 参与者 + Issue 关注者 + 仓库关注者
+- WIP 检查：**关闭 PR 时，如果标题仍含 WIP 前缀，仓库关注者不会收到邮件**
+- `ForceDoerNotification=false`：操作者本人正常排除
+
+### 7.3 PR/Issue 重开
+
+#### 触发入口
+
+| 入口 | 代码位置 |
+|-----|---------|
+| Web UI 重开 | `routers/web/repo/issue_comment.go:180` → `issue_service.ReopenIssue()` |
+| API 重开 | `routers/api/v1/repo/pull.go:1066` → `issue_service.ReopenIssue()` |
+| PR 合并联动重开 | `services/pull/merge.go:325` → `issue_service.ReopenIssue()` |
+| 提交关键词重开 | `services/issue/commit.go:225` → `ReopenIssue()` |
+
+#### 通知链路
+
+```
+services/issue/status.go:ReopenIssue()    (L44-52)
+    │
+    ├─ issues_model.ReopenIssue()         # DB: setIssueAsReopen → CreateComment(Reopen)
+    │
+    └─ notify_service.IssueChangeStatus(ctx, doer, commitID, issue, comment, false)
+        │
+        ├─ uinotification.IssueChangeStatus()       # 同关闭
+        └─ mailNotifier.IssueChangeStatus()          # → MailParticipants(ActionReopen*)
+```
+
+#### 收件人集合（重开）
+
+与关闭逻辑基本相同，但：
+- `ActionType = ActionReopenIssue / ActionReopenPullRequest`
+- `content=""`：重开邮件同样不含原文
+- **WIP 不再适用**：重开时 Issue/PR 已非关闭状态，标题不含 WIP 的可能性更高；但若标题仍含 WIP，仓库关注者仍被排除
+
+### 7.4 PR 草稿(WIP)与 Ready 切换
+
+Gitea 没有独立的"WIP 状态"字段——WIP 完全由**标题前缀**决定。切换仅通过修改标题实现。
+
+#### WIP 前缀判断
+
+**`models/issues/pull.go:660-663`**
+
+```go
+func HasWorkInProgressPrefix(title string) bool {
+    _, ok := CutWorkInProgressPrefix(title)
+    return ok
+}
+```
+
+前缀列表由 `setting.Repository.PullRequest.WorkInProgressPrefixes` 配置，默认 `[WIP:, [WIP], Draft:, (Draft)]`。
+
+#### 触发链路：标题变更
+
+```
+services/issue/issue.go:ChangeTitle()     (L72-111)
+    │
+    ├─ issues_model.ChangeIssueTitle(ctx, issue, doer, oldTitle)
+    │
+    ├─ if IsPull && HasWorkInProgressPrefix(oldTitle) && !HasWorkInProgressPrefix(newTitle):
+    │   ├─ PullRequestCodeOwnersReview()    # 触发 code owner 审查
+    │   └─ reviewNotifiers = ...
+    │
+    └─ notify_service.IssueChangeTitle(ctx, doer, issue, oldTitle)
+```
+
+#### 站内信路径（WIP→Ready）
+
+**`services/uinotification/notify.go:112-123`**
+
+```go
+func (ns *notificationService) IssueChangeTitle(ctx, doer, issue, oldTitle) {
+    issue.LoadPullRequest(ctx)
+    if issue.IsPull && HasWorkInProgressPrefix(oldTitle) && !issue.PullRequest.IsWorkInProgress(ctx) {
+        issueQueue.Push({
+            IssueID:              issue.ID,
+            NotificationAuthorID: doer.ID,
+            CommentID:            0,   # 无 Comment
+            ReceiverID:           0,   # 广播
+        })
+    }
+}
+```
+
+**关键断点**：只有 **WIP→Ready** 才发站内信，Ready→WIP 不发。且 `CommentID=0`，这意味着站内信只能更新已有通知的排序，无法创建关联到具体评论的通知。
+
+#### 邮件路径（WIP→Ready）
+
+**`services/mailer/notify.go:80-90`**
+
+```go
+func (m *mailNotifier) IssueChangeTitle(ctx, doer, issue, oldTitle) {
+    issue.LoadPullRequest(ctx)
+    if issue.IsPull && HasWorkInProgressPrefix(oldTitle) && !issue.PullRequest.IsWorkInProgress(ctx) {
+        MailParticipants(ctx, issue, doer, ActionPullRequestReadyForReview, nil)
+    }
+}
+```
+
+同样 **只有 WIP→Ready 才发邮件**，Ready→WIP 不发。
+
+#### 收件人集合（WIP→Ready）
+
+**站内信**：走 `createOrUpdateIssueNotifications(ReceiverID=0)`
+
+此时 PR 标题已不含 WIP 前缀，所以：
+1. Issue 级关注者 ✓
+2. **仓库级关注者 ✓**（`HasWorkInProgressPrefix(issue.Title)` 为 false，不再抑制）
+3. 参与者 ✓
+4. 排除操作者本人 ✓
+5. 排除 Issue 级显式忽略者 ✓
+
+**邮件**：走 `mailIssueCommentToParticipants()`
+
+- `ActionType = ActionPullRequestReadyForReview`
+- `mentions=nil`：无 @mention
+- **content=issue.Content**：Ready for Review 邮件**包含 Issue 原文内容**（只有 Close/Reopen/Merge 才清空 content）
+- 仓库关注者 ✓（标题已不含 WIP）
+- `ForceDoerNotification=false`
+
+#### Ready→WIP：无通知
+
+这是容易忽视的断点：**将 PR 标题改回 WIP 不会触发任何通知**。用户不会被通知"PR 又变成草稿了"。这可能导致以下问题：
+- 已经收到"Ready for Review"邮件的审查者，不知道 PR 又回到了草稿状态
+- 站内信列表中仍显示之前的"Ready"通知，不会更新
+
+---
+
+## 八、收件人集合对比：来源、去重顺序与排除规则
+
+### 8.1 站内信收件人计算统一流程
+
+所有站内信事件最终都走同一个函数 `createOrUpdateIssueNotifications`（`models/activities/notification_list.go:78-162`），但入口参数不同：
+
+| 事件 | ReceiverID | CommentID | 效果 |
+|-----|-----------|-----------|------|
+| 创建 Issue/评论 | 0 + 各 mention.ID | comment.ID | 广播 + mention 单独推送 |
+| 合并 PR | 0 | 0 | 广播，无关联 Comment |
+| 自动合并 PR | 0 | 0 | 同上 |
+| 关闭/重开 | 0 | actionComment.ID | 广播，关联关闭/重开 Comment |
+| WIP→Ready | 0 | 0 | 广播，无关联 Comment |
+| Assignee 变更 | assignee.ID | comment.ID | 仅指定用户 |
+| Review 请求 | reviewer.ID | comment.ID | 仅指定用户 |
+
+**站内信去重与排除顺序**（`createOrUpdateIssueNotifications`）：
+
+```
+① 收集 Issue 级关注者 (IsWatching=true)    → Set.AddMultiple
+② 收集仓库级关注者 (mode≠Dont)             → Set.AddMultiple（WIP PR 跳过）
+③ 收集参与者                                 → Set.AddMultiple
+④ 排除操作者本人                             → Set.Delete(notificationAuthorID)
+⑤ 排除 Issue 级显式忽略者 (IsWatching=false) → Set.Remove(各 ID)
+⑥ 对集合中每个用户：权限检查 CheckRepoUnitUser
+⑦ 已有通知 → updateIssueNotification
+   无通知 → createIssueNotification
+```
+
+**注意**：当 `ReceiverID > 0` 时（如 @mention、Assignee 变更），跳过 ①-⑤，直接为指定用户创建/更新通知。但 **Issue 级显式忽略者的排除也被跳过**——这意味着被 @mention 时即使用户显式 unwatch 了一个 Issue，仍会收到站内信通知。
+
+### 8.2 邮件收件人计算统一流程
+
+所有邮件事件最终都走 `mailIssueCommentToParticipants`（`services/mailer/mail_issue.go:27-104`），但入参 `mailComment` 不同：
+
+| 事件 | ActionType | mentions | content | ForceDoerNotification |
+|-----|-----------|----------|---------|----------------------|
+| 创建 Issue | ActionCreateIssue | 解析结果 | issue.Content | false |
+| 创建评论 | ActionCommentIssue | 解析结果 | comment.Content | false |
+| 合并 PR | ActionMergePullRequest | nil | "" | false |
+| 自动合并 PR | ActionAutoMergePullRequest | nil | "" | **true** |
+| 关闭 | ActionCloseIssue/PR | nil | "" | false |
+| 重开 | ActionReopenIssue/PR | nil | "" | false |
+| WIP→Ready | ActionPullRequestReadyForReview | nil | issue.Content | false |
+
+**邮件去重与排除顺序**（`mailIssueCommentToParticipants`）：
+
+```
+① 收集候选 ID 列表 (unfiltered[]):
+   a. 原始作者 (PosterID)
+   b. Assignee IDs
+   c. 参与者 IDs
+   d. Issue 级关注者 (IsWatching=true)
+   e. 仓库级关注者 (mode≠Dont)  ← WIP PR 且非创建动作时跳过
+
+② 初始化 visited 集合
+
+③ 排除操作者本人:
+   if Doer.EmailNotificationsPreference ≠ AndYourOwn && !ForceDoerNotification:
+       visited.Add(Doer.ID)
+
+④ 先处理 @mentions (fromMention=true):
+   mailIssueCommentBatch(mentions, visited, true)
+   ├─ 过滤: 非活跃用户
+   ├─ 过滤: 邮件偏好 (Enabled || AndYourOwn || (OnMention && fromMention))
+   ├─ 过滤: visited 去重
+   ├─ 过滤: 仓库单元权限
+   └─ 按语言分组 → 批量发送 (每批 100)
+
+⑤ 排除 Issue 级显式忽略者 (IsWatching=false):
+   visited.AddMultiple(issueUnWatchIDs...)
+
+⑥ 处理其余收件人 (fromMention=false):
+   unfilteredUsers = GetMailableUsersByIDs(unfiltered)
+   mailIssueCommentBatch(unfilteredUsers, visited, false)
+   ├─ 过滤: 非活跃用户
+   ├─ 过滤: 邮件偏好 (Enabled || AndYourOwn)  ← 不含 OnMention
+   ├─ 过滤: visited 去重 (已被 mention 或 unwatch 的不会重复)
+   ├─ 过滤: 仓库单元权限
+   └─ 按语言分组 → 批量发送
+```
+
+### 8.3 关键差异：站内信 vs 邮件的排除规则
+
+| 规则 | 站内信 | 邮件 |
+|-----|--------|------|
+| 操作者本人排除 | **始终排除**（`delete(toNotify, authorID)`） | 排除，但 `EmailNotificationsAndYourOwn` 或 `ForceDoerNotification` 时不排除 |
+| 显式忽略者 | 先加入集合再移除（最终排除） | 加入 visited 集合（在 mentions 处理之后） |
+| @mention 用户是否受显式忽略影响 | **否**（ReceiverID>0 时跳过 unwatch 排除） | **是**（unwatch 排除在 mention 处理之后，visited 包含 unwatcher） |
+| 邮件偏好 | 不检查 | 检查 `EmailNotificationsPreference` |
+| 活跃状态 | 由 JOIN `user.is_active AND !prohibit_login` 保证 | 显式检查 `user.IsActive` |
+| 权限检查 | `CheckRepoUnitUser` | `CheckRepoUnitUser` |
+
+**最重要的不对称**：@mention 用户在站内信中**不受显式忽略影响**，但在邮件中**受显式忽略影响**。
+
+这意味着：
+- 用户 A unwatch 了 Issue #1，有人在 #1 中 @A → A **会收到**站内信，但**不会收到**邮件
+- 这是站内信与邮件之间最大的行为不一致
+
+### 8.4 各事件收件人集合一览
+
+| 事件 | 站内信候选 | 邮件候选 | mentions | WIP 抑制 |
+|-----|----------|---------|----------|---------|
+| 创建 Issue | Issue 关注者 + 仓库关注者 + 参与者 + @mention | 作者 + Assignee + 参与者 + Issue 关注者 + 仓库关注者 + @mention | ✓ | 否（非 PR） |
+| 创建评论 | 同上 | 同上 | ✓ | WIP PR 不通知仓库关注者 |
+| 合并 PR | Issue 关注者 + 仓库关注者 + 参与者 | 作者 + Assignee + 参与者 + Issue 关注者 + 仓库关注者 | ✗ | 合并后不含 WIP，不受影响 |
+| 自动合并 PR | 同合并 | 同合并 | ✗ | 同合并；**操作者收到邮件** |
+| 关闭 PR/Issue | Issue 关注者 + 仓库关注者 + 参与者 | 作者 + Assignee + 参与者 + Issue 关注者 + 仓库关注者 | ✗ | WIP PR 不通知仓库关注者 |
+| 重开 PR/Issue | 同关闭 | 同关闭 | ✗ | WIP PR 不通知仓库关注者 |
+| WIP→Ready | Issue 关注者 + **仓库关注者** + 参与者 | 作者 + Assignee + 参与者 + Issue 关注者 + **仓库关注者** | ✗ | 否（标题已不含 WIP） |
+| Ready→WIP | **不发送** | **不发送** | ✗ | N/A |
+
+---
+
+## 九、核心文件索引
 
 | 文件 | 职责 |
 |-----|------|
@@ -553,10 +933,18 @@ Issue 级的 `IsWatching=false` 优先级最高，会在：
 | `services/uinotification/notify.go` | 站内信 Notifier 实现 |
 | `services/mailer/notify.go` | 邮件 Notifier 实现 |
 | `services/mailer/mail_issue.go` | 邮件收件人计算与批量发送 |
+| `services/mailer/mail_comment.go` | 评论邮件发送 (`MailParticipantsComment`, `MailMentionsComment`) |
+| `services/mailer/mail_issue_common.go` | 邮件公共结构 (`mailComment`, `composeIssueCommentMessages`) |
 | `services/mailer/mailer.go` | 邮件队列与发送 |
+| `services/pull/merge.go` | PR 合并逻辑 (`Merge`, `MergedManually`, `SetMerged`) |
+| `services/automerge/automerge.go` | PR 自动合并逻辑 |
+| `services/issue/status.go` | Issue/PR 关闭与重开 (`CloseIssue`, `ReopenIssue`) |
+| `services/issue/issue.go` | Issue 创建与标题变更 (`NewIssue`, `ChangeTitle`) |
+| `services/issue/commit.go` | 提交关键词关闭/重开 Issue |
 | `models/activities/notification.go` | 通知数据模型与 CRUD |
-| `models/activities/notification_list.go` | 站内信奉件人聚合 (`CreateOrUpdateIssueNotifications`) |
+| `models/activities/notification_list.go` | 站内信收件人聚合 (`CreateOrUpdateIssueNotifications`) |
 | `models/issues/issue_watch.go` | Issue 级关注模型 |
+| `models/issues/issue_update.go` | @mention 解析 + Issue 关闭/重开 DB 操作 |
+| `models/issues/pull.go` | PR 模型 + WIP 前缀判断 |
 | `models/repo/watch.go` | 仓库级关注模型与 WatchMode |
-| `models/issues/issue_update.go` | @mention 解析 (`FindAndUpdateIssueMentions`, `ResolveIssueMentionsByVisibility`) |
 | `modules/references/references.go` | @mention 正则匹配与 Markdown 剥离 |

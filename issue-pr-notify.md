@@ -1181,7 +1181,310 @@ func SendIssueAssignedMail(ctx, issue, doer, content, comment, recipients) error
 
 ---
 
-## 十、核心文件索引
+## 十、团队成员重叠时的去重边界与执行流程
+
+当一个用户同时属于多个 Code Owner 团队（或同时出现在用户规则和团队规则中）时，通知路径会产生多次 `PullRequestReviewRequest` 调用。去重逻辑分布在四个不同层级，每层的去重范围和边界条件不同。
+
+### 10.1 完整执行流程全景
+
+```
+PullRequestCodeOwnersReview()
+    │
+    ├─ ① 上游去重：uniqUsers / uniqTeams（基于 ID 的 map）
+    │   ├─ uniqUsers[userID] = user    ← 用户级别去重
+    │   └─ uniqTeams[orgID/teamID] = team  ← 团队级别去重
+    │
+    ├─ ② DB 层面去重：AddReviewRequest / AddTeamReviewRequest
+    │   ├─ 检查 reviewer 是否已存在审查请求
+    │   └─ 已存在 → 返回 comment=nil，不生成 notifier
+    │
+    └─ 返回 []*ReviewRequestNotifier（每个待通知的用户/团队一条）
+        │
+        └─ ReviewRequestNotify()
+            │
+            ├─ 单个用户 notifier:
+            │   └─ notify_service.PullRequestReviewRequest(reviewer=user)
+            │       ├─ 站内信: issueQueue.Push(ReceiverID=user.ID)
+            │       │   └─ createOrUpdateIssueNotifications(ReceiverID=user.ID)
+            │       │       └─ ③ 站内信去重: notificationExists()
+            │       │           ├─ 存在 → updateIssueNotification (只更新排序)
+            │       │           └─ 不存在 → createIssueNotification
+            │       │
+            │       └─ 邮件: SendIssueAssignedMail([user])
+            │           └─ ④ 邮件去重: 无（每个调用独立发送）
+            │
+            └─ 团队 notifier:
+                └─ teamReviewRequestNotify(team)
+                    ├─ GetTeamMembers() → members[]
+                    └─ for member ∈ members:
+                        ├─ 排除: member.ID == PosterID
+                        └─ notify_service.PullRequestReviewRequest(reviewer=member)
+                            └─ (同上站内信 + 邮件流程)
+```
+
+### 10.2 四层去重详解
+
+#### ① 上游去重：Code Owner 规则匹配阶段
+
+**位置**：`services/issue/pull.go:94-109`
+
+```go
+uniqUsers := make(map[int64]*user_model.User)
+uniqTeams := make(map[string]*org_model.Team)  // key: "orgID/teamID"
+for _, rule := range rules {
+    for _, f := range changedFiles {
+        matched, _ := rule.Rule.MatchString(f)
+        if matched {
+            for _, u := range rule.Users {
+                uniqUsers[u.ID] = u  // 同一用户多次命中只保留一个
+            }
+            for _, t := range rule.Teams {
+                uniqTeams[key(t)] = t  // 同一团队多次命中只保留一个
+            }
+        }
+    }
+}
+```
+
+**去重范围**：同一次 `PullRequestCodeOwnersReview` 调用内
+
+**边界条件**：
+- 用户和团队是分开去重的——用户 A 同时被用户规则和团队规则匹配会被去重（在 uniqUsers 层面），但用户 A 作为团队成员还会在团队展开时再次出现
+- 团队之间不去重成员——用户 A 同时属于 Team X 和 Team Y，两个团队都被命中时，会在后续团队展开时产生两次调用
+
+#### ② DB 层面去重：审查请求创建阶段
+
+**位置**：
+- 用户：`models/issues/review.go:638-685` (`AddReviewRequest`)
+- 团队：`models/issues/review.go:762-814` (`AddTeamReviewRequest`)
+
+```go
+func AddReviewRequest(ctx, issue, reviewer, doer, isCodeOwners) (*Comment, error) {
+    review, err := GetReviewByIssueIDAndUserID(ctx, issue.ID, reviewer.ID)
+    if review != nil {
+        // 已有请求，检查是否为 ReviewTypeRequest
+        if review.Type == ReviewTypeRequest {
+            return nil, nil  // 已存在审查请求，返回 nil comment
+        }
+    }
+    // ... 创建新审查请求和评论
+}
+```
+
+**去重范围**：跨调用去重（基于 DB 的 review 记录）
+
+**边界条件**：
+- 检查 `GetReviewByIssueIDAndUserID` —— 只要该用户对此 PR 已有 **任何类型** 的审查记录（评论、批准、拒绝等），并且最后一条是 `ReviewTypeRequest`，就返回 `comment=nil`
+- 返回 `comment=nil` 意味着 **不会生成 ReviewRequestNotifier**，后续通知链路完全不会触发
+- Code Owner 和手动添加评审人共享此去重逻辑
+
+#### ③ 站内信去重：通知落库阶段
+
+**位置**：`models/activities/notification_list.go:151-156`
+
+```go
+if notificationExists(notifications, issue.ID, userID) {
+    if err = updateIssueNotification(ctx, userID, issue.ID, commentID, notificationAuthorID); err != nil {
+        return err
+    }
+    continue  // 已有通知，只更新不新建
+}
+if err = createIssueNotification(ctx, userID, issue, commentID, notificationAuthorID); err != nil {
+    return err
+}
+```
+
+**`notificationExists` 判定** (`models/activities/notification.go:313-319`)：
+```go
+func notificationExists(notifications []*Notification, issueID, userID int64) bool {
+    for _, notification := range notifications {
+        if notification.IssueID == issueID && notification.UserID == userID {
+            return true  // 只检查 IssueID + UserID，不检查通知来源
+        }
+    }
+    return false
+}
+```
+
+**站内信更新逻辑** (`models/activities/notification.go:170-189`)：
+```go
+func updateIssueNotification(ctx, userID, issueID, commentID, updatedByID) error {
+    notification, _ := GetIssueNotification(ctx, userID, issueID)
+
+    var cols []string
+    if notification.Status == NotificationStatusRead {
+        // 已读 → 重新标记为未读，更新 CommentID
+        notification.Status = NotificationStatusUnread
+        notification.CommentID = commentID
+        cols = []string{"status", "update_by", "comment_id"}
+    } else {
+        // 未读 → 只更新 UpdatedBy 以重新排序
+        notification.UpdatedBy = updatedByID
+        cols = []string{"update_by"}
+    }
+    _, err = db.GetEngine(ctx).ID(notification.ID).Cols(cols...).Update(notification)
+    return err
+}
+```
+
+**去重范围**：同一次 `createOrUpdateIssueNotifications` 调用内（基于函数开始时查询的 `notifications` 列表）
+
+**关键特性**：
+- **通知唯一性**：`(UserID, IssueID)` 联合唯一——一个用户对一个 Issue 只有一条站内信通知
+- **重复调用的结果**：已有通知时只更新 `updated_unix`（重新排序列表）或 `comment_id`（通知指向最新评论），**不会创建新通知**
+- **`ReceiverID > 0` 的副作用**：虽然跳过了 Issue 级 unwatch 排除，但**不跳过 notificationExists 检查**——重叠成员仍会被去重
+
+#### ④ 邮件去重：发送阶段
+
+**邮件端没有去重**——每个 `SendIssueAssignedMail` 调用独立执行，没有全局去重机制。
+
+**位置**：`services/mailer/notify.go:129-136`
+
+```go
+func (m *mailNotifier) PullRequestReviewRequest(ctx, doer, issue, reviewer, isRequest, comment) {
+    if isRequest && doer.ID != reviewer.ID && reviewer.EmailNotificationsPreference != EmailNotificationsDisabled {
+        ct := fmt.Sprintf("Requested to review %s.", issue.HTMLURL(ctx))
+        // 每次调用独立发送
+        if err := SendIssueAssignedMail(ctx, issue, doer, ct, comment, []*user_model.User{reviewer}); err != nil {
+            log.Error("Error in SendIssueAssignedMail ...: %v", err)
+        }
+    }
+}
+```
+
+**边界条件**：
+- **没有跨调用去重**：同一用户被多个团队命中，会收到**多封内容完全相同的邮件**
+- **前置过滤**：只有三层检查（`isRequest`、`doer.ID != reviewer.ID`、`EmailNotificationsPreference != Disabled`），但这些是有效性检查不是去重
+- **异步队列无去重**：`SendAsync` 直接投递到 `mailQueue`，队列处理时也不做去重
+
+### 10.3 重叠场景的完整行为对比
+
+假设场景：用户 `alice` 同时属于 `team-frontend` 和 `team-backend` 两个团队，PR 同时修改了 `frontend/` 和 `backend/` 目录，两个团队的 Code Owner 规则都命中。
+
+#### 站内信行为
+```
+PullRequestCodeOwnersReview()
+    ├─ uniqTeams = {team-frontend, team-backend}
+    ├─ AddTeamReviewRequest(team-frontend) → comment_123
+    ├─ AddTeamReviewRequest(team-backend)  → comment_124
+    └─ notifiers = [{ReviewTeam: team-frontend}, {ReviewTeam: team-backend}]
+
+ReviewRequestNotify()
+    ├─ team-frontend:
+    │   └─ GetTeamMembers() → [alice, bob, charlie]
+    │       ├─ alice: PullRequestReviewRequest(reviewer=alice, comment=comment_123)
+    │       │   └─ 站内信 queue: issueQueue.Push(ReceiverID=alice.ID, CommentID=123)
+    │       │       └─ createOrUpdateIssueNotifications()
+    │       │           └─ notificationExists(alice, pr) → false
+    │       │           └─ createIssueNotification(alice, CommentID=123)  ✅ 创建
+    │       ├─ bob: ...
+    │       └─ charlie: ...
+    │
+    └─ team-backend:
+        └─ GetTeamMembers() → [alice, dave, eve]
+            ├─ alice: PullRequestReviewRequest(reviewer=alice, comment=comment_124)
+            │   └─ 站内信 queue: issueQueue.Push(ReceiverID=alice.ID, CommentID=124)
+            │       └─ createOrUpdateIssueNotifications()
+            │           └─ notificationExists(alice, pr) → true（第一次创建的通知）
+            │           └─ updateIssueNotification()
+            │               └─ if status == Read: 标记为 Unread，更新 CommentID=124
+            │                  else: 只更新 UpdatedBy，重新排序  ⚠️ 不创建新通知
+            ├─ dave: ...
+            └─ eve: ...
+```
+
+**站内信结果**：alice 只收到 **1 条**站内信通知。
+
+#### 邮件行为
+```
+ReviewRequestNotify()
+    ├─ team-frontend:
+    │   └─ alice: PullRequestReviewRequest(reviewer=alice, comment=comment_123)
+    │       └─ SendIssueAssignedMail([alice])
+    │           └─ SendAsync(邮件1: "Requested to review PR#123")  ✅ 发送
+    │
+    └─ team-backend:
+        └─ alice: PullRequestReviewRequest(reviewer=alice, comment=comment_124)
+            └─ SendIssueAssignedMail([alice])
+                └─ SendAsync(邮件2: "Requested to review PR#123")  ✅ 发送（内容相同）
+```
+
+**邮件结果**：alice 收到 **2 封**内容完全相同的邮件。
+
+### 10.4 去重边界条件总结表
+
+| 去重层级 | 位置 | 去重键 | 站内信 | 邮件 | 跨团队重叠 | 跨调用重叠 |
+|---------|------|--------|--------|------|-----------|-----------|
+| ① 上游规则匹配 | `uniqUsers` / `uniqTeams` map | 用户 ID / 团队 key | ✓ | ✓ | 用户去重，团队不去重成员 | 否（同次调用内） |
+| ② DB 审查请求 | `AddReviewRequest` / `AddTeamReviewRequest` | (IssueID, ReviewerID) | ✓ | ✓ | 否（团队展开前已过滤） | ✓ |
+| ③ 站内信落库 | `notificationExists` | (IssueID, UserID) | ✓ | N/A | ✓（只创建 1 条） | ✓ |
+| ④ 邮件发送 | `SendIssueAssignedMail` | 无去重 | N/A | ✗ | ✗（收多封） | ✗ |
+
+### 10.5 已知的代码问题
+
+#### 问题 1：团队成员展开时复用 Comment 指针
+
+**位置**：`services/issue/review_request.go:224-229`
+
+```go
+for _, member := range members {
+    if member.ID == comment.Issue.PosterID {
+        continue
+    }
+    comment.AssigneeID = member.ID  // ⚠️ 复用同一个 Comment 指针，循环内修改字段
+    notify_service.PullRequestReviewRequest(ctx, doer, issue, member, isAdd, comment)
+}
+```
+
+**风险**：
+- 同一 `*Comment` 对象在循环中被反复修改 `AssigneeID` 字段
+- 虽然 `notify_service` 调用是同步的，但如果内部将 comment 指针传入异步队列（站内信 queue 实际只存 `CommentID`，所以没问题）
+- 邮件端在调用 `SendIssueAssignedMail` 时会立即读取 `comment` 的内容，同步执行下没有问题
+- 但这是不良实践，如果未来 `notify_service.PullRequestReviewRequest` 改为异步，会出现竞态条件
+
+#### 问题 2：邮件端无去重导致重复邮件
+
+**影响**：
+- 用户同时属于多个 Code Owner 团队时，会收到多封内容相同的审查请求邮件
+- 邮件内容完全相同，只是发送时机有细微差异
+- 与站内信行为不一致（站内信会去重）
+
+**可能的修复方向**：在 `PullRequestReviewRequest` 的 mailNotifier 实现中，增加对同一 IssueID + ReviewerID 在短时间内的去重缓存。
+
+#### 问题 3：团队展开时作者排除不完整
+
+**位置**：`services/issue/review_request.go:225`
+
+```go
+if member.ID == comment.Issue.PosterID {
+    continue
+}
+```
+
+**问题**：只排除了 PR 作者，没有排除操作者本人（`doer`）。如果团队成员包含操作人，操作人会收到"你自己请求了审查"的通知。虽然 `mailNotifier` 中 `doer.ID != reviewer.ID` 会排除这种情况（邮件端安全），但 **站内信端没有这个排除**，操作人会收到自己发起的审查请求的站内信通知。
+
+#### 问题 4：站内信 CommentID 更新策略有信息损失
+
+**位置**：`models/activities/notification.go:179-186`
+
+```go
+if notification.Status == NotificationStatusRead {
+    // 已读 → 更新 CommentID
+    notification.Status = NotificationStatusUnread
+    notification.CommentID = commentID
+    cols = []string{"status", "update_by", "comment_id"}
+} else {
+    // 未读 → 不更新 CommentID
+    notification.UpdatedBy = updatedByID
+    cols = []string{"update_by"}
+}
+```
+
+**问题**：当通知状态为 **未读** 时收到新的审查请求（如 alice 场景的第二次调用），`CommentID` 不会更新，通知仍然指向第一次审查请求的评论。用户点击通知会跳转到 `team-frontend` 的审查请求评论，而不是 `team-backend` 的。
+
+---
+
+## 十一、核心文件索引
 
 | 文件 | 职责 |
 |-----|------|

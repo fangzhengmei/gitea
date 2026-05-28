@@ -388,7 +388,7 @@ canWriteCode = CanMaintainerWriteToBranch(userPerm, branchName, user) || deployK
 3. 以上均不满足 → 返回 false
 ```
 
-> **修正**：`GetUnmergedPullRequestsByHeadInfo` 函数定义在 `models/issues/pull_list.go:63`，其 SQL 查询的 `flow = PullRequestFlowGithub` 过滤条件在**第 68 行**。原文档误写为第 142 行（第 142 行是 `HasUnmergedPullRequestsByHeadInfo` 函数）。由于有 `flow = PullRequestFlowGithub` 过滤，AGit Flow 的 PR 不会触发 Maintainer 编辑路径。
+> **修正**：`GetUnmergedPullRequestsByHeadInfo` 函数声明在 `models/issues/pull_list.go:64`（L63 为注释行），其 SQL 查询的 `flow = PullRequestFlowGithub` 过滤条件在**第 68 行**。原文档误写为第 142 行（第 142 行是 `HasUnmergedPullRequestsByHeadInfo` 函数）。由于有 `flow = PullRequestFlowGithub` 过滤，AGit Flow 的 PR 不会触发 Maintainer 编辑路径。
 
 **Hook 场景下的上下文**：
 - 在 `pre-receive` hook 中，`headPerm` 是 doer 对**目标仓库**（被 push 的仓库）的权限，不是 PR HeadRepo 的权限
@@ -731,7 +731,7 @@ Gitea 内部操作（UI 合并 PR、同步分支等）通过 `GITEA_INTERNAL_PUS
 | Hook 子命令入口 | `cmd/hook.go` | `runHookPreReceive:184`, `runHookUpdate:314`, `runHookPostReceive:331`, `runHookProcReceive:518` |
 | 内部 API 客户端 | `modules/private/hook.go` | `HookPreReceive:96`, `HookPostReceive:103`, `HookProcReceive:109` |
 | 内部 API 路由 | `routers/private/internal.go` | L67-69 |
-| pre-receive 权限校验 | `routers/private/hook_pre_receive.go` | `HookPreReceive:108`, `preReceiveBranch:142`, `preReceiveTag:406`, `preReceiveFor:442`, `loadPusherAndPermission:493` |
+| pre-receive 权限校验 | `routers/private/hook_pre_receive.go` | `HookPreReceive:109`, `preReceiveBranch:142`, `preReceiveTag:406`, `preReceiveFor:442`, `loadPusherAndPermission:493` |
 | 签名验证 | `routers/private/hook_verification.go` | `verifyCommits:18`, `readAndVerifyCommit:58` |
 | 签名解析 | `services/asymkey/commit.go` | `ParseCommitWithSignature:26` |
 | post-receive 处理 | `routers/private/hook_post_receive.go` | `HookPostReceive:33` |
@@ -742,8 +742,8 @@ Gitea 内部操作（UI 合并 PR、同步分支等）通过 `GITEA_INTERNAL_PUS
 | **HTTP 路由注册** | `routers/web/githttp.go` | `addOwnerRepoGitHTTPRouters:11` |
 | 受保护分支模型 | `models/git/protected_branch.go` | `CanUserPush:125`, `CanUserForcePush:162`, `CanBypassBranchProtection:212` |
 | 受保护标签模型 | `models/git/protected_tag.go` | `IsUserAllowedToControlTag:127` |
-| Maintainer 写入权限 | `models/issues/pull_list.go` | `CanMaintainerWriteToBranch:73`, `canMaintainerWriteToBranch:82`, `GetUnmergedPullRequestsByHeadInfo:63`, `flow=PullRequestFlowGithub:68` |
-| Maintainer 权限调用链 | `services/context/repo.go` | `CanWriteToBranch:106`, L152, L153, L1110 |
+| Maintainer 写入权限 | `models/issues/pull_list.go` | `CanMaintainerWriteToBranch:73`, `canMaintainerWriteToBranch:82`, `GetUnmergedPullRequestsByHeadInfo:64`, `flow=PullRequestFlowGithub:68` |
+| Maintainer 权限调用链 | `services/context/repo.go` | `CanWriteToBranch:107`, L152, L153, L1110 |
 | Doer 推送环境 | `modules/repository/env.go` | `DoerPushingEnvironment:58` |
 | Hook 脚本生成 | `modules/gitrepo/hooks.go` | `getHookTemplates:17`, `CreateDelegateHooks:110` |
 | 环境变量常量 | `modules/repository/env.go` | L19-33 |

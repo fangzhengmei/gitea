@@ -78,7 +78,17 @@ gitea hook
 **执行流程**：
 
 1. **内部推送跳过**：检查 `GITEA_INTERNAL_PUSH` 环境变量，若为 true 则直接返回（Gitea 内部的推送操作如合并 PR 已在事务内完成，无需重复校验）
-2. **SSH 环境检查**：若 `SSH_ORIGINAL_COMMAND` 为空且 `OnlyAllowPushIfGiteaEnvironmentSet` 启用，则拒绝推送
+2. **SSH 环境检查**：
+   ```go
+   // cmd/hook.go:191-198
+   if len(os.Getenv("SSH_ORIGINAL_COMMAND")) == 0 {
+       if setting.OnlyAllowPushIfGiteaEnvironmentSet {
+           return fail(ctx, `Rejecting changes as Gitea environment not set...`)
+       }
+       return nil  // 否则不校验，直接通过
+   }
+   ```
+   > **修正**：默认行为是宽松的——当 `SSH_ORIGINAL_COMMAND` 为空且配置**未启用**时，**直接通过**而非拒绝。只有配置 `ONLY_ALLOW_PUSH_IF_GITEA_ENVIRONMENT_SET=true`（默认值）时才会拒绝。HTTP 推送通过手动设置 `SSH_ORIGINAL_COMMAND=receive-pack` 来规避此检查。
 3. **环境变量读取**：从环境变量获取 pusher 身份信息：
    - `GITEA_PUSHER_ID` — 推送者用户 ID
    - `GITEA_REPO_USER_NAME` / `GITEA_REPO_NAME` — 仓库所有者/仓库名
@@ -200,8 +210,10 @@ Gitea 内部操作（如 UI 合并 PR）推送时使用 `InternalPushingEnvironm
 **路由**：
 ```
 POST /{username}/{reponame}/git-receive-pack  →  repo.ServiceReceivePack
-POST /{username}/{reponame}/info/refs         →  repo.GetInfoRefs (带 service=git-receive-pack 参数)
+GET  /{username}/{reponame}/info/refs         →  repo.GetInfoRefs (带 ?service=git-receive-pack 查询参数)
 ```
+
+> **修正**：`/info/refs` 使用 `GET` 方法（带 `?service=git-receive-pack` 查询参数），而非 `POST`。`git-receive-pack` 本身才是 `POST`。对应源码：`routers/web/githttp.go:16` → `m.Methods("GET,OPTIONS", "/info/refs", repo.GetInfoRefs)`。
 
 **完整执行流程**：
 
@@ -245,14 +257,22 @@ POST /{username}/{reponame}/info/refs         →  repo.GetInfoRefs (带 service
         │    h.environ = append(h.environ, "SSH_ORIGINAL_COMMAND=receive-pack")  # 用于 hook 层判断非匿名
         │    h.environ = append(h.environ, "GIT_PROTOCOL=<version>")            # 若请求头有 Git-Protocol
         │
-        ├── 构建 git 命令：
+        ├── 构建 git 命令（serviceRPC 内）：
+        │    // 先校验 Content-Type 必须为 application/x-git-receive-pack-request
+        │    // 不匹配则返回 400 Bad Request
+        │    // 支持 gzip 压缩的请求体（Content-Encoding: gzip）
+        │    // 运行命令：
         │    git receive-pack --stateless-rpc .
         │        ├── WithEnv(append(os.Environ(), h.environ...))
-        │        ├── WithStdinCopy(ctx.Req.Body)       # 客户端推送的 pack 数据
+        │        ├── WithStdinCopy(reqBody)           # 客户端推送的 pack 数据（可能解压）
         │        └── WithStdoutCopy(ctx.Resp)          # 结果直接写回 HTTP 响应
         │
         └── 运行命令：
              gitrepo.RunCmdWithStderr(ctx, repo, cmd)
+
+        // info/refs 流程类似，但不启动 hook，仅 advertise refs：
+        //   git receive-pack --stateless-rpc --advertise-refs .
+        //   结果包装为 application/x-git-receive-pack-advertisement
         │
         ▼
   git-receive-pack 启动
@@ -281,17 +301,22 @@ POST /{username}/{reponame}/info/refs         →  repo.GetInfoRefs (带 service
 | `GITEA_REPO_ID` | ✓ | ✓ | 仓库 ID |
 | `GITEA_ROOT_URL` | ✓ | ✓ | App URL |
 | `GITEA_ACTIONS_TASK_ID` | ✓ | ✓ | Actions 用户任务 ID |
-| `GITEA_PR_ID` | ✓ (初始=0) | ✗ | PR ID（HTTP 场景不需要，内部推送时设置） |
+| `GITEA_PR_ID` | ✓ (初始=0) | ✗ | PR ID（HTTP 场景不需要，内部推送通过 FullPushingEnvironment 设置） |
 | `GITEA_DEPLOY_KEY_ID` | ✓ | ✗ | Deploy Key ID（HTTP 不使用 Deploy Key） |
 | `GITEA_KEY_ID` | ✓ | ✗ | SSH 公钥 ID |
 | `SSH_ORIGINAL_COMMAND` | 完整命令（如 `git-receive-pack...`） | `"receive-pack"` | HTTP 场景仅设置为服务名，用于 hook 层跳过匿名检查 |
-| `GIT_PROTOCOL` | ✗ | ✓（若有请求头） | Git 协议版本 |
+| `GIT_PROTOCOL` | ✗ | ✓（若有请求头） | Git 协议版本（通过 Git-Protocol 请求头传递） |
+
+**info/refs 请求的环境变量注入**：
+
+`GetInfoRefs` 同样会调用 `httpBase` 并注入环境变量（`routers/web/repo/githttp.go:455-483`），用于在 `--advertise-refs` 阶段正确设置 hook 环境。但该阶段不启动 hook，仅用于获取引用列表。
 
 **关键设计点**：
-1. HTTP 场景复用 `SSH_ORIGINAL_COMMAND` 环境变量来标记"非匿名推送"，但值仅为服务名而非完整命令
+1. HTTP 场景复用 `SSH_ORIGINAL_COMMAND` 环境变量来标记"非匿名推送"，但值仅为服务名（`"receive-pack"`）而非完整命令
 2. `runHookPreReceive` 中的检查逻辑 `len(os.Getenv("SSH_ORIGINAL_COMMAND")) == 0` 对 HTTP 推送同样生效
 3. HTTP 推送不经过 `gitea serv`，直接由 Web 进程启动 `git-receive-pack`，权限校验在 `httpBase` 中完成
-4. HTTP 推送的环境变量注入入口是 `repo_module.DoerPushingEnvironment`，SSH 推送是在 `runServ` 中手动拼接
+4. HTTP 推送的环境变量注入入口是 `repo_module.DoerPushingEnvironment`（返回基础环境），再在 `serviceRPC` 中追加 `SSH_ORIGINAL_COMMAND` 和 `GIT_PROTOCOL`。SSH 推送是在 `runServ` 中手动拼接完整环境。
+5. `DoerPushingEnvironment` 不含 `SSH_ORIGINAL_COMMAND`，`FullPushingEnvironment` 会设置 `SSH_ORIGINAL_COMMAND=gitea-internal`（内部推送场景）
 
 ---
 
@@ -348,7 +373,9 @@ canWriteCode = CanMaintainerWriteToBranch(userPerm, branchName, user) || deployK
 2. Maintainer 编辑模式检查（仅当用户无直接 Write 权限时触发）：
    │
    ├── 从 headPerm 中提取仓库 ID（GetFirstUnitRepoID）
-   ├── 查询该仓库中 headBranch 作为源分支的所有未合并 PR（GitHub Flow 类型）
+   ├── 查询该仓库中 headBranch 作为源分支的所有未合并 PR
+   │   过滤条件：has_merged=false, is_closed=false, **flow=PullRequestFlowGithub**
+   │   （即**只匹配 GitHub Flow 类型 PR，排除 AGit Flow PR**）
    │
    └── 遍历 PR，寻找满足以下所有条件的 PR：
        │
@@ -361,13 +388,18 @@ canWriteCode = CanMaintainerWriteToBranch(userPerm, branchName, user) || deployK
 3. 以上均不满足 → 返回 false
 ```
 
+> **修正**：`GetUnmergedPullRequestsByHeadInfo` 的 SQL 查询带有 `flow = PullRequestFlowGithub` 过滤条件（`models/issues/pull_list.go:142`），因此 AGit Flow 的 PR 不会触发 Maintainer 编辑路径。
+
 **Hook 场景下的上下文**：
 - 在 `pre-receive` hook 中，`headPerm` 是 doer 对**目标仓库**（被 push 的仓库）的权限，不是 PR HeadRepo 的权限
 - 因此 "maintainer 编辑" 路径只有在以下极特殊场景才会触发：
   - doer 对目标仓库只有 Read 权限
-  - 但存在一个从 fork 仓库的 `branchName` 指向目标仓库的未合并 PR
+  - 但存在一个从 fork 仓库的 `branchName` 指向目标仓库的未合并 PR（GitHub Flow 类型）
   - PR 开启了 `AllowMaintainerEdit`
-  - doer 对目标仓库（BaseRepo）有 Write 权限
+  - PR 发布者对 fork 仓库（HeadRepo）有 Code Write 权限
+  - doer 对目标仓库（BaseRepo）有 Code Write 权限
+
+> **补充**：在 `services/context/repo.go::CanWriteToBranch` 场景中，`headPerm` 同样是 doer 对当前仓库（HeadRepo）的权限，此时 Maintainer 路径才更有意义——用于判断上游仓库的维护者是否有权限修改当前 fork 仓库的源分支。
 
 **完整调用链**：
 - `routers/private/hook_pre_receive.go:62` — hook 中的分支写权限判断
@@ -530,11 +562,13 @@ verifyCommits(oldCommitID, newCommitID, gitRepo, env)
     │
     ├── 新建分支（oldCommitID == EmptyObjectID）:
     │   git rev-list <newCommitID> --not --all
-    │   列出所有新接收的提交（排除仓库中已有的所有 ref 指向的提交）
+    │   列出从 newCommitID 可达、但**无法从仓库中任何已存在 ref（分支/标签）** 可达的提交
+    │   （即排除所有已存在 ref 指向的提交及其所有祖先）
+    │   确保只验证真正通过此次推送新接收的提交
     │
     └── 已有分支:
         git rev-list <old>...<new>
-        列出对称差集范围内的提交
+        列出 old 与 new 的对称差集
     │
     ▼ 逐个提交验证
 readAndVerifyCommit(sha, repo, env)
@@ -602,9 +636,22 @@ if len(output) > 0 {  // 检测到强推
 // hook_verification.go:29 注释："This is safe as force pushes are already forbidden"
 ```
 
-**注释的局限性**：`hook_verification.go:29` 的注释 "This is safe as force pushes are already forbidden" 只说对了一半：
-- 当 `CanForcePush == false` 时，强推在签名验证前就被拒绝，注释成立
-- 当 `CanForcePush == true` 时，强推被允许，签名验证**仍然执行**，此时 `old...new` 包含已被丢弃的 old 侧提交
+**注释的局限性与潜在问题**：`hook_verification.go:29` 的注释 "This is safe as force pushes are already forbidden" 只说对了一半：
+
+| 场景 | CanForcePush | 强推检测结果 | 是否执行签名验证 | old...new 范围 | 实际行为 |
+|------|-------------|-------------|-----------------|---------------|---------|
+| Fast-forward 推送 | 任意 | false | 是 | 仅 new 侧新提交 | ✅ 合理 |
+| Force push | false | true | **否**（强推检测直接拒绝） | N/A | ✅ 注释成立 |
+| Force push | true | true | **是** | old 侧被丢弃提交 + new 侧新提交 | ⚠️ 注释不成立，存在问题 |
+
+**`CanForcePush == true` 时的问题**：
+
+当强推被允许时，`old...new` 包含即将被丢弃的 old 侧提交。对这些提交做签名验证存在两个不合理之处：
+1. **范围过大**：old 侧的提交是即将被丢弃的历史，不应该要求它们都有签名（可能是多年前的历史提交）
+2. **校验对象错误**：`verifyCommits` 通过 `git cat-file commit <sha>` 读取的是**仓库中已存在**的 commit 对象（强推的 old 侧提交必然已存在于仓库中），而非 quarantine 中即将写入的新对象
+3. **不一致性**：`newCommitID --not --all` 逻辑只校验新对象，而 `old...new` 在校验已存在对象
+
+> **修正**：合理的实现应该是在强推场景下改用 `new --not --all`（仅校验新引入的提交），或使用 `old..new`（两点范围，仅 new 侧独有的提交）。当前实现会在允许强推时对将被丢弃的历史提交也做签名检查，可能造成不必要的拒绝。
 
 **代码位置**：`services/asymkey/commit.go::ParseCommitWithSignature()`
 

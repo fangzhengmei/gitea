@@ -46,40 +46,154 @@
 
 ## 二、Web 页面渲染完整链路
 
-### 2.1 链路概览
+### 2.1 链路概览：从 Request 到 HTML
 
 ```
 HTTP Request
     ↓
 [路由匹配] routers/web/web.go
     ↓
-[中间件链] Contexter() → services/context/context.go:160
-    │  ├─ 创建 Context 结构体 (services/context/context.go:41)
-    │  ├─ 初始化 TemplateContext (services/context/context.go:101)
-    │  ├─ 注入公共数据: CommonTemplateContextData()
-    │  ├─ 注入系统配置、Flash 消息、PageData
-    │  └─ ctx.Data = map[string]any{}
+[中间件 1: Contexter()] services/context/context.go:160
+    │
+    ├─ 1. NewWebContext() 创建上下文 (context.go:124)
+    │   ├─ 初始化 ctx.Data = middleware.CommonTemplateContextData()
+    │   ├─ 初始化 ctx.TemplateContext (context.go:101)
+    │   │   ├─ tmplCtx["RootData"] = ctx.Data  ← 关键：引用同一 map
+    │   │   ├─ tmplCtx["Locale"] = locale
+    │   │   ├─ tmplCtx["Consts"] = {...}
+    │   │   └─ ... 其他工具函数
+    │   └─ ctx.Data["PageData"] = ctx.PageData
+    │
+    ├─ 2. 注入请求级公共数据
+    │   ├─ ctx.Data["CurrentURL"] = setting.AppSubURL + req.URL.RequestURI()
+    │   ├─ ctx.Data["Link"] = ctx.Link
+    │   ├─ ctx.Data["SystemConfig"] = setting.Config()
+    │   ├─ ctx.Data["DisableMigrations"] = setting.Repository.DisableMigrations
+    │   ├─ ctx.Data["EnableActions"] = setting.Actions.Enabled
+    │   ├─ ctx.Data["AllLangs"] = translation.AllLangs()
+    │   └─ ctx.Data["ShowTwoFactorRequiredMessage"] = ctx.DoerNeedTwoFactorAuth()
+    │
+    └─ 3. Flash 消息处理
+        ├─ 读取 cookie 中的上一次消息到 ctx.Data["Flash"]
+        └─ 注册 Before hook 写入新消息
+    ↓
+[中间件 2: RepoAssignment()] services/context/repo.go:792
+    │
+    ├─ 1. repoAssignmentPrepareOwner() 解析 Owner
+    ├─ 2. repoAssignmentPrepareRepo() 查找 Repository
+    ├─ 3. repoAssignmentLegacy() 权限校验
+    │   └─ ctx.Data["Permission"] = &ctx.Repo.Permission
+    └─ 4. repoAssignmentPrepareTemplateData() 批量注入 (repo.go:587)
+        ├─ ctx.Data["Repository"] = repo  ← 完整 DB Model
+        ├─ ctx.Data["Owner"] = repo.Owner
+        ├─ ctx.Data["RepoLink"] = repo.Link()
+        ├─ ctx.Data["CanWriteCode"] = Permission.CanWrite(TypeCode)
+        ├─ ctx.Data["NumReleases"] = db.Count[...]
+        ├─ ctx.Data["IsWatchingRepo"] = repo_model.IsWatching(...)
+        ├─ ctx.Data["IsStaringRepo"] = repo_model.IsStaring(...)
+        └─ ... 共注入 30+ 个变量（见第十章）
+    ↓
+[中间件 3: RepoRefByType()] services/context/repo.go:937
+    │
+    ├─ 解析 Git 引用 (branch/tag/commit)
+    ├─ 设置 ctx.Repo.BranchName / Commit / TreePath
+    └─ 注入 ctx.Data["BranchName"] / "CommitID" / "TreePath"
     ↓
 [Handler] 例如 Home() → routers/web/repo/view_home.go:389
-    │  ├─ 执行业务逻辑，查询 DB Model
-    │  │   topics, _ := db.Find[repo_model.Topic](...)
-    │  ├─ 直接注入 ctx.Data (无转换层)
-    │  │   ctx.Data["Topics"] = topics          // view_home.go:66
-    │  │   ctx.Data["LatestRelease"] = release  // view_home.go:183
-    │  │   ctx.Data["LanguageStats"] = langs    // view_home.go:164
-    │  └─ 调用 ctx.HTML() 触发渲染
+    │
+    ├─ 执行业务逻辑，查询 DB Model
+    │   topics, _ := db.Find[repo_model.Topic](...)
+    ├─ 直接注入 ctx.Data (无转换层)
+    │   ctx.Data["Topics"] = topics          // view_home.go:66
+    │   ctx.Data["LatestRelease"] = release  // view_home.go:183
+    │   ctx.Data["LanguageStats"] = langs    // view_home.go:164
+    └─ 调用 ctx.HTML() 触发渲染
     ↓
-[模板渲染] ctx.HTML() → services/context/context_response.go:81
-    │  ├─ 传入模板名和 ctx.Data
-    │  └─ PageRenderer.HTML() → modules/templates/page.go:47
+[渲染触发] ctx.HTML() services/context/context_response.go:81
+    │
+    ├─ ctx.Data["TemplateName"] = name
+    ├─ ctx.Data["TemplateLoadTimes"] = func() string {...}
+    └─ ctx.Render.HTML(ctx.Resp, status, name, ctx.Data, ctx.TemplateContext)
+    ↓
+[模板引擎] PageRenderer.HTML() modules/templates/page.go:47
+    │
+    └─ t.Execute(w, data)  ← data = ctx.Data，作为模板根对象
     ↓
 [模板执行] Go Template Engine
-    │  ├─ 模板通过 .Data.Key 访问数据
-    │  │   例如: {{range .Data.Topics}} ... {{end}}
-    │  └─ 输出 HTML
+    │
+    ├─ 直接访问：.Key → ctx.Data["Key"]
+    │   例如: .Repository.Name → ctx.Data["Repository"].Name
+    │        .Permission.IsAdmin → ctx.Data["Permission"].IsAdmin
+    │
+    ├─ 模板函数（通过 ctx 访问 TemplateContext）：
+    │   ctx.Locale.Tr("...") → TemplateContext["Locale"]
+    │   ctx.Consts.RepoUnitTypeCode → TemplateContext["Consts"]["RepoUnitTypeCode"]
+    │   ctx.RootData.Key → TemplateContext["RootData"]["Key"] = ctx.Data["Key"]
+    │
+    └─ JavaScript 数据：
+        .PageData → 渲染为 window.config.pageData
     ↓
 HTTP Response (text/html)
 ```
+
+### 2.2 ContextData 注入路径详解
+
+#### 注入时序与层级
+
+```
+Contexter() 中间件
+    ↓
+┌─ ctx.Data 初始化
+│   ├─ CommonTemplateContextData()  // 全局公共数据
+│   ├─ CurrentURL / Link            // 请求级数据
+│   ├─ SystemConfig / AllLangs      // 系统配置
+│   └─ PageData                     // JS 数据容器
+    ↓
+RepoAssignment() 中间件
+    ↓
+┌─ 仓库级数据注入 (30+ 字段)
+│   ├─ Repository / Owner           // DB Model 直出
+│   ├─ Permission                   // 完整权限对象
+│   ├─ RepoLink / RepoCloneLink     // 链接
+│   ├─ CanWriteCode / ...           // 预计算布尔值
+│   ├─ NumReleases / NumTags        // 统计数据
+│   └─ IsWatchingRepo / IsStaringRepo  // 用户状态
+    ↓
+RepoRefByType() 中间件
+    ↓
+┌─ Git 引用级数据
+│   ├─ BranchName / CommitID
+│   └─ TreePath / CommitsCount
+    ↓
+Handler
+    ↓
+┌─ 页面专属数据
+│   ├─ Topics / LatestRelease
+│   ├─ LanguageStats / ...
+│   └─ 各页面私有数据
+    ↓
+ctx.HTML() 渲染触发
+    ↓
+┌─ 渲染时注入
+    ├─ TemplateName
+    └─ TemplateLoadTimes
+```
+
+#### 关键设计：`ctx.RootData` 与 `ctx.Data` 共享同一 Map
+
+```go
+// NewTemplateContextForWeb (context.go:101)
+tmplCtx["RootData"] = ctx.GetData()  // 返回 ctx.Data，同引用！
+
+// 所以:
+ctx.Data["Repository"] = repo
+// 等价于:
+TemplateContext["RootData"]["Repository"] = repo
+```
+
+这意味着：
+- 在模板根级别，`.Repository` 和 `ctx.RootData.Repository` 是同一个对象
+- 在嵌套模板或 range 循环中，`.` 被重新绑定后，用 `ctx.RootData` 访问根数据
 
 ### 2.2 关键代码详解
 
@@ -468,10 +582,10 @@ ctx.Data["LatestRelease"] = release  // release 是 *repo_model.Release
 
 // 模板中按需取用（隐式裁剪）
 // templates/repo/home.tmpl
-{{if .Data.LatestRelease}}
+{{if .LatestRelease}}
     <div class="release-info">
-        <span class="tag">{{.Data.LatestRelease.TagName}}</span>
-        <span class="title">{{.Data.LatestRelease.Title}}</span>
+        <span class="tag">{{.LatestRelease.TagName}}</span>
+        <span class="title">{{.LatestRelease.Title}}</span>
         {{/* 模板不访问的字段不会被输出 */}}
     </div>
 {{end}}
@@ -597,21 +711,95 @@ DB Model (repo_model.Repository)
 3. **版本兼容**：API 字段可以独立演进，不与 DB Model 强绑定
 4. **格式标准化**：统一时间格式、枚举值映射、URL 生成等
 
-### 9.3 `ctx.Data` vs `ctx.PageData` 的区别
+### 9.3 模板数据访问层级：`ctx.Data` vs `TemplateContext` vs `ctx.RootData`
+
+#### 关键概念澄清
+
+| 概念 | 类型 | 说明 | 模板访问方式 |
+|-----|------|------|-------------|
+| **`ctx.Data`** | `map[string]any` | **模板根数据对象**，所有业务数据都注入到这里 | 直接 `.Key` |
+| **`TemplateContext`** | `map[string]any` | 模板**函数上下文**，提供辅助方法 | 通过 `ctx.` 前缀调用 |
+| **`ctx.RootData`** | `ctx.Data` 的引用 | 嵌套模板/模板函数中访问根数据的入口 | `ctx.RootData.Key` |
+| **`ctx.PageData`** | `map[string]any` | JavaScript 模块数据，从 `ctx.Data["PageData"]` 注入 | `window.config.pageData.Key` |
+
+#### 访问方式详解
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Go Template Engine                       │
+├─────────────────────────────────────────────────────────────┤
+│  根对象 = ctx.Data (map[string]any)                          │
+│                                                              │
+│  直接访问：.Repository → ctx.Data["Repository"]              │
+│             .Permission → ctx.Data["Permission"]              │
+│             .Topics     → ctx.Data["Topics"]                  │
+│                                                              │
+│  模板函数上下文（通过 ctx 函数访问）：                         │
+│    ctx.Locale.Tr("...")                                      │
+│    ctx.Consts.RepoUnitTypeCode                               │
+│    ctx.RootData.Repository   → 等价于 .Repository            │
+│    ctx.RootData.Permission   → 等价于 .Permission            │
+│                                                              │
+│  JavaScript 数据：                                            │
+│    .PageData → 渲染为 window.config.pageData                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 代码注入路径
+
+**`TemplateContext` 注入**（`services/context/context.go:101`）：
+```go
+func NewTemplateContextForWeb(...) TemplateContext {
+    tmplCtx["Locale"] = locale
+    tmplCtx["AvatarUtils"] = templates.NewAvatarUtils(ctx)
+    tmplCtx["RootData"] = ctx.GetData()  // = ctx.Data
+    tmplCtx["Consts"] = map[string]any{
+        "RepoUnitTypeCode": unit.TypeCode,
+        // ...
+    }
+    return tmplCtx
+}
+```
+
+**模板渲染时传递**（`modules/templates/page.go:59`）：
+```go
+// data = ctx.Data，作为模板根对象
+return t.Execute(w, data)
+```
+
+#### `ctx.RootData` 的使用场景
+
+当模板的 `.` 被重新绑定时（如 range 循环、dict 调用），需要用 `ctx.RootData` 访问原始根数据：
+
+```html
+{{range .Topics}}
+    <!-- 这里 . 是当前 Topic，不是根对象 -->
+    <div>{{.Name}}</div>
+    
+    <!-- 访问根对象的 Permission 需要用 ctx.RootData -->
+    {{if ctx.RootData.Permission.IsAdmin}}
+        <button>删除</button>
+    {{end}}
+{{end}}
+```
+
+#### `ctx.Data` vs `ctx.PageData` 对比
 
 | 特性 | `ctx.Data` | `ctx.PageData` |
 |-----|-----------|---------------|
 | 用途 | 模板渲染数据 | JavaScript 模块数据 |
-| 访问方式 | 模板中 `.Data.Key` | `window.config.pageData.Key` |
-| 传递方式 | 模板执行时传入 | 渲染到 `head.tmpl` 的 inline script |
-| 数据类型 | 任意 Go 类型 | 需可序列化为 JSON |
-| 典型数据 | 列表、对象、HTML 字符串 | 配置项、初始状态、API 响应 |
+| 访问方式 | 模板中 `.Key` | `window.config.pageData.Key` |
+| 传递方式 | 模板执行时作为根对象传入 | 渲染到 `head.tmpl` 的 inline script |
+| 数据类型 | 任意 Go 类型（结构体、方法等） | 需可序列化为 JSON |
+| 典型数据 | 列表、对象、权限、HTML 字符串 | 配置项、初始状态、API 响应 |
 
 ```go
-// ctx.Data - 给 Go 模板用
-ctx.Data["Topics"] = topics  // topics 是 Go 结构体切片
+// ctx.Data - 给 Go 模板用，直接作为根对象
+ctx.Data["Topics"] = topics          // Go 结构体切片
+ctx.Data["Permission"] = permission  // 带方法的权限对象
+ctx.Data["Repository"] = repo        // 完整 DB Model
 
-// ctx.PageData - 给 JavaScript 用
+// ctx.PageData - 给 JavaScript 用，从 ctx.Data["PageData"] 注入
 ctx.PageData["citationFileContent"] = content  // 会被 JSON 序列化
 ```
 
@@ -717,16 +905,16 @@ ctx.Data["Permission"] = &ctx.Repo.Permission           // 注入权限对象到
 
 ### 10.4 模板中的权限变量取值路径
 
-模板中权限检查主要通过 `.Permission` 对象和预计算的布尔值两条路径：
+模板中权限检查主要通过 `.Permission` 对象和预计算的布尔值两条路径。**注意：模板根对象是 `ctx.Data`，所以直接用 `.Key` 访问，不是 `.Data.Key`**。
 
 **路径 1：直接使用预计算布尔值**（由 `repoAssignmentPrepareTemplateData` 注入）
 
 ```
-模板取值                  注入来源                              代码行
-.CanWriteCode         ← Permission.CanWrite(TypeCode)        repo.go:622
-.CanWriteIssues       ← Permission.CanWrite(TypeIssues)      repo.go:623
-.CanWritePulls        ← Permission.CanWrite(TypePullRequests) repo.go:624
-.CanWriteActions      ← Permission.CanWrite(TypeActions)     repo.go:625
+模板取值               ctx.Data Key            注入来源                          代码行
+.CanWriteCode      ←  CanWriteCode         ← Permission.CanWrite(TypeCode)    repo.go:622
+.CanWriteIssues    ←  CanWriteIssues       ← Permission.CanWrite(TypeIssues)  repo.go:623
+.CanWritePulls     ←  CanWritePulls        ← Permission.CanWrite(TypePullRequests) repo.go:624
+.CanWriteActions   ←  CanWriteActions      ← Permission.CanWrite(TypeActions) repo.go:625
 ```
 
 模板示例：`templates/repo/issue/milestones.tmpl:10`
@@ -738,8 +926,8 @@ ctx.Data["Permission"] = &ctx.Repo.Permission           // 注入权限对象到
 
 ```
 模板取值                                  对应方法
-.Permission.IsAdmin                   ← access_model.Permission.IsAdmin
-.Permission.IsOwner                   ← access_model.Permission.IsOwner
+.Permission.IsAdmin                   ← ctx.Data["Permission"].IsAdmin
+.Permission.IsOwner                   ← ctx.Data["Permission"].IsOwner
 .Permission.CanRead ctx.Consts.RepoUnitTypeCode     ← Permission.CanRead(TypeCode)
 .Permission.CanWrite ctx.Consts.RepoUnitTypeCode    ← Permission.CanWrite(TypeCode)
 .Permission.HasAnyUnitPublicAccess    ← Permission.HasAnyUnitPublicAccess
@@ -748,6 +936,19 @@ ctx.Data["Permission"] = &ctx.Repo.Permission           // 注入权限对象到
 模板示例：`templates/repo/pulse.tmpl:21`
 ```html
 {{if (or (.Permission.CanRead ctx.Consts.RepoUnitTypeIssues) (.Permission.CanRead ctx.Consts.RepoUnitTypePullRequests))}}
+```
+
+**路径 3：嵌套模板中通过 ctx.RootData 访问**（当 `.` 被重新绑定时）
+
+```
+模板取值                                  等价于
+ctx.RootData.Permission.IsAdmin       ← .Permission.IsAdmin
+ctx.RootData.Repository.Name          ← .Repository.Name
+```
+
+模板示例：`templates/repo/issue/view_content/context_menu.tmpl:22`
+```html
+{{if or ctx.RootData.Permission.IsAdmin .IsCommentPoster ctx.RootData.HasIssuesOrPullsWritePermission}}
 ```
 
 ---

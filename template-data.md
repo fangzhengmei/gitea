@@ -51,33 +51,81 @@
 ```
 HTTP Request
     ↓
-[路由匹配] routers/web/web.go
+[全局协议中间件] routers/common/middleware.go:27 ProtocolMiddlewares()
+    │
+    └─ RequestContextHandler() (middleware.go:65)
+        ├─ reqctx.NewRequestContext() → 创建 requestDataStore
+        │   └─ data 字段初始为 nil（惰性创建，见 datastore.go:68）
+        ├─ 将 requestDataStore 注入 req.Context()
+        └─ panic recovery
     ↓
-[中间件 1: Contexter()] services/context/context.go:160
+[路由级中间件链] routers/web/web.go:257 Routes()
     │
-    ├─ 1. NewWebContext() 创建上下文 (context.go:124)
-    │   ├─ 初始化 ctx.Data = middleware.CommonTemplateContextData()
-    │   ├─ 初始化 ctx.TemplateContext (context.go:101)
-    │   │   ├─ tmplCtx["RootData"] = ctx.Data  ← 关键：引用同一 map
-    │   │   ├─ tmplCtx["Locale"] = locale
-    │   │   ├─ tmplCtx["Consts"] = {...}
-    │   │   └─ ... 其他工具函数
-    │   └─ ctx.Data["PageData"] = ctx.PageData
+    │  中间件注册顺序（web.go:298-311）：
+    │    mid = [Sessioner, Contexter, webAuth, goGet, PageGlobalData, ...]
     │
-    ├─ 2. 注入请求级公共数据
-    │   ├─ ctx.Data["CurrentURL"] = setting.AppSubURL + req.URL.RequestURI()
-    │   ├─ ctx.Data["Link"] = ctx.Link
-    │   ├─ ctx.Data["SystemConfig"] = setting.Config()
-    │   ├─ ctx.Data["DisableMigrations"] = setting.Repository.DisableMigrations
-    │   ├─ ctx.Data["EnableActions"] = setting.Actions.Enabled
-    │   ├─ ctx.Data["AllLangs"] = translation.AllLangs()
-    │   └─ ctx.Data["ShowTwoFactorRequiredMessage"] = ctx.DoerNeedTwoFactorAuth()
+    ├─ [中间件 1: Sessioner] 会话初始化
     │
-    └─ 3. Flash 消息处理
-        ├─ 读取 cookie 中的上一次消息到 ctx.Data["Flash"]
-        └─ 注册 Before hook 写入新消息
+    ├─ [中间件 2: Contexter()] services/context/context.go:160
+    │   │
+    │   ├─ 2a. NewBaseContext(resp, req) → base.go:191
+    │   │   ├─ reqCtx = reqctx.FromContext(req.Context())
+    │   │   │   └─ 从 req.Context() 取出 RequestContextHandler 创建的 requestDataStore
+    │   │   ├─ base.Data = reqCtx.GetData() → datastore.go:67
+    │   │   │   └─ 首次调用时惰性创建: make(ContextData) → 空 map
+    │   │   ├─ base.Locale = middleware.Locale(resp, req)
+    │   │   └─ 返回 *Base
+    │   │
+    │   ├─ 2b. NewWebContext(base, rnd, session) → context.go:124
+    │   │   ├─ ctx.Data = base.Data ← 引用同一 ContextData map
+    │   │   ├─ ctx.TemplateContext = NewTemplateContextForWeb(ctx, req, locale)
+    │   │   │   ├─ tmplCtx["RootData"] = ctx.GetData() ← 引用 ctx.Data
+    │   │   │   ├─ tmplCtx["Locale"] = locale
+    │   │   │   ├─ tmplCtx["Consts"] = {RepoUnitTypeCode, ...}
+    │   │   │   ├─ tmplCtx["AvatarUtils"] = ...
+    │   │   │   ├─ tmplCtx["RenderUtils"] = ...
+    │   │   │   └─ tmplCtx["MiscUtils"] / "ActionsUtils" = ...
+    │   │   └─ ctx.Data["PageData"] = ctx.PageData (空 map，给 JS 用)
+    │   │
+    │   ├─ 2c. ctx.Data.MergeFrom(CommonTemplateContextData())
+    │   │   └─ 将以下字段合并进 ctx.Data（不是赋值，是 MergeInto）:
+    │   │       PageTitleCommon, IsLandingPageOrganizations,
+    │   │       ShowRegistrationButton, ShowMilestonesDashboardPage,
+    │   │       ShowFooterVersion, DisableDownloadSourceArchives,
+    │   │       EnableSwagger, EnableOpenIDSignIn,
+    │   │       PageStartTime, RunModeIsProd, ViteModeIsDev
+    │   │
+    │   ├─ 2d. 注入请求级数据
+    │   │   ├─ ctx.Data["CurrentURL"]
+    │   │   └─ ctx.Data["Link"] = ctx.Link
+    │   │
+    │   ├─ 2e. Flash 消息处理
+    │   │   ├─ 读取 cookie 中的上一次消息到 ctx.Data["Flash"]
+    │   │   └─ 注册 Before hook 写入新消息
+    │   │
+    │   ├─ 2f. 注入系统配置
+    │   │   ├─ ctx.Data["SystemConfig"]
+    │   │   ├─ ctx.Data["ShowTwoFactorRequiredMessage"]
+    │   │   ├─ ctx.Data["DisableMigrations"]
+    │   │   ├─ ctx.Data["DisableStars"]
+    │   │   ├─ ctx.Data["EnableActions"]
+    │   │   └─ ctx.Data["AllLangs"]
+    │   │
+    │   └─ next.ServeHTTP(ctx.Resp, ctx.Req)
+    │
+    ├─ [中间件 3: webAuth] 认证 (web.go:301)
+    │   └─ 设置 ctx.Doer (当前登录用户)
+    │
+    ├─ [中间件 4: PageGlobalData] routers/common/pagetmpl.go:76
+    │   └─ ctx.Data["PageGlobalData"] = {
+    │          IsSigned, IsSiteAdmin,
+    │          GetNotificationUnreadCount (惰性求值),
+    │          GetActiveStopwatch (惰性求值)
+    │      }
+    │
+    └─ [中间件 5+: RepoAssignment / Handler 特定中间件]
     ↓
-[中间件 2: RepoAssignment()] services/context/repo.go:792
+[RepoAssignment()] services/context/repo.go:792
     │
     ├─ 1. repoAssignmentPrepareOwner() 解析 Owner
     ├─ 2. repoAssignmentPrepareRepo() 查找 Repository
@@ -138,45 +186,86 @@ HTTP Response (text/html)
 
 ### 2.2 ContextData 注入路径详解
 
-#### 注入时序与层级
+#### ctx.Data 的完整生命周期
 
 ```
-Contexter() 中间件
-    ↓
-┌─ ctx.Data 初始化
-│   ├─ CommonTemplateContextData()  // 全局公共数据
-│   ├─ CurrentURL / Link            // 请求级数据
-│   ├─ SystemConfig / AllLangs      // 系统配置
-│   └─ PageData                     // JS 数据容器
-    ↓
-RepoAssignment() 中间件
-    ↓
-┌─ 仓库级数据注入 (30+ 字段)
-│   ├─ Repository / Owner           // DB Model 直出
-│   ├─ Permission                   // 完整权限对象
-│   ├─ RepoLink / RepoCloneLink     // 链接
-│   ├─ CanWriteCode / ...           // 预计算布尔值
-│   ├─ NumReleases / NumTags        // 统计数据
-│   └─ IsWatchingRepo / IsStaringRepo  // 用户状态
-    ↓
-RepoRefByType() 中间件
-    ↓
-┌─ Git 引用级数据
-│   ├─ BranchName / CommitID
-│   └─ TreePath / CommitsCount
-    ↓
-Handler
-    ↓
-┌─ 页面专属数据
-│   ├─ Topics / LatestRelease
-│   ├─ LanguageStats / ...
-│   └─ 各页面私有数据
-    ↓
-ctx.HTML() 渲染触发
-    ↓
-┌─ 渲染时注入
-    ├─ TemplateName
-    └─ TemplateLoadTimes
+阶段 0: RequestContextHandler (全局协议中间件)
+    │
+    └─ reqctx.NewRequestContext() → 创建 requestDataStore
+        └─ data 字段 = nil（尚未创建 map）
+           首次调用 GetData() 时才 make(ContextData)
+
+阶段 1: Contexter → NewBaseContext (context/base.go:191)
+    │
+    ├─ reqCtx = reqctx.FromContext(req.Context())
+    │   └─ 从 req.Context() 取出阶段 0 创建的 requestDataStore
+    ├─ base.Data = reqCtx.GetData() (datastore.go:67)
+    │   └─ if r.data == nil { r.data = make(ContextData) } → 创建空 map
+    │      此时 ctx.Data = {} ← 空 map，无任何数据
+    └─ base.Locale = middleware.Locale(resp, req)
+
+阶段 2: Contexter → NewWebContext (context/context.go:124)
+    │
+    ├─ ctx.Data = base.Data ← 引用阶段 1 创建的空 map
+    ├─ ctx.TemplateContext = NewTemplateContextForWeb(ctx, req, locale)
+    │   └─ tmplCtx["RootData"] = ctx.GetData() ← 引用同一个 map
+    └─ ctx.Data["PageData"] = ctx.PageData ← 第一个写入的数据项
+
+阶段 3: Contexter → MergeFrom(CommonTemplateContextData) (context.go:166)
+    │
+    └─ maps.Copy(ctx.Data, CommonTemplateContextData())
+        将以下字段合并进已有 map（不覆盖已存在的 key）:
+        PageTitleCommon, IsLandingPageOrganizations,
+        ShowRegistrationButton, ShowMilestonesDashboardPage,
+        ShowFooterVersion, DisableDownloadSourceArchives,
+        EnableSwagger, EnableOpenIDSignIn,
+        PageStartTime, RunModeIsProd, ViteModeIsDev
+
+阶段 4: Contexter → 注入请求级数据 (context.go:167-210)
+    │
+    ├─ ctx.Data["CurrentURL"]
+    ├─ ctx.Data["Link"]
+    ├─ ctx.Data["Flash"]
+    ├─ ctx.Data["SystemConfig"]
+    ├─ ctx.Data["ShowTwoFactorRequiredMessage"]
+    ├─ ctx.Data["DisableMigrations"]
+    ├─ ctx.Data["DisableStars"]
+    ├─ ctx.Data["EnableActions"]
+    └─ ctx.Data["AllLangs"]
+
+阶段 5: webAuth 认证中间件 (web.go:301)
+    │
+    └─ 设置 ctx.Doer（间接影响后续数据，如 IsSigned）
+
+阶段 6: PageGlobalData (routers/common/pagetmpl.go:76)
+    │
+    └─ ctx.Data["PageGlobalData"] = {
+           IsSigned, IsSiteAdmin,
+           GetNotificationUnreadCount, GetActiveStopwatch
+       }
+
+阶段 7: RepoAssignment (services/context/repo.go:792)
+    │
+    ├─ ctx.Data["Permission"] = &ctx.Repo.Permission
+    ├─ ctx.Data["Repository"] = repo
+    ├─ ctx.Data["Owner"] = repo.Owner
+    ├─ ctx.Data["CanWriteCode"] = ...
+    └─ ... 共 30+ 个仓库级字段
+
+阶段 8: RepoRefByType (services/context/repo.go:937)
+    │
+    ├─ ctx.Data["BranchName"]
+    ├─ ctx.Data["CommitID"]
+    └─ ctx.Data["TreePath"] / "CommitsCount"
+
+阶段 9: Handler 专属数据
+    │
+    └─ 各页面 Handler 注入页面专属数据
+
+阶段 10: ctx.HTML() 渲染触发 (context_response.go:81)
+    │
+    ├─ ctx.Data["TemplateName"]
+    └─ ctx.Data["TemplateLoadTimes"]
 ```
 
 #### 关键设计：`ctx.RootData` 与 `ctx.Data` 共享同一 Map
@@ -195,9 +284,57 @@ TemplateContext["RootData"]["Repository"] = repo
 - 在模板根级别，`.Repository` 和 `ctx.RootData.Repository` 是同一个对象
 - 在嵌套模板或 range 循环中，`.` 被重新绑定后，用 `ctx.RootData` 访问根数据
 
-### 2.2 关键代码详解
+#### `CommonTemplateContextData` 的职责边界
 
-#### 2.2.1 上下文创建与公共数据注入
+**文件**: `modules/web/middleware/data.go:24`
+
+`CommonTemplateContextData()` 是一个**纯函数**，返回一个**新的 `ContextData` map**，包含不依赖任何请求状态的全局配置项：
+
+| 字段 | 来源 | 说明 |
+|-----|------|------|
+| `PageTitleCommon` | `setting.AppName` | 默认页面标题 |
+| `IsLandingPageOrganizations` | `setting.LandingPageURL` | 首页是否为组织列表 |
+| `ShowRegistrationButton` | `setting.Service.ShowRegistrationButton` | 是否显示注册按钮 |
+| `ShowMilestonesDashboardPage` | `setting.Service.ShowMilestonesDashboardPage` | 是否显示里程碑仪表盘 |
+| `ShowFooterVersion` | `setting.Other.ShowFooterVersion` | 页脚是否显示版本 |
+| `DisableDownloadSourceArchives` | `setting.Repository.DisableDownloadSourceArchives` | 是否禁用源码下载 |
+| `EnableSwagger` | `setting.API.EnableSwagger` | 是否启用 Swagger |
+| `EnableOpenIDSignIn` | `setting.Service.EnableOpenIDSignIn` | 是否启用 OpenID |
+| `PageStartTime` | `time.Now()` | 页面开始时间 |
+| `RunModeIsProd` | `setting.IsProd` | 是否生产模式 |
+| `ViteModeIsDev` | `public.IsViteDevMode()` | 是否 Vite 开发模式 |
+
+**关键区别**：`CommonTemplateContextData` 不包含 `SystemConfig`、`AllLangs`、`DisableMigrations` 等。这些在 `Contexter` 中单独注入（context.go:201-210），因为它们属于**请求级配置**而非全局模板常量。
+
+#### `NewWebContext` 的职责范围
+
+**文件**: `services/context/context.go:124`
+
+`NewWebContext` **不做数据注入**，只做结构体组装：
+
+```go
+func NewWebContext(base *Base, render Render, session session.Store) *Context {
+    ctx := &Context{
+        Base:    base,       // 包含 Data（已有空 map）
+        Render:  render,
+        Session: session,
+        Cache:   cache.GetCache(),
+        Link:    setting.AppSubURL + ...,
+        Repo:    &Repository{},
+        Org:     &Organization{},
+    }
+    ctx.TemplateContext = NewTemplateContextForWeb(ctx, ctx.Base.Req, ctx.Base.Locale)
+    ctx.Flash = &middleware.Flash{...}
+    ctx.SetContextValue(WebContextKey, ctx)
+    return ctx
+}
+```
+
+数据注入由调用方（`Contexter`）负责，`NewWebContext` 不参与。
+
+### 2.3 关键代码详解
+
+#### 2.3.1 上下文创建与公共数据注入
 
 **文件**: `services/context/context.go:160`
 
@@ -206,24 +343,34 @@ func Contexter() func(next http.Handler) http.Handler {
     rnd := templates.PageRenderer()
     return func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+            // 步骤 2a+2b: NewBaseContext 惰性创建空 ContextData map，
+            //              NewWebContext 引用该 map 并初始化 TemplateContext
             base := NewBaseContext(resp, req)
             ctx := NewWebContext(base, rnd, session.GetContextSession(req))
-            
-            // 注入公共模板数据
+
+            // 步骤 2c: 合并全局公共数据（MergeFrom = maps.Copy）
             ctx.Data.MergeFrom(middleware.CommonTemplateContextData())
+
+            // 步骤 2d: 请求级数据
             ctx.Data["CurrentURL"] = setting.AppSubURL + req.URL.RequestURI()
             ctx.Data["Link"] = ctx.Link
-            
+
             // PageData 传递给 JavaScript (window.config.pageData)
+            // 注意：PageData 在 NewWebContext 中已通过 ctx.Data["PageData"] = ctx.PageData 关联
             ctx.PageData = map[string]any{}
             ctx.Data["PageData"] = ctx.PageData
-            
-            // 注入系统配置
+
+            // 步骤 2e: Flash 消息
+            // ...
+
+            // 步骤 2f: 系统配置（不属于 CommonTemplateContextData）
             ctx.Data["SystemConfig"] = setting.Config()
+            ctx.Data["ShowTwoFactorRequiredMessage"] = ctx.DoerNeedTwoFactorAuth()
             ctx.Data["DisableMigrations"] = setting.Repository.DisableMigrations
-            ctx.Data["EnableActions"] = setting.Actions.Enabled && ...
+            ctx.Data["DisableStars"] = setting.Repository.DisableStars
+            ctx.Data["EnableActions"] = setting.Actions.Enabled && !unit.TypeActions.UnitGlobalDisabled()
             ctx.Data["AllLangs"] = translation.AllLangs()
-            
+
             next.ServeHTTP(ctx.Resp, ctx.Req)
         })
     }
@@ -260,7 +407,7 @@ func Home(ctx *context.Context) {
 }
 ```
 
-#### 2.2.3 模板渲染入口
+#### 2.3.3 模板渲染入口
 
 **文件**: `services/context/context_response.go:81`
 
@@ -278,7 +425,7 @@ func (ctx *Context) HTML(status int, name templates.TplName) {
 }
 ```
 
-#### 2.2.4 TemplateContext 辅助函数注入
+#### 2.3.4 TemplateContext 辅助函数注入
 
 **文件**: `services/context/context.go:101`
 
@@ -557,14 +704,20 @@ type Repository struct {
 
 | 组件 | 文件路径 | 关键行号 | 说明 |
 |-----|---------|---------|------|
-| Web 上下文 | `services/context/context.go` | 41, 124, 160 | Context 结构体、NewWebContext、Contexter 中间件 |
+| 请求数据存储 | `modules/reqctx/datastore.go` | 19, 43, 67, 127 | ContextData 类型、requestDataStore、GetData 惰性创建、NewRequestContext |
+| 全局协议中间件 | `routers/common/middleware.go` | 65, 73 | RequestContextHandler、创建 requestDataStore |
+| Base 上下文 | `services/context/base.go` | 33, 191 | Base 结构体、NewBaseContext（从 RequestContext 取 Data） |
+| Web 上下文 | `services/context/context.go` | 124, 160 | NewWebContext、Contexter 中间件 |
 | API 上下文 | `services/context/api.go` | 34, 225 | APIContext 结构体、APIContexter 中间件 |
+| 公共模板数据 | `modules/web/middleware/data.go` | 24 | CommonTemplateContextData() 纯函数 |
+| 页面全局数据 | `routers/common/pagetmpl.go` | 76 | PageGlobalData() |
 | Web 渲染 | `services/context/context_response.go` | 81 | Context.HTML() 渲染入口 |
-| 模板引擎 | `modules/templates/page.go` | 23, 47, 62 | PageRenderer、HTML 渲染方法 |
-| 模板上下文 | `services/context/context_template.go` | 23, 101 | TemplateContext、辅助函数注入 |
+| 模板引擎 | `modules/templates/page.go` | 23, 47, 59 | PageRenderer、HTML 渲染方法、t.Execute(w, data) |
+| 模板上下文 | `services/context/context_template.go` | 23, 27 | TemplateContext、NewTemplateContext |
 | Convert 层入口 | `services/convert/convert.go` | 44 | ToEmail、ToBranch 等转换函数 |
 | Convert 层仓库 | `services/convert/repository.go` | 22, 26 | ToRepo、innerToRepo 字段映射 |
 | API 结构体 | `modules/structs/repo.go` | 59 | Repository 结构体定义 |
+| Web 路由注册 | `routers/web/web.go` | 257, 298 | Routes()、中间件注册顺序 |
 | Web Handler 示例 | `routers/web/repo/view_home.go` | 389 | Home() 仓库首页 |
 | API Handler 示例 | `routers/api/v1/repo/repo.go` | 500, 526 | Get() 获取仓库信息 |
 

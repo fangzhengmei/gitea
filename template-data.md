@@ -85,7 +85,8 @@ HTTP Request
     │   │   │   ├─ tmplCtx["AvatarUtils"] = ...
     │   │   │   ├─ tmplCtx["RenderUtils"] = ...
     │   │   │   └─ tmplCtx["MiscUtils"] / "ActionsUtils" = ...
-    │   │   └─ ctx.Data["PageData"] = ctx.PageData (空 map，给 JS 用)
+    │   │   ├─ ctx.PageData = nil ← 未初始化（结构体零值）
+    │   │   └─ ctx.Data 中无 "PageData" 键 ← NewWebContext 不负责此注入
     │   │
     │   ├─ 2c. ctx.Data.MergeFrom(CommonTemplateContextData())
     │   │   └─ 将以下字段合并进 ctx.Data（不是赋值，是 MergeInto）:
@@ -97,7 +98,9 @@ HTTP Request
     │   │
     │   ├─ 2d. 注入请求级数据
     │   │   ├─ ctx.Data["CurrentURL"]
-    │   │   └─ ctx.Data["Link"] = ctx.Link
+    │   │   ├─ ctx.Data["Link"] = ctx.Link
+    │   │   ├─ ctx.PageData = map[string]any{}          ← Contexter 初始化 PageData
+    │   │   └─ ctx.Data["PageData"] = ctx.PageData      ← Contexter 注入到模板数据
     │   │
     │   ├─ 2e. Flash 消息处理
     │   │   ├─ 读取 cookie 中的上一次消息到 ctx.Data["Flash"]
@@ -209,7 +212,7 @@ HTTP Response (text/html)
     ├─ ctx.Data = base.Data ← 引用阶段 1 创建的空 map
     ├─ ctx.TemplateContext = NewTemplateContextForWeb(ctx, req, locale)
     │   └─ tmplCtx["RootData"] = ctx.GetData() ← 引用同一个 map
-    └─ ctx.Data["PageData"] = ctx.PageData ← 第一个写入的数据项
+    └─ ctx.PageData = nil ← NewWebContext 不初始化 PageData
 
 阶段 3: Contexter → MergeFrom(CommonTemplateContextData) (context.go:166)
     │
@@ -225,6 +228,8 @@ HTTP Response (text/html)
     │
     ├─ ctx.Data["CurrentURL"]
     ├─ ctx.Data["Link"]
+    ├─ ctx.PageData = map[string]any{}          ← Contexter 在此初始化 PageData
+    ├─ ctx.Data["PageData"] = ctx.PageData      ← 并注入到模板数据
     ├─ ctx.Data["Flash"]
     ├─ ctx.Data["SystemConfig"]
     ├─ ctx.Data["ShowTwoFactorRequiredMessage"]
@@ -322,6 +327,7 @@ func NewWebContext(base *Base, render Render, session session.Store) *Context {
         Link:    setting.AppSubURL + ...,
         Repo:    &Repository{},
         Org:     &Organization{},
+        // 注意：PageData 字段未显式赋值，为零值 nil
     }
     ctx.TemplateContext = NewTemplateContextForWeb(ctx, ctx.Base.Req, ctx.Base.Locale)
     ctx.Flash = &middleware.Flash{...}
@@ -330,7 +336,35 @@ func NewWebContext(base *Base, render Render, session session.Store) *Context {
 }
 ```
 
-数据注入由调用方（`Contexter`）负责，`NewWebContext` 不参与。
+**职责清单**（NewWebContext 做什么 / 不做什么）：
+
+| 动作 | NewWebContext | Contexter |
+|-----|:---:|:---:|
+| 引用 `base.Data` 到 `ctx.Data` | ✅ | - |
+| 初始化 `ctx.TemplateContext` | ✅ | - |
+| 初始化 `ctx.Flash` | ✅ | - |
+| 初始化 `ctx.PageData` | ❌ (nil) | ✅ `map[string]any{}` |
+| 注入 `ctx.Data["PageData"]` | ❌ | ✅ |
+| `MergeFrom(CommonTemplateContextData)` | ❌ | ✅ |
+| 注入 `CurrentURL` / `Link` | ❌ | ✅ |
+| 注入 `SystemConfig` / `AllLangs` 等 | ❌ | ✅ |
+| Flash 消息读写 | ❌ | ✅ |
+
+#### `Contexter` vs `ContexterInstallPage` 的 PageData 差异
+
+**`Contexter`** (context.go:160) 初始化 PageData：
+```go
+ctx.PageData = map[string]any{}
+ctx.Data["PageData"] = ctx.PageData
+```
+
+**`ContexterInstallPage`** (context.go:141) **不初始化 PageData**：
+```go
+// 没有 ctx.PageData = ...
+// 没有 ctx.Data["PageData"] = ...
+```
+
+原因：安装页面 (`/install`) 不需要 JavaScript 模块数据，所以跳过了 PageData 初始化。
 
 ### 2.3 关键代码详解
 
@@ -356,7 +390,7 @@ func Contexter() func(next http.Handler) http.Handler {
             ctx.Data["Link"] = ctx.Link
 
             // PageData 传递给 JavaScript (window.config.pageData)
-            // 注意：PageData 在 NewWebContext 中已通过 ctx.Data["PageData"] = ctx.PageData 关联
+            // 注意：PageData 在 NewWebContext 中为 nil，由 Contexter 在此初始化
             ctx.PageData = map[string]any{}
             ctx.Data["PageData"] = ctx.PageData
 
@@ -873,7 +907,7 @@ DB Model (repo_model.Repository)
 | **`ctx.Data`** | `map[string]any` | **模板根数据对象**，所有业务数据都注入到这里 | 直接 `.Key` |
 | **`TemplateContext`** | `map[string]any` | 模板**函数上下文**，提供辅助方法 | 通过 `ctx.` 前缀调用 |
 | **`ctx.RootData`** | `ctx.Data` 的引用 | 嵌套模板/模板函数中访问根数据的入口 | `ctx.RootData.Key` |
-| **`ctx.PageData`** | `map[string]any` | JavaScript 模块数据，从 `ctx.Data["PageData"]` 注入 | `window.config.pageData.Key` |
+| **`ctx.PageData`** | `map[string]any` | JavaScript 模块数据，由 Contexter 初始化并注入 `ctx.Data["PageData"]` | `window.config.pageData.Key` |
 
 #### 访问方式详解
 
@@ -941,18 +975,23 @@ return t.Execute(w, data)
 | 特性 | `ctx.Data` | `ctx.PageData` |
 |-----|-----------|---------------|
 | 用途 | 模板渲染数据 | JavaScript 模块数据 |
-| 访问方式 | 模板中 `.Key` | `window.config.pageData.Key` |
-| 传递方式 | 模板执行时作为根对象传入 | 渲染到 `head.tmpl` 的 inline script |
+| 初始化位置 | `NewBaseContext` → `reqCtx.GetData()` (惰性创建空 map) | `Contexter()` (context.go:171) |
+| 注入到模板 | 作为根对象传入 `t.Execute(w, data)` | 通过 `ctx.Data["PageData"]` 引用 |
+| 模板访问 | `.Key` | `.PageData` → 渲染为 `window.config.pageData` |
 | 数据类型 | 任意 Go 类型（结构体、方法等） | 需可序列化为 JSON |
 | 典型数据 | 列表、对象、权限、HTML 字符串 | 配置项、初始状态、API 响应 |
+| 安装页可用 | ✅ (`ContexterInstallPage` 也使用 ctx.Data) | ❌ (`ContexterInstallPage` 不初始化 PageData) |
 
 ```go
 // ctx.Data - 给 Go 模板用，直接作为根对象
+// 由 NewBaseContext 创建空 map，Contexter 注入公共数据
 ctx.Data["Topics"] = topics          // Go 结构体切片
 ctx.Data["Permission"] = permission  // 带方法的权限对象
 ctx.Data["Repository"] = repo        // 完整 DB Model
 
-// ctx.PageData - 给 JavaScript 用，从 ctx.Data["PageData"] 注入
+// ctx.PageData - 给 JavaScript 用
+// 由 Contexter 初始化为空 map，并注入 ctx.Data["PageData"]
+// NewWebContext 不负责初始化 PageData（零值为 nil）
 ctx.PageData["citationFileContent"] = content  // 会被 JSON 序列化
 ```
 

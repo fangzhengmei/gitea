@@ -614,3 +614,467 @@ ctx.Data["Topics"] = topics  // topics 是 Go 结构体切片
 // ctx.PageData - 给 JavaScript 用
 ctx.PageData["citationFileContent"] = content  // 会被 JSON 序列化
 ```
+
+---
+
+## 十、RepoAssignment 中间件：模板变量取值的前置注入
+
+Web 页面渲染前，`RepoAssignment` 是最关键的仓库上下文准备中间件，决定了 `ctx.Data` 中所有仓库相关变量的可用性。
+
+### 10.1 中间件执行链
+
+**文件**: `services/context/repo.go:792`
+
+```go
+func RepoAssignment(ctx *Context) {
+    repoAssignmentPreCheck(ctx)
+    prepareData := repoAssignmentPrepareData(ctx)
+    funcs := []func(ctx *Context, data *repoAssignmentPrepareDataStruct){
+        repoAssignmentPrepareOwner,       // 1. 解析 Owner 用户
+        repoAssignmentAutoRedirectWiki,   // 2. .wiki 后缀自动重定向
+        repoAssignmentPrepareRepo,        // 3. 查找 Repository DB Model
+        repoAssignmentLegacy,             // 4. 权限校验 + 核心注入
+        repoAssignmentPrepareTemplateData,// 5. 批量注入模板变量
+        repoAssignmentAutoRedirectNotReady,// 6. 迁移中/损坏仓库重定向
+        repoAssignmentPrepareGitRepo,     // 7. 打开 GitRepo
+        repoAssignmentPrepareRepoTransfer,// 8. 仓库转让信息
+        repoAssignmentPrepareBranches,    // 9. 分支计数
+        repoAssignmentPreparePullRequests,// 10. PR 上下文
+        repoAssignmentHandleGoGet,        // 11. go-get meta
+    }
+    for _, f := range funcs {
+        f(ctx, prepareData)
+        if ctx.Written() { return }
+    }
+}
+```
+
+### 10.2 权限校验流程
+
+**核心代码**: `repoAssignmentLegacy` → `services/context/repo.go:424`
+
+```
+请求进入
+    ↓
+repo.LoadOwner(ctx)          // 加载仓库 Owner
+    ↓
+┌─ ctx.DoerNeedTwoFactorAuth()?
+│   YES → ctx.Repo.Permission = PermissionNoAccess()   // 2FA 未完成 = 无权限
+│   NO  → ctx.Repo.Permission = GetDoerRepoPermission(ctx, repo, ctx.Doer)
+    ↓
+┌─ ctx.Repo.Permission.HasAnyUnitAccessOrPublicAccess()?
+│   NO → ┌─ go-get=1? → EarlyResponseForGoGetMeta()    // go get 特殊处理
+│        └─ 否则 → ctx.NotFound(nil)                    // 404
+│   YES → 继续
+    ↓
+ctx.Data["Permission"] = &ctx.Repo.Permission           // 注入权限对象到模板
+```
+
+**关键点**：
+- 2FA 强制模式下，未完成二次认证的用户被设为 `NoAccess`
+- `canWriteAsMaintainer` 是额外的旁路检查：即使整体无 UnitAccess，如果用户作为 Maintainer 可写某分支，也允许访问
+- `HasAnyUnitAccessOrPublicAccess` 对公开仓库的未登录用户也放行
+
+### 10.3 模板变量注入完整清单
+
+`repoAssignmentPrepareTemplateData` → `services/context/repo.go:587` 是**模板变量注入的核心函数**，在权限校验通过后执行：
+
+| ctx.Data Key | 来源 | 代码行 | 说明 |
+|-------------|------|-------|------|
+| `RepoLink` | `repo.Link()` | 590 | 仓库链接 |
+| `FeedURL` | `repo.Link()` | 591 | Feed URL |
+| `RepoExternalIssuesLink` | `unit.ExternalTrackerConfig()` | 595 | 外部 Issue 跟踪链接 |
+| `NumTags` | `db.Count[repo_model.Release]` | 598 | 标签数量 |
+| `NumReleases` | `db.Count[repo_model.Release]` | 608 | Release 数量（受权限控制：无写权限则不含 Draft） |
+| `Title` | `repo.Owner.Name + "/" + repo.Name` | 618 | 页面标题 |
+| `PageTitleCommon` | `repo.Name + " - " + setting.AppName` | 619 | 通用标题 |
+| `Repository` | `repo` (repo_model.Repository) | 620 | **完整 DB Model** |
+| `Owner` | `ctx.Repo.Repository.Owner` | 621 | 仓库 Owner |
+| `CanWriteCode` | `Permission.CanWrite(TypeCode)` | 622 | 是否可写代码 |
+| `CanWriteIssues` | `Permission.CanWrite(TypeIssues)` | 623 | 是否可写 Issue |
+| `CanWritePulls` | `Permission.CanWrite(TypePullRequests)` | 624 | 是否可写 PR |
+| `CanWriteActions` | `Permission.CanWrite(TypeActions)` | 625 | 是否可写 Actions |
+| `CanSignedUserFork` | `repo_module.CanUserForkRepo()` | 632 | 当前用户是否可 Fork |
+| `UserAndOrgForks` | `repo_model.GetForksByUserAndOrgs()` | 639 | 用户/组织的 Fork 列表 |
+| `ShowForkModal` | `len(userAndOrgForks) > 1 \|\| ...` | 644 | 是否显示 Fork 选择弹窗 |
+| `RepoCloneLink` | `repo.CloneLink(ctx, ctx.Doer)` | 646 | 克隆链接（含用户信息） |
+| `CloneButtonShowHTTPS` | `!setting.Repository.DisableHTTPGit` | 648 | 是否显示 HTTPS 克隆 |
+| `CloneButtonShowSSH` | `!setting.SSH.Disabled && ...` | 649 | 是否显示 SSH 克隆 |
+| `CloneButtonOriginLink` | `ctx.Data["RepoCloneLink"]` | 656 | 克隆按钮原始链接 |
+| `RepoSearchEnabled` | `setting.Indexer.RepoIndexerEnabled` | 658 | 代码搜索是否启用 |
+| `CodeIndexerUnavailable` | `!code_indexer.IsAvailable()` | 660 | 代码索引是否不可用 |
+| `IsWatchingRepo` | `repo_model.IsWatching()` | 664 | 是否关注（需登录） |
+| `IsStaringRepo` | `repo_model.IsStaring()` | 665 | 是否 Star（需登录） |
+| `Permission` | `&ctx.Repo.Permission` | 450 | 权限对象（repoAssignmentLegacy 注入） |
+| `RepoName` | `ctx.Repo.Repository.Name` | 463 | 仓库名 |
+| `IsEmptyRepo` | `ctx.Repo.Repository.IsEmpty` | 464 | 是否空仓库 |
+| `PullMirror` | `repo_model.GetMirrorByRepoID()` | 454 | Mirror 信息 |
+| `BranchesCount` | `db.Count[git_model.Branch]` | 743 | 分支总数 |
+| `BaseRepo` | `repo.BaseRepo` 或 `repo` | 754/758 | PR 基础仓库 |
+| `PullRequestCtx` | `InitRepoPullRequestCtx()` | 755/759 | PR 上下文 |
+| `RepoTransfer` | `repo_model.GetPendingRepositoryTransfer()` | 776 | 待转让信息 |
+| `CanUserAcceptOrRejectTransfer` | `repoTransfer.CanUserAcceptOrRejectTransfer()` | 777 | 是否可接受/拒绝转让 |
+
+### 10.4 模板中的权限变量取值路径
+
+模板中权限检查主要通过 `.Permission` 对象和预计算的布尔值两条路径：
+
+**路径 1：直接使用预计算布尔值**（由 `repoAssignmentPrepareTemplateData` 注入）
+
+```
+模板取值                  注入来源                              代码行
+.CanWriteCode         ← Permission.CanWrite(TypeCode)        repo.go:622
+.CanWriteIssues       ← Permission.CanWrite(TypeIssues)      repo.go:623
+.CanWritePulls        ← Permission.CanWrite(TypePullRequests) repo.go:624
+.CanWriteActions      ← Permission.CanWrite(TypeActions)     repo.go:625
+```
+
+模板示例：`templates/repo/issue/milestones.tmpl:10`
+```html
+{{if and (or .CanWriteIssues .CanWritePulls) (not .Repository.IsArchived)}}
+```
+
+**路径 2：通过 Permission 对象动态调用**（注入 `ctx.Data["Permission"]`）
+
+```
+模板取值                                  对应方法
+.Permission.IsAdmin                   ← access_model.Permission.IsAdmin
+.Permission.IsOwner                   ← access_model.Permission.IsOwner
+.Permission.CanRead ctx.Consts.RepoUnitTypeCode     ← Permission.CanRead(TypeCode)
+.Permission.CanWrite ctx.Consts.RepoUnitTypeCode    ← Permission.CanWrite(TypeCode)
+.Permission.HasAnyUnitPublicAccess    ← Permission.HasAnyUnitPublicAccess
+```
+
+模板示例：`templates/repo/pulse.tmpl:21`
+```html
+{{if (or (.Permission.CanRead ctx.Consts.RepoUnitTypeIssues) (.Permission.CanRead ctx.Consts.RepoUnitTypePullRequests))}}
+```
+
+---
+
+## 十一、RepoRefByType 中间件：Git 引用解析与变量注入
+
+`RepoRefByType` 在 `RepoAssignment` 之后执行，负责解析当前查看的 Git 引用（分支/标签/Commit），并将结果注入 `ctx.Repo` 和 `ctx.Data`。
+
+### 11.1 执行流程
+
+**文件**: `services/context/repo.go:937`
+
+```
+请求进入 RepoRefByType(detectRefType)
+    ↓
+┌─ 仓库为空?
+│   YES → 设置默认分支名，注入 BranchName/TreePath，返回
+│   NO  → 继续
+    ↓
+┌─ 仓库迁移中/损坏?
+│   YES → 返回（显示迁移中 UI）
+│   NO  → 继续
+    ↓
+┌─ reqPath (路径参数 *) 为空?
+│   YES → 使用默认分支
+│   │     RefFullName = refs/heads/{DefaultBranch}
+│   │     Commit = GetBranchCommit(DefaultBranch)
+│   NO  → 解析 refShortName
+│         ├─ detectRefType == "" (Legacy) → getRefNameLegacy()
+│         │   依次尝试: Branch → Tag → Commit ID → 回退默认分支
+│         └─ detectRefType != "" → getRefName(ctx, repo, path, refType)
+│             精确匹配指定类型的引用
+    ↓
+根据解析结果设置 ctx.Repo 字段:
+    ├─ ctx.Repo.RefFullName   // 如 refs/heads/main
+    ├─ ctx.Repo.BranchName    // 如 main
+    ├─ ctx.Repo.Commit        // *git.Commit
+    ├─ ctx.Repo.CommitID      // 如 a1b2c3d4
+    ├─ ctx.Repo.TreePath      // 如 docs/README.md
+    └─ ctx.Repo.CommitsCount  // int64
+    ↓
+注入到 ctx.Data:
+    ├─ ctx.Data["RefFullName"]        // 完整引用名
+    ├─ ctx.Data["RefTypeNameSubURL"]  // URL 子路径如 "branch/main"
+    ├─ ctx.Data["TreePath"]           // 文件树路径
+    ├─ ctx.Data["BranchName"]         // 分支名
+    ├─ ctx.Data["CommitID"]           // Commit SHA
+    ├─ ctx.Data["CanCreateBranch"]    // 是否可创建分支
+    └─ ctx.Data["CommitsCount"]       // 提交数
+```
+
+### 11.2 Legacy 引用解析策略
+
+`getRefNameLegacy` → `services/context/repo.go:832` 是 URL 中未明确指定 ref 类型时的回退解析：
+
+```
+输入: reqPath = "master/docs/README.md"
+    ↓
+1. 尝试作为 Branch: getRefName(ctx, repo, path, RefTypeBranch)
+   ├─ "master" 是分支? → YES → RefFullName=refs/heads/master, TreePath=docs/README.md
+   └─ NO → 继续尝试 "master/docs" 是否分支...
+    ↓
+2. 尝试作为 Tag: getRefName(ctx, repo, path, RefTypeTag)
+   ├─ "master" 是标签? → YES → ...
+   └─ NO → 继续尝试
+    ↓
+3. 尝试作为 Commit ID: IsStringLikelyCommitID("master")
+   └─ 不是合法 SHA → 跳过
+    ↓
+4. 回退到默认分支: RefFullName=refs/heads/{DefaultBranch}
+   TreePath = reqPath（整个路径作为文件路径）
+```
+
+**重命名分支处理**：如果引用名匹配了重命名分支，会自动重定向到新分支名。
+
+---
+
+## 十二、API repoAssignment 中间件：Token 可见性与权限校验
+
+### 12.1 执行流程
+
+**文件**: `routers/api/v1/api.go:134`
+
+```
+HTTP Request (API)
+    ↓
+[tokenRequiresScopes] → api.go:319
+    │  ├─ 解析 API Token Scope
+    │  ├─ 验证 Scope 包含必需的 Category (如 Repository)
+    │  ├─ 检查 Read/Write 级别与 HTTP Method 匹配
+    │  └─ 设置 ctx.PublicOnly = scope.PublicOnly()
+    ↓
+[repoAssignment] → api.go:134
+    │
+    ├─ 1. 解析 Owner 用户
+    │     ├─ 已登录且名字匹配 → ctx.Doer
+    │     └─ 否则 → GetUserByName()，处理重定向
+    │
+    ├─ 2. 查找 Repository
+    │     └─ repo_model.GetRepositoryByName()
+    │        └─ 不存在则尝试重定向
+    │
+    ├─ 3. 权限计算（三层判断）
+    │     ├─ Actions Task 用户 → GetActionsUserRepoPermission()
+    │     ├─ 需要 2FA → PermissionNoAccess()
+    │     └─ 普通用户 → GetDoerRepoPermission(ctx, repo, ctx.Doer)
+    │
+    ├─ 4. 访问控制（两道关卡）
+    │     ├─ !Permission.HasAnyUnitAccessOrPublicAccess() → 404
+    │     └─ !TokenCanAccessRepo(repo) → 404
+    │
+    └─ 5. 注入到 ctx.Repo
+          ctx.Repo.Owner = owner
+          ctx.Repo.Repository = repo
+          ctx.Repo.Permission = permission
+```
+
+### 12.2 Token 可见性限制详解
+
+API 的 Token 可见性限制与 Web 页面的 Session 认证有本质区别：
+
+#### `ctx.PublicOnly` 的设置链路
+
+```
+tokenRequiresScopes() → api.go:319
+    ↓
+检查 ctx.Data["IsApiToken"] == true?
+    ↓ YES
+解析 scope = ctx.Data["ApiTokenScope"]
+    ↓
+scope.PublicOnly() → 判断 Scope 是否仅限公共资源
+    ↓
+ctx.PublicOnly = publicOnly  // 赋值到 APIContext
+```
+
+**`PublicOnly` 的来源**：Token 的 Scope 中可能包含 `public-only` 限定符，表示该 Token 只能访问公开资源。
+
+#### `TokenCanAccessRepo` 的检查逻辑
+
+**文件**: `services/context/api.go:53`
+
+```go
+func (ctx *APIContext) TokenCanAccessRepo(repo *repo_model.Repository) bool {
+    return repo == nil || !ctx.PublicOnly || !repo.IsPrivate
+}
+```
+
+```
+TokenCanAccessRepo(repo) 判定:
+    ├─ repo == nil → true (无仓库限制)
+    ├─ !ctx.PublicOnly → true (非 Public-Only Token，不受限)
+    └─ !repo.IsPrivate → true (公开仓库，可访问)
+    
+    仅当 PublicOnly=true && repo.IsPrivate=true 时 → false (拒绝)
+```
+
+#### `checkTokenPublicOnly` 中间件
+
+**文件**: `routers/api/v1/api.go:246`
+
+在 `repoAssignment` 之后执行，针对特定端点进行更细粒度的 Public-Only 检查：
+
+```go
+func checkTokenPublicOnly() func(ctx *context.APIContext) {
+    return func(ctx *context.APIContext) {
+        if !ctx.PublicOnly { return }  // 非 Public-Only Token，放行
+        // 检查请求的 Scope Category 是否允许访问私有资源
+        // 例如: 写操作在 Public-Only Token 下被拒绝
+    }
+}
+```
+
+#### `rejectPublicOnly` 中间件
+
+某些端点完全禁止 Public-Only Token 访问：
+
+```go
+func rejectPublicOnly() func(ctx *context.APIContext) {
+    return func(ctx *context.APIContext) {
+        if !ctx.PublicOnly { return }
+        ctx.APIError(http.StatusForbidden, "this endpoint is not available for public-only tokens")
+    }
+}
+```
+
+### 12.3 Web 与 API 权限校验对比
+
+| 校验维度 | Web (`RepoAssignment`) | API (`repoAssignment`) |
+|---------|----------------------|----------------------|
+| **认证方式** | Session + Cookie | Bearer Token / OAuth2 |
+| **2FA 处理** | `DoerNeedTwoFactorAuth()` → NoAccess | `doerNeedTwoFactorAuth()` → NoAccess |
+| **权限计算** | `GetDoerRepoPermission(ctx, repo, doer)` | `GetDoerRepoPermission(ctx, repo, doer)` 或 `GetActionsUserRepoPermission()` |
+| **访问拒绝** | `ctx.NotFound(nil)` (404 页面) | `ctx.APIErrorNotFound()` (404 JSON) |
+| **Token Scope** | ❌ 不适用 | ✅ `tokenRequiresScopes()` 检查 Category |
+| **Public-Only** | ❌ 不适用 | ✅ `TokenCanAccessRepo()` + `checkTokenPublicOnly()` |
+| **go-get 特例** | ✅ `go-get=1` 返回 meta | ❌ 无 |
+| **canWriteAsMaintainer** | ✅ 旁路检查 | ❌ 无 |
+| **权限对象注入** | `ctx.Data["Permission"] = &ctx.Repo.Permission` | 不注入模板，通过 convert 层使用 |
+
+### 12.4 API 路由中间件栈典型示例
+
+```
+/repos/{username}/{reponame} 组路由:
+    ↓
+tokenRequiresScopes(AccessTokenScopeCategoryRepository)   // 检查 Token 有 Repository Scope
+    ↓
+repoAssignment()                                           // 解析仓库、计算权限
+    ↓
+checkTokenPublicOnly()                                     // 检查 Public-Only 限制
+    ↓
+具体 Handler:
+    ├─ Get()         → ctx.JSON(200, convert.ToRepo(...))  // 读取
+    ├─ Edit()        → ctx.JSON(200, convert.ToRepo(...))  // 修改
+    └─ Delete()      → ...                                  // 删除
+```
+
+---
+
+## 十三、模板取数路径与 Convert 字段裁剪对应关系
+
+### 13.1 同一 DB Model 在 Web 模板与 API 中的取值路径对比
+
+以 `repo_model.Repository` 为例，展示模板直接访问与 Convert 裁剪后的对应关系：
+
+| DB Model 字段 | Web 模板取值路径 | API Convert 裁剪 | 差异说明 |
+|-------------|----------------|-----------------|---------|
+| `repo.ID` | `.Repository.ID` | `api.Repository.ID` → `json:"id"` | 直传 |
+| `repo.Name` | `.Repository.Name` / `.RepoName` | `api.Repository.Name` → `json:"name"` | 模板有额外 `.RepoName` 快捷方式 |
+| `repo.Owner` | `.Repository.Owner` / `.Owner` | `api.Repository.Owner` → `ToUser()` 裁剪 | 模板直接用 DB Model；API 经过 ToUser 裁剪 |
+| `repo.IsPrivate` | `.Repository.IsPrivate` | `api.Repository.Private` → `json:"private"` | 字段名重命名 Is→无前缀 |
+| `repo.IsFork` | `.Repository.IsFork` | `api.Repository.Fork` → `json:"fork"` | 字段名重命名 |
+| `repo.IsArchived` | `.Repository.IsArchived` | `api.Repository.Archived` → `json:"archived"` | 字段名重命名 |
+| `repo.IsEmpty` | `.Repository.IsEmpty` / `.IsEmptyRepo` | `api.Repository.Empty` → `json:"empty"` | 模板有额外 `.IsEmptyRepo` |
+| `repo.NumStars` | `.Repository.NumStars` | `api.Repository.Stars` → `json:"stars_count"` | 字段名+json tag 双重重命名 |
+| `repo.NumForks` | `.Repository.NumForks` | `api.Repository.Forks` → `json:"forks_count"` | 同上 |
+| `repo.NumWatches` | - | `api.Repository.Watchers` → `json:"watchers_count"` | Web 不直接用，用 `.IsWatchingRepo` 布尔值 |
+| `repo.NumOpenIssues` | - | `api.Repository.OpenIssues` → `json:"open_issues_count"` | Web 不直接用此字段 |
+| `repo.NumOpenPulls` | - | `api.Repository.OpenPulls` → `json:"open_pr_counter"` | Web 不直接用此字段 |
+| `repo.DefaultBranch` | `.Repository.DefaultBranch` | `api.Repository.DefaultBranch` → `json:"default_branch"` | 直传 |
+| `repo.CreatedUnix` | `.Repository.CreatedUnix` (调用方法) | `api.Repository.Created` → `json:"created_at"` (AsTime()) | 模板用 Unix+方法；API 转为 time.Time |
+| `repo.UpdatedUnix` | `.Repository.UpdatedUnix` (调用方法) | `api.Repository.Updated` → `json:"updated_at"` (AsTime()) | 同上 |
+| `repo.Description` | `.Repository.Description` | `api.Repository.Description` → `json:"description"` | 直传 |
+| `repo.Website` | `.Repository.Website` | `api.Repository.Website` → `json:"website"` | 直传 |
+| `repo.OwnerID` | ❌ 不暴露 | ❌ 裁剪掉 | 内部字段，两边都不暴露 |
+| `repo.Units` | 通过方法间接访问 | ❌ 裁剪掉，转为 `HasXxx` 布尔值 | 模板用 `Repository.UnitEnabled()`；API 用 `HasIssues`/`HasWiki` 等 |
+| 权限信息 | `.Permission` (完整对象) | `api.Repository.Permissions` → `json:"permissions"` (简化为 admin/push/pull) | 模板可调用 `.Permission.CanWrite(TypeCode)` 等；API 只有三个布尔 |
+| 克隆链接 | `.RepoCloneLink` / `.CloneButtonOriginLink` | `api.Repository.SSHURL` / `CloneURL` | 模板注入 CloneLink 对象；API 拆为两个字段 |
+| 分支数 | `.BranchesCount` | `api.Repository.BranchCount` → `json:"branch_count"` | 模板从 `repoAssignmentPrepareBranches` 注入；API 从 `CountBranches` |
+| Release 数 | `.NumReleases` | `api.Repository.Releases` → `json:"release_counter"` | 模板受权限控制（无写权限不含 Draft）；API 含非 Draft |
+| 标签数 | `.NumTags` | ❌ API 无此字段 | Web 侧独立计算注入 |
+| Star/Watch | `.IsStaringRepo` / `.IsWatchingRepo` (布尔) | ❌ API Repository 无此字段 | Web 直接计算；API 需单独端点 |
+| Fork 相关 | `.CanSignedUserFork` / `.ShowForkModal` / `.UserAndOrgForks` | ❌ API 无此字段 | Web 侧 UI 专用计算 |
+
+### 13.2 Permission 对象在两条路径中的形态差异
+
+**Web 模板路径** — 完整 `access_model.Permission` 对象：
+
+```
+ctx.Data["Permission"] = &ctx.Repo.Permission
+
+模板可调用:
+    .Permission.CanWrite(unit.TypeCode)      // 细粒度单元权限
+    .Permission.CanRead(unit.TypeIssues)      // 细粒度单元权限
+    .Permission.IsAdmin                       // 管理员
+    .Permission.IsOwner                       // 所有者
+    .Permission.HasAnyUnitPublicAccess        // 公共访问
+```
+
+**API Convert 路径** — 简化为三个布尔：
+
+```
+convert.ToRepo() →
+    permission := &api.Permission{
+        Admin: permissionInRepo.AccessMode >= perm.AccessModeAdmin,
+        Push:  permissionInRepo.UnitAccessMode(TypeCode) >= perm.AccessModeWrite,
+        Pull:  permissionInRepo.UnitAccessMode(TypeCode) >= perm.AccessModeRead,
+    }
+
+JSON 输出:
+    "permissions": {
+        "admin": false,
+        "push": true,
+        "pull": true
+    }
+```
+
+**核心差异**：
+- Web 模板的 Permission 支持按**单元类型**（Code/Issues/PR/Wiki/Actions 等）分别检查读写权限
+- API 的 Permission 只输出 Code 单元级别的 Admin/Push/Pull 三个布尔值
+- 模板可做 `Permission.CanRead(TypeIssues)` 细粒度控制；API 消费者需自行从 `has_issues` 等布尔字段推断
+
+### 13.3 动态字段裁剪对应关系总结
+
+```
+                    DB Model 层
+                        │
+          ┌─────────────┼─────────────┐
+          │                           │
+    Web 模板路径                  API Convert 路径
+          │                           │
+   RepoAssignment 注入            convert.ToRepo()
+          │                           │
+   ┌──────▼──────┐              ┌──────▼──────┐
+   │ ctx.Data    │              │ api.Repo    │
+   │ (无裁剪)    │              │ (逐字段映射) │
+   └──────┬──────┘              └──────┬──────┘
+          │                           │
+   ┌──────▼──────┐              ┌──────▼──────┐
+   │ 模板按需    │              │ JSON tag    │
+   │ 隐式裁剪    │              │ + omitempty │
+   └──────┬──────┘              └──────┬──────┘
+          │                           │
+          ▼                           ▼
+     HTML 输出                    JSON 输出
+  (只含模板引用的)           (只含 Convert 映射的
+   DB Model 字段)             + omitempty 过滤)
+```
+
+**典型裁剪差异**：
+
+| 裁剪类型 | Web 模板 | API Convert |
+|---------|---------|-------------|
+| 字段名映射 | 无（保持 DB 原名） | `IsPrivate` → `Private`，`NumStars` → `Stars` |
+| 时间格式 | `CreatedUnix` (Unix 时间戳+模板方法) | `Created` (time.Time，JSON 自动 RFC3339) |
+| 关联对象 | 直接访问 `.Repository.Owner.*` | `ToUser()` 裁剪后注入 `Owner` |
+| 权限粒度 | 按 Unit Type 细粒度检查 | 简化为 Admin/Push/Pull |
+| 计数字段 | `.NumReleases`（受权限控 Draft） | `Releases`（不含 Draft） |
+| UI 专用字段 | `.CanSignedUserFork`/`.ShowForkModal` | 完全不存在 |
+| 内部字段 | 模板不引用则不输出 | Convert 层直接不映射 |
+| omitempty | 不适用 | `Parent`/`Permissions` 等空值不输出 |

@@ -390,20 +390,37 @@ releases, err := db.Find[repo_model.Release](ctx, repo_model.FindReleasesOptions
 **latest 别名下载分支** (`routers/web/repo/repo.go:344-360`):
 ```go
 } else if len(releases) == 0 && vTag == "latest" {
+    // GitHub supports the alias "latest" for the latest release
+    // We only fetch the latest release if the tag is "latest" and no release with the tag "latest" exists
     release, err := repo_model.GetLatestReleaseByRepoID(ctx, ctx.Repo.Repository.ID)
-    // GetLatestReleaseByRepoID 内部硬编码过滤 is_draft: false
+    ...
 }
 ```
-- **`GetLatestReleaseByRepoID` 实现** (`models/repo/release.go:330-335`):
-  ```go
-  cond := builder.NewCond().
-      And(builder.Eq{"repo_id": repoID}).
-      And(builder.Eq{"is_draft": false}).      // 硬编码过滤草稿
-      And(builder.Eq{"is_prerelease": false}).  // 硬编码过滤预发布
-      And(builder.Eq{"is_tag": false})
-  ```
-- **latest 分支特性**：无论用户权限如何，永远不会返回草稿 Release
-- 草稿转正后才会出现在 latest 查询结果中
+
+**`GetLatestReleaseByRepoID` 完整实现** (`models/repo/release.go:329-349`):
+```go
+// GetLatestReleaseByRepoID returns the latest release for a repository
+func GetLatestReleaseByRepoID(ctx context.Context, repoID int64) (*Release, error) {
+    cond := builder.NewCond().
+        And(builder.Eq{"repo_id": repoID}).
+        And(builder.Eq{"is_draft": false}).      // 硬编码过滤草稿: 无论权限都看不到
+        And(builder.Eq{"is_prerelease": false}).  // 硬编码过滤预发布
+        And(builder.Eq{"is_tag": false})           // 排除纯 tag
+
+    rel := new(Release)
+    has, err := db.GetEngine(ctx).
+        Desc("created_unix", "id").  // 按创建时间倒序，取最新的
+        Where(cond).
+        Get(rel)
+    ...
+}
+```
+
+**latest 分支特性**：
+- 查询条件**硬编码** `is_draft: false`，与用户权限无关
+- 即使用户有写入权限，latest 路径也永远不会返回草稿 Release
+- 草稿必须转正（`IsDraft` 变为 `false`）后才会出现在 latest 查询结果中
+- 同时过滤预发布版本和纯 tag
 
 #### 4. UUID 直接访问 (`/attachments/{uuid}`)
 
@@ -414,6 +431,7 @@ unitType, repoID, err := repo_service.GetAttachmentLinkedTypeAndRepoID(ctx, atta
 
 if repo == nil {  // 全局路由访问时 ctx.Repo.Repository 为 nil
     repo, err = repo_model.GetRepositoryByID(ctx, repoID)
+    // GetDoerRepoPermission 接受 user 为 nil（未登录用户）
     perm, err = access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
 }
 
@@ -423,14 +441,32 @@ if !perm.CanRead(unitType) {  // 仅检查 Releases 读权限
 }
 ```
 
+**未登录用户权限处理** (`models/perm/access/repo_permission.go:433-437`):
+```go
+// anonymous visit public repo
+if user == nil {
+    perm.AccessMode = perm_model.AccessModeRead  // 公开仓库赋予读权限
+    return perm, nil
+}
+```
+
 **可见性分析**：
 - **草稿时**：
-  - 公开仓库：**所有用户（包括未登录）都可下载** ⚠️ **存在安全隐患**
-  - 私有仓库：只有仓库读权限用户可下载
-  - **关键缺失**：没有检查关联 Release 的 `IsDraft` 状态
+  - 公开仓库：
+    - 未登录用户：`ctx.Doer == nil` → `GetDoerRepoPermission` 返回 `AccessModeRead` → **可下载**
+    - 已登录普通用户：只要有读权限就可下载
+    - ⚠️ **存在安全隐患**：草稿保护完全失效
+  - 私有仓库：
+    - 未登录用户：`user == nil && repo.IsPrivate` → `AccessModeNone` → 不可下载
+    - 只有仓库读权限用户可下载
+  - **关键缺失**：整个权限检查链路**完全没有检查**关联 Release 的 `IsDraft` 状态
 - **转正后**：
-  - 公开仓库：所有人可下载
+  - 公开仓库：所有人（包括未登录）可下载
   - 私有仓库：有仓库读权限用户可下载
+
+**核心问题根源**：
+- UUID 直链绕过了 `/releases/download` 路径的 `IncludeDrafts` 过滤
+- `ServeAttachment()` 只校验仓库读权限，不感知 Release 的草稿状态
 
 ### 6.4 安全注意事项
 
@@ -441,7 +477,7 @@ if !perm.CanRead(unitType) {  // 仅检查 Releases 读权限
 - **完全不检查关联 Release 的 `IsDraft` 状态**
 - 公开仓库场景下：攻击者若猜到 UUID，可绕过草稿保护下载附件
 
-**修复建议（需考虑全局路由上下文）**：
+**修复建议（需考虑全局路由上下文，与真实函数签名一致）**：
 ```go
 // 在 ServeAttachment() 的权限检查后增加草稿状态检查
 if unitType == unit.TypeReleases {
@@ -452,8 +488,15 @@ if unitType == unit.TypeReleases {
         if ctx.Repo.Repository != nil {
             canWrite = ctx.Repo.Permission.CanWrite(unit.TypeReleases)
         } else {
-            perm, _ := access_model.GetDoerRepoPermission(ctx, rel.RepoID, ctx.Doer)
-            canWrite = perm.CanWrite(unit.TypeReleases)
+            // 真实函数签名: GetDoerRepoPermission(ctx, repo *repo_model.Repository, user)
+            // 需要先通过 RepoID 获取 Repository 对象
+            repo, err := repo_model.GetRepositoryByID(ctx, rel.RepoID)
+            if err == nil {
+                perm, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
+                if err == nil {
+                    canWrite = perm.CanWrite(unit.TypeReleases)
+                }
+            }
         }
         if !canWrite {
             ctx.HTTPError(http.StatusNotFound)
@@ -462,6 +505,10 @@ if unitType == unit.TypeReleases {
     }
 }
 ```
+
+**代码依据**：
+- `GetRepositoryByID(ctx, id int64) (*Repository, error)` - `models/repo/repo.go:835`
+- `GetDoerRepoPermission(ctx, repo *Repository, user) (Permission, error)` - `models/perm/access/repo_permission.go:384`
 
 ---
 
@@ -498,7 +545,7 @@ func canAccessReleaseDraft(ctx *context.APIContext) bool {
 |------|-----------------------------|----------------|
 | **识别标志** | `ctx.Data["IsApiToken"] != true` | `ctx.Data["IsApiToken"] == true` |
 | **权限判断** | 只需有仓库写入权限 | 写入权限 + Token Scope 检查 |
-| **Required Scope** | 不需要 | `repo`（Write 级别）|
+| **Required Scope** | 不需要 | `write:repository` |
 | **典型场景** | Web 界面操作、浏览器访问 | 第三方工具、CI/CD |
 
 ### 7.3 访问场景详解
@@ -514,7 +561,7 @@ func canAccessReleaseDraft(ctx *context.APIContext) bool {
 - `IsApiToken = true`
 - 双重检查：
   1. Token 所属用户有仓库写入权限
-  2. Token 具有 `repo` (Write) Scope
+  2. Token 具有 `write:repository` Scope
 
 #### 场景 3：使用 OAuth2 Token 调用 API
 - 请求头：`Authorization: Bearer <oauth2-token>`

@@ -10,6 +10,10 @@ Deliver() 执行流程（行号标注）
 [150] w, err := GetWebhookByID(t.HookID)
 [152]   if err != nil { return err }                        ← 失败点 A
 
+[156] defer func() {                                         ← 注册 PANIC RECOVER
+[157]   err := recover()                                    ← 捕获 panic，仅日志，不重抛
+[163] }()
+
 [165] t.IsDelivered = true                                  ← 内存标记（仅进程内）
 
 [167] newRequest := webhookRequesters[w.Type]
@@ -31,7 +35,7 @@ Deliver() 执行流程（行号标注）
 [206]   if err != nil { return fmt.Errorf("unable to mark") } ← 失败点 D
 [209]   if !updated { return nil }                           ← 幂等短路
 
-[216] defer func() {                                         ← 注册最终落库
+[216] defer func() {                                         ← 注册 UPDATE DEFER（LIFO 后注册先执行）
 [217]   t.Delivered = timeutil.TimeStampNanoNow()
 [226]   UpdateHookTask(ctx, t)                              ← 全量写回
 [231-235] UpdateWebhookLastStatus(ctx, w)                   ← 更新状态
@@ -47,6 +51,8 @@ Deliver() 执行流程（行号标注）
 [254]     return fmt.Errorf("unable to deliver")
 [255]   }
 
+[256] defer resp.Body.Close()                               ← 注册 RESP CLOSE
+
 [259] t.IsSucceed = resp.StatusCode/100 == 2
 [265] p, err := util.ReadWithLimit(resp.Body, ...)
 [266]   if err != nil {                                     ← 失败点 H
@@ -56,6 +62,11 @@ Deliver() 执行流程（行号标注）
 [270] t.ResponseInfo.Body = string(p)
 [271] return nil                                            ← 成功
 ```
+
+**defer 执行顺序说明（LIFO 后进先出）**:
+1. 先注册 → 后执行：L156 recover defer
+2. 后注册 → 先执行：L216 UpdateHookTask defer、L256 resp.Body.Close defer
+3. panic 发生时，按注册逆序执行 defer
 
 ---
 
@@ -248,22 +259,185 @@ func (w Webhook) HeaderAuthorization() (string, error) {
 
 ---
 
-## 三、综合状态对比表
+## 三、Panic 分支分析（原文档缺失部分）
 
-### 3.1 MarkTaskDelivered 之前 vs 之后
+### 3.0 两层 recover 机制
 
-| 维度 | 之前（A/B/C/D） | 之后（E/F/G/H） |
-|------|-----------------|-----------------|
+Webhook 投递链路有两层 panic 保护：
+
+| 层级 | 代码位置 | 捕获范围 | 行为 |
+|------|----------|----------|------|
+| 外层队列 | `modules/queue/workerqueue.go:243-257` | 整个 handler 调用 | 捕获未被内层捕获的 panic，日志记录，返回 nil |
+| 内层 Deliver | `services/webhook/deliver.go:156-163` | GetWebhookByID 成功后的所有代码 | 捕获 panic，仅日志记录，不重抛，返回 nil |
+
+**关键特性**:
+- 两层 recover 都只记录日志，不重新抛出 panic
+- 捕获 panic 后函数返回值为 `nil`（error 零值）
+- handler 无法区分"正常成功"和"panic 被捕获"
+- Go defer 按 LIFO（后进先出）顺序执行
+
+### 3.1 Panic 场景 P0：GetWebhookByID 中发生 panic
+
+**触发位置**: `deliver.go:151`，recover defer（L156）**尚未注册**
+
+| 项目 | 值 |
+|------|----|
+| **触发条件** | 数据库查询时发生 panic（如驱动 Bug、内存错误） |
+| **代码位置** | `deliver.go:151`（GetWebhookByID 内部） |
+| **相对边界** | **MarkTaskDelivered 之前，且 recover 未注册** |
+| **哪层 recover 捕获** | 外层队列 recover（workerqueue.go:248） |
+| **DB is_delivered** | `false` |
+| **DB is_succeed** | `false` |
+| **RequestInfo** | ❌ 未落库 |
+| **ResponseInfo** | ❌ 未落库 |
+| **defer 执行顺序** | 内层 recover 未注册，只执行外层队列 recover |
+| **UpdateHookTask defer 注册** | ❌ 未注册，不执行 |
+| **Deliver 返回值** | 函数未正常返回，外层 handler 也不会收到 error（队列层返回 nil） |
+| **w.LastStatus** | ❌ 不更新 |
+| **handler 日志级别** | 外层队列记录 `log.Error("Recovered from panic...")` |
+| **恢复入口** | ✅ **系统重启时 `populateWebhookSendingQueue` 重新入队** |
+| **实际可恢复性** | 中 — 取决于 panic 根因是否已修复 |
+
+**执行流程**:
+```
+GetWebhookByID() → panic!
+  → recover defer 未注册，向外传播
+  → 队列层 safeHandler 的 recover 捕获
+  → 记录 PANIC 日志
+  → 返回 unhandled=nil
+  → 任务从队列消失，但 DB is_delivered=false
+  → 下次重启时重新入队
+```
+
+### 3.2 Panic 场景 P1：MarkTaskDelivered 之前发生 panic
+
+**触发位置**: `deliver.go:156-203` 之间，recover defer（L156）**已注册**，UpdateHookTask defer（L216）**未注册**
+
+**可能的 panic 点**:
+- `newRequest` 中（URL 解析 panic、JSON 编码 panic）
+- `t.RequestInfo.Headers` 赋值时（nil map 操作）
+- `w.HeaderAuthorization()` 中（解密算法 panic）
+- `MarkTaskDelivered` 之前的任意代码
+
+| 项目 | 值 |
+|------|----|
+| **触发条件** | newRequest 内部 panic、HeaderAuthorization 解密 panic、nil map 操作等 |
+| **代码位置** | `deliver.go:156-203` |
+| **相对边界** | **MarkTaskDelivered 之前** |
+| **哪层 recover 捕获** | 内层 Deliver recover（deliver.go:157） |
+| **DB is_delivered** | `false`（MarkTaskDelivered 未执行） |
+| **DB is_succeed** | `false` |
+| **RequestInfo** | ❌ 未落库（UpdateHookTask defer 未注册） |
+| **ResponseInfo** | ❌ 未落库 |
+| **defer 执行顺序** | 只有内层 recover defer 执行，UpdateHookTask defer 未注册不执行 |
+| **UpdateHookTask defer 注册** | ❌ 未注册 |
+| **Deliver 返回值** | `nil`（error 零值，因为 panic 被捕获） |
+| **handler 对返回值的处理** | `err == nil`，**认为成功**，不记录任何 error 日志 |
+| **实际日志** | 只有内层 recover 记录 `PANIC whilst trying to deliver...` |
+| **w.LastStatus** | ❌ 不更新 |
+| **恢复入口** | ✅ **系统重启时 `populateWebhookSendingQueue` 重新入队** |
+| **实际可恢复性** | 中 — 取决于 panic 根因 |
+| **隐蔽问题** | handler 认为成功，但任务实际未执行，且无 error 日志，仅 PANIC 日志 |
+
+**执行流程**:
+```
+GetWebhookByID() → 成功
+  → 注册 recover defer (L156)
+  → newRequest() / HeaderAuthorization() → panic!
+  → 按 LIFO 执行 defer：
+     1. recover defer 捕获 panic → 记录 PANIC 日志
+     2. UpdateHookTask defer 未注册，不执行
+  → Deliver 返回 nil（error 零值）
+  → handler 判断 err == nil，认为成功
+  → 任务从队列消失，但 DB is_delivered=false
+  → 下次重启时重新入队
+```
+
+### 3.3 Panic 场景 P2：MarkTaskDelivered 之后发生 panic
+
+**触发位置**: `deliver.go:205-271` 之间，recover defer（L156）和 UpdateHookTask defer（L216）**都已注册**
+
+**可能的 panic 点**:
+- `setting.DisableWebhooks` 访问时（配置系统 panic）
+- `webhookHTTPClient.Do` 中（网络库 panic）
+- `resp.StatusCode` 访问时（resp 为 nil，但此处不会，因为前面有 err 检查）
+- `util.ReadWithLimit` 中（读取时 panic）
+- `t.ResponseInfo.Body` 赋值时（nil pointer）
+- defer 内部（UpdateHookTask 中 panic）
+
+| 项目 | 值 |
+|------|----|
+| **触发条件** | HTTP 请求发送中 panic、响应读取 panic、任意代码缺陷 |
+| **代码位置** | `deliver.go:205-271` |
+| **相对边界** | **MarkTaskDelivered 之后** |
+| **哪层 recover 捕获** | 内层 Deliver recover（deliver.go:157） |
+| **DB is_delivered** | `true`（MarkTaskDelivered 已原子写入） |
+| **DB is_succeed** | `false`（从未设为 true，除非 panic 在 L259 之后） |
+| **RequestInfo** | ✅ **defer UpdateHookTask 会落库** |
+| **ResponseInfo** | ✅ **defer UpdateHookTask 会落库**（内容取决于 panic 位置） |
+| **defer 执行顺序** | 按 LIFO 逆序执行：<br>1. UpdateHookTask defer（L216）→ 全量写回<br>2. resp.Body.Close defer（L256，若已注册）<br>3. recover defer（L156）→ 捕获并记录日志 |
+| **UpdateHookTask defer 注册** | ✅ 已注册，必执行 |
+| **Deliver 返回值** | `nil`（error 零值） |
+| **handler 对返回值的处理** | `err == nil`，**认为成功** |
+| **实际日志** | 内层 recover 记录 PANIC 日志，UpdateHookTask 中记录 "Hook delivery failed" 日志 |
+| **w.LastStatus** | `HookStatusFail`（defer 中 is_succeed=false 分支） |
+| **恢复入口** | ❌ 无自动恢复（is_delivered=true） |
+| **手动重放** | ✅ 用户在 UI 点击"重放"创建新任务 |
+| **隐蔽问题** | handler 认为成功，UI 显示失败状态（LastStatus=Fail），日志有 PANIC 但无 Deliver error |
+
+**执行流程**:
+```
+GetWebhookByID() → 成功
+  → 注册 recover defer (L156)
+  → MarkTaskDelivered() → 成功，DB is_delivered=true
+  → 注册 UpdateHookTask defer (L216)
+  → webhookHTTPClient.Do() / ReadWithLimit() → panic!
+  → 按 LIFO 逆序执行 defer：
+     1. resp.Body.Close defer（若已注册）
+     2. UpdateHookTask defer：
+        - t.IsSucceed 保持 false（panic 在 L259 之前）
+        - t.RequestInfo / t.ResponseInfo 已赋值的部分会落库
+        - w.LastStatus = HookStatusFail
+        - UpdateHookTask 写 DB
+     3. recover defer：
+        - 捕获 panic
+        - 记录 PANIC 日志
+  → Deliver 返回 nil（error 零值）
+  → handler 判断 err == nil，认为成功
+  → 任务从队列消失，DB is_delivered=true
+  → 无法自动恢复，只能手动重放
+```
+
+### 3.4 Panic 在 defer 内部的特殊情况
+
+如果 panic 发生在 **UpdateHookTask defer 内部**（如 `UpdateHookTask` 数据库操作 panic）：
+
+```
+panic 发生在 defer 内部 → defer 链继续执行
+  → recover defer 仍能捕获
+  → 但 UpdateHookTask 的写库操作可能部分完成或完全未完成
+  → 结果不确定，取决于 panic 发生的具体位置
+```
+
+---
+
+## 四、综合状态对比表
+
+### 4.1 MarkTaskDelivered 之前 vs 之后（含 panic 场景）
+
+| 维度 | 之前（A/B/C/D/P0/P1） | 之后（E/F/G/H/P2） |
+|------|-----------------------|---------------------|
 | **DB is_delivered** | `false` | `true` |
 | **defer UpdateHookTask** | 未注册，不执行 | 已注册，必执行 |
-| **RequestInfo 落库** | ❌ 不会 | ✅ 会 |
+| **RequestInfo 落库** | ❌ 不会（包括 P1 panic 场景） | ✅ 会（包括 P2 panic 场景） |
 | **ResponseInfo 落库** | ❌ 不会 | ✅ 会 |
 | **w.LastStatus 更新** | ❌ 不更新 | ✅ 更新为 Fail |
 | **重启可恢复** | ✅ `populateWebhookSendingQueue` 重新入队 | ❌ is_delivered=true 被跳过 |
 | **手动重放** | ✅ 也可，但重启已能自动恢复 | ✅ **唯一的恢复手段** |
 | **UI 可见性** | 不出现在"最近投递"列表 | 出现在"最近投递"列表，标红失败 |
+| **handler 感知** | 普通错误可见，P0/P1 panic 不可见（返回 nil） | 普通错误可见，P2 panic 不可见（返回 nil） |
 
-### 3.2 四种指定场景完整对照
+### 4.2 四种指定场景 + panic 场景完整对照
 
 | 场景 | 失败点 | 代码行 | DB is_delivered | DB is_succeed | Request 落库 | Response 落库 | LastStatus | 重启恢复 | 手动重放 |
 |------|--------|--------|-----------------|---------------|-------------|--------------|------------|----------|----------|
@@ -271,25 +445,48 @@ func (w Webhook) HeaderAuthorization() (string, error) {
 | **授权头解析失败** | C | `deliver.go:189` | `false` | `false` | ❌（内存有值但不落库） | ❌ | 不更新 | ✅ | ✅ |
 | **未激活返回** | F | `deliver.go:246` | `true` | `false` | ✅ | ✅（空） | `Fail` | ❌ | ✅ |
 | **HTTP 失败** | G | `deliver.go:251` | `true` | `false` | ✅ | ✅（含错误信息） | `Fail` | ❌ | ✅ |
+| **Panic: GetWebhookByID 中** | P0 | `deliver.go:151` | `false` | `false` | ❌ | ❌ | 不更新 | ✅ | ✅ |
+| **Panic: MarkTaskDelivered 之前** | P1 | `deliver.go:156-203` | `false` | `false` | ❌（内存有值但 defer 未注册） | ❌ | 不更新 | ✅ | ✅ |
+| **Panic: MarkTaskDelivered 之后** | P2 | `deliver.go:205-271` | `true` | `false` | ✅（defer 落库） | ✅（内容取决于 panic 位置） | `Fail` | ❌ | ✅ |
 
-### 3.3 所有失败点完整对照
+### 4.3 所有失败点 + panic 完整对照
 
 | 失败点 | 触发条件 | 行号 | 相对边界 | DB is_delivered | defer 注册 | 重启恢复 | 手动重放 |
 |--------|----------|------|----------|-----------------|-----------|----------|----------|
 | A | GetWebhookByID 失败 | 152 | **之前** | `false` | ❌ | ✅ | ✅ |
+| P0 | GetWebhookByID 中 panic | 151 | **之前** | `false` | ❌（recover 也未注册） | ✅ | ✅ |
 | B | 请求构建失败 | 174 | **之前** | `false` | ❌ | ✅ | ✅ |
 | C | 授权头解析失败 | 191 | **之前** | `false` | ❌ | ✅ | ✅ |
+| P1 | 请求构建/授权头解析中 panic | 156-203 | **之前** | `false` | ❌（recover 已注册，Update 未注册） | ✅ | ✅ |
 | D | MarkTaskDelivered DB 错误 | 207 | **边界上** | `false` | ❌ | ✅ | ✅ |
 | E | DisableWebhooks | 243 | **之后** | `true` | ✅ | ❌ | ✅ |
 | F | Webhook 未激活 | 248 | **之后** | `true` | ✅ | ❌ | ✅ |
 | G | HTTP 请求失败 | 254 | **之后** | `true` | ✅ | ❌ | ✅ |
 | H | 响应读取失败 | 268 | **之后** | `true` | ✅ | ❌ | ✅ |
+| P2 | HTTP/响应读取中 panic | 205-271 | **之后** | `true` | ✅（两个 defer 都已注册） | ❌ | ✅ |
+
+### 4.4 Panic 场景专项对比
+
+| 维度 | P0 (GetWebhookByID 中) | P1 (MarkTaskDelivered 之前) | P2 (MarkTaskDelivered 之后) |
+|------|-------------------------|-----------------------------|-----------------------------|
+| **recover defer 注册状态** | 未注册 | 已注册 | 已注册 |
+| **UpdateHookTask defer 注册状态** | 未注册 | 未注册 | 已注册 |
+| **哪层 recover 捕获** | 外层队列 recover | 内层 Deliver recover | 内层 Deliver recover |
+| **defer 执行顺序** | 只有外层队列 recover | 只有内层 recover | Update → resp.Close → recover |
+| **DB is_delivered** | `false` | `false` | `true` |
+| **Request/Response 落库** | ❌ | ❌ | ✅ |
+| **w.LastStatus 更新** | ❌ | ❌ | ✅（Fail） |
+| **Deliver 返回值** | 函数未正常返回 | `nil`（error 零值） | `nil`（error 零值） |
+| **handler 感知** | 不可见 | 不可见（err==nil） | 不可见（err==nil） |
+| **日志特征** | 队列层 "Recovered from panic" | Deliver 层 "PANIC whilst trying to deliver" | 两条日志：PANIC + "Hook delivery failed" |
+| **重启可恢复** | ✅ | ✅ | ❌ |
+| **隐蔽性** | 中 | 高（handler 认为成功） | 最高（handler 认为成功 + UI 显示失败） |
 
 ---
 
-## 四、恢复路径详解
+## 五、恢复路径详解
 
-### 4.1 重启恢复（仅限 is_delivered=false）
+### 5.1 重启恢复（仅限 is_delivered=false）
 
 **触发**: Gitea 进程启动时
 
@@ -303,15 +500,16 @@ Init()
                            └─ handler() → Deliver() 重新执行
 ```
 
-**适用场景**: A / B / C / D
+**适用场景**: A / B / C / D / P0 / P1
 
 **限制**:
 - 仅在启动时执行一次
 - 若根因未修复，任务会在下次重启时再次失败，形成 **重启循环**
 - 场景 A（webhook 已删除）属于永久性循环
 - 场景 C（SECRET_KEY 变更）属于永久性循环
+- 场景 P0/P1（panic）若为代码缺陷导致，也属于永久性循环
 
-### 4.2 手动重放（唯一通用恢复方式）
+### 5.2 手动重放（唯一通用恢复方式）
 
 **触发**: 用户在 Web UI 点击"重放"按钮
 
@@ -322,7 +520,7 @@ ReplayWebhook(ctx)
             └─ enqueueHookTask(newTask.ID)       ← 新 ID 入队
 ```
 
-**适用场景**: 所有（A/B/C/D/E/F/G/H）
+**适用场景**: 所有（A/B/C/D/E/F/G/H/P0/P1/P2）
 
 **特点**:
 - 创建全新 HookTask（新 ID、新 UUID）
@@ -330,51 +528,60 @@ ReplayWebhook(ctx)
 - 旧任务记录保持不变
 - 需用户主动操作
 
-### 4.3 队列退避（对 webhook 不生效）
+### 5.3 队列退避（对 webhook 不生效）
 
 ```
 handler() 总是返回 nil → unhandled 为空 → 退避条件不满足 → 不触发
 ```
 
-**结论**: 队列退避机制与 webhook 投递完全无关。
+**结论**: 队列退避机制与 webhook 投递完全无关，包括 panic 场景。
 
 ---
 
-## 五、场景 F 的特殊语义
+## 六、场景 F 与 P1/P2 的特殊语义对比
 
-场景 F（`!w.IsActive`）是 MarkTaskDelivered 之后**唯一返回 `nil` 而非 error 的失败路径**。这带来几个特殊后果：
+场景 F（`!w.IsActive`）是 MarkTaskDelivered 之后**唯一返回 `nil` 而非 error 的普通失败路径**。但 P1/P2 panic 场景也返回 `nil`，形成更隐蔽的失败模式：
 
-| 对比维度 | 场景 F（未激活） | 其他之后场景（E/G/H） |
-|----------|-----------------|---------------------|
-| Deliver 返回值 | `nil` | `error` |
-| handler 日志级别 | 无 error 日志 | `log.Error` |
-| defer 日志内容 | "Hook delivery skipped as webhook is inactive" | "Hook delivery failed" |
-| 实际意义 | 用户主动禁用，不算异常 | 属于投递异常 |
+| 对比维度 | 场景 F（未激活） | 场景 P1（边界前 panic） | 场景 P2（边界后 panic） | 其他之后场景（E/G/H） |
+|----------|-----------------|-----------------------|-----------------------|---------------------|
+| Deliver 返回值 | `nil` | `nil` | `nil` | `error` |
+| handler 日志级别 | 无 error 日志 | 无 error 日志 | 无 error 日志 | `log.Error` |
+| defer 日志内容 | "skipped as webhook is inactive" | 只有 PANIC 日志 | PANIC + "delivery failed" | "Hook delivery failed" |
+| DB is_delivered | `true` | `false` | `true` | `true` |
+| Request/Response 落库 | ✅ | ❌ | ✅ | ✅ |
+| w.LastStatus | `Fail` | 不更新 | `Fail` | `Fail` |
+| handler 感知 | 不可见（返回 nil） | 不可见（返回 nil） | 不可见（返回 nil） | 可见（返回 error） |
+| 重启可恢复 | ❌ | ✅ | ❌ | ❌ |
+| 实际意义 | 用户主动禁用，不算异常 | 代码缺陷，隐蔽失败 | 代码缺陷，UI 可见失败 | 投递异常 |
 
-**关键点**: 虽然 Deliver 返回 `nil`，但 `is_succeed=false`，`w.LastStatus=HookStatusFail`。这意味着：
+**关键点**: 虽然 Deliver 返回 `nil`，但 `is_succeed=false`，`w.LastStatus=HookStatusFail`（对于 F 和 P2）。这意味着：
 - 禁用 webhook 期间的所有事件都会被标记为失败
 - 重新激活后，`LastStatus` 仍为 `Fail`，直到下次成功投递才更新
 - UI 上"最近投递"列表中会出现大量红色记录
+- P2 场景最隐蔽：handler 认为成功，但 UI 显示失败，日志需要同时检查 PANIC 和 delivery failed 两条记录
 
 ---
 
-## 六、代码溯源索引
+## 七、代码溯源索引
 
 | 代码位置 | 文件路径 | 行号 |
 |----------|----------|------|
 | GetWebhookByID | `services/webhook/deliver.go` | 151 |
+| 内层 panic recover defer | `services/webhook/deliver.go` | 156-163 |
 | 内存 t.IsDelivered=true | `services/webhook/deliver.go` | 165 |
 | 请求构建 newRequest | `services/webhook/deliver.go` | 172 |
 | 授权头解析 HeaderAuthorization | `services/webhook/deliver.go` | 189 |
 | 解密实现 DecryptSecret | `models/webhook/webhook.go` | 211-216 |
 | MarkTaskDelivered（边界） | `services/webhook/deliver.go` | 204 |
 | MarkTaskDelivered DB 实现 | `models/webhook/hooktask.go` | 188-195 |
-| defer 注册（落库） | `services/webhook/deliver.go` | 216-240 |
+| defer UpdateHookTask 注册 | `services/webhook/deliver.go` | 216-240 |
 | DisableWebhooks 检查 | `services/webhook/deliver.go` | 242 |
 | IsActive 检查 | `services/webhook/deliver.go` | 246 |
 | HTTP 请求发送 | `services/webhook/deliver.go` | 251 |
+| resp.Body.Close defer | `services/webhook/deliver.go` | 256 |
 | 响应读取 | `services/webhook/deliver.go` | 265 |
 | handler 处理器 | `services/webhook/webhook.go` | 77-104 |
+| 外层队列 panic recover | `modules/queue/workerqueue.go` | 243-257 |
 | 重启恢复 populateWebhookSendingQueue | `services/webhook/deliver.go` | 338-366 |
 | 查询未投递任务 | `models/webhook/hooktask.go` | 173-186 |
 | 手动重放 ReplayHookTask | `models/webhook/hooktask.go` | 153-171 |

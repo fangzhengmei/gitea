@@ -309,15 +309,36 @@ if len(releases) == 1 {
    }
    ```
 
+**attachmentReadScope 映射规则** (`routers/web/repo/attachment.go:25-34`):
+```go
+func attachmentReadScope(unitType unit.Type) (auth_model.AccessTokenScope, bool) {
+    switch unitType {
+    case unit.TypeIssues, unit.TypePullRequests:
+        return auth_model.AccessTokenScopeReadIssue, true
+    case unit.TypeReleases:
+        return auth_model.AccessTokenScopeReadRepository, true  // Release 附件需要 read:repository
+    default:
+        return "", false
+    }
+}
+```
+- Release 附件下载的 Token Scope 是 `read:repository`，而非 `write:repository`
+- 草稿保护不依赖 Scope，而是依赖查询层的 `IncludeDrafts` 过滤
+
 ### 5.3 附件下载入口的鉴权复用总结
 
 | 鉴权层级 | 复用机制 | 代码位置 |
 |---------|---------|---------|
-| **第一层** | 查询时通过 `IncludeDrafts` 过滤草稿 | `routers/web/repo/repo.go:325` |
-| **第二层** | 仅能查询到有权限的 Release | `FindReleasesOptions.ToConds()` |
+| **第一层** | 查询时通过 `IncludeDrafts` 过滤草稿（关键防护） | `routers/web/repo/repo.go:325` |
+| **第二层** | 仅能查询到有权限的 Release（隐式过滤） | `FindReleasesOptions.ToConds()` |
 | **第三层** | 通用附件服务的仓库归属检查 | `routers/web/repo/attachment.go:148` |
 | **第四层** | Releases 单元读取权限检查 | `routers/web/repo/attachment.go:184` |
-| **第五层** | API Token Scope 验证 | `routers/web/repo/attachment.go:189-194` |
+| **第五层** | API Token Scope 验证（read:repository） | `routers/web/repo/attachment.go:189-194` |
+
+**鉴权缺陷说明**：
+- 前两层仅适用于 `/releases/download/{tag}/{filename}` 友好 URL 路径
+- 全局 UUID 直链 `/attachments/{uuid}` 绕过了前两层过滤
+- 导致 UUID 直链无法防止草稿附件泄露
 
 ---
 
@@ -354,34 +375,90 @@ if len(releases) == 1 {
 - **控制逻辑**：`routers/api/v1/repo/release.go:80-83`
 
 #### 3. Web 端友好下载 URL (`/releases/download/{tag}/{filename}`)
-- **草稿时**：无权限用户查询不到 Release，返回 404
+
+**普通 tag 下载分支** (`routers/web/repo/repo.go:324-328`):
+```go
+releases, err := db.Find[repo_model.Release](ctx, repo_model.FindReleasesOptions{
+    IncludeDrafts: ctx.Repo.Permission.CanWrite(unit.TypeReleases),
+    RepoID:        curRepo.ID,
+    TagNames:      tagNames,
+})
+```
+- **草稿时**：无写入权限用户查询不到 Release，返回 404
 - **转正后**：所有用户都能下载
-- **控制逻辑**：`routers/web/repo/repo.go:325` 的 `IncludeDrafts` 参数
+
+**latest 别名下载分支** (`routers/web/repo/repo.go:344-360`):
+```go
+} else if len(releases) == 0 && vTag == "latest" {
+    release, err := repo_model.GetLatestReleaseByRepoID(ctx, ctx.Repo.Repository.ID)
+    // GetLatestReleaseByRepoID 内部硬编码过滤 is_draft: false
+}
+```
+- **`GetLatestReleaseByRepoID` 实现** (`models/repo/release.go:330-335`):
+  ```go
+  cond := builder.NewCond().
+      And(builder.Eq{"repo_id": repoID}).
+      And(builder.Eq{"is_draft": false}).      // 硬编码过滤草稿
+      And(builder.Eq{"is_prerelease": false}).  // 硬编码过滤预发布
+      And(builder.Eq{"is_tag": false})
+  ```
+- **latest 分支特性**：无论用户权限如何，永远不会返回草稿 Release
+- 草稿转正后才会出现在 latest 查询结果中
 
 #### 4. UUID 直接访问 (`/attachments/{uuid}`)
+
+**实际权限检查流程** (`routers/web/repo/attachment.go:153-195`):
+```go
+unitType, repoID, err := repo_service.GetAttachmentLinkedTypeAndRepoID(ctx, attach)
+// unitType = unit.TypeReleases (当 attach.ReleaseID != 0 时)
+
+if repo == nil {  // 全局路由访问时 ctx.Repo.Repository 为 nil
+    repo, err = repo_model.GetRepositoryByID(ctx, repoID)
+    perm, err = access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
+}
+
+if !perm.CanRead(unitType) {  // 仅检查 Releases 读权限
+    ctx.HTTPError(http.StatusNotFound)
+    return
+}
+```
+
+**可见性分析**：
 - **草稿时**：
-  - 写入权限用户：可下载（通过 `CanRead(unit.TypeReleases)` 检查）
-  - 其他用户：也可下载 ⚠️ **存在安全隐患**
-- **转正后**：所有用户都能下载
-- **问题**：UUID 直接访问不检查 Release 的草稿状态！
+  - 公开仓库：**所有用户（包括未登录）都可下载** ⚠️ **存在安全隐患**
+  - 私有仓库：只有仓库读权限用户可下载
+  - **关键缺失**：没有检查关联 Release 的 `IsDraft` 状态
+- **转正后**：
+  - 公开仓库：所有人可下载
+  - 私有仓库：有仓库读权限用户可下载
 
 ### 6.4 安全注意事项
 
-**UUID 直接访问的权限漏洞**：
+**UUID 直接访问的权限漏洞分析**：
 - 通用附件服务 `ServeAttachment()` 只检查：
-  1. 附件是否属于当前仓库
-  2. 用户是否有 Releases 单元的读取权限
-- **不检查关联 Release 的 `IsDraft` 状态**
-- 攻击者若猜到 UUID，可绕过草稿保护下载附件
+  1. 附件是否属于当前仓库（仓库归属检查）
+  2. 用户是否有 Releases 单元的读取权限（`perm.CanRead(unit.TypeReleases)`）
+- **完全不检查关联 Release 的 `IsDraft` 状态**
+- 公开仓库场景下：攻击者若猜到 UUID，可绕过草稿保护下载附件
 
-**建议修复方向**：
-在 `ServeAttachment()` 中增加对 Release 草稿状态的检查：
+**修复建议（需考虑全局路由上下文）**：
 ```go
+// 在 ServeAttachment() 的权限检查后增加草稿状态检查
 if unitType == unit.TypeReleases {
-    rel, _ := repo_model.GetReleaseByID(ctx, attach.ReleaseID)
-    if rel != nil && rel.IsDraft && !ctx.Repo.Permission.CanWrite(unit.TypeReleases) {
-        ctx.HTTPError(http.StatusNotFound)
-        return
+    rel, err := repo_model.GetReleaseByID(ctx, attach.ReleaseID)
+    if err == nil && rel.IsDraft {
+        // 需要动态获取权限（兼容全局路由 ctx.Repo.Repository == nil 的情况）
+        var canWrite bool
+        if ctx.Repo.Repository != nil {
+            canWrite = ctx.Repo.Permission.CanWrite(unit.TypeReleases)
+        } else {
+            perm, _ := access_model.GetDoerRepoPermission(ctx, rel.RepoID, ctx.Doer)
+            canWrite = perm.CanWrite(unit.TypeReleases)
+        }
+        if !canWrite {
+            ctx.HTTPError(http.StatusNotFound)
+            return
+        }
     }
 }
 ```
@@ -454,10 +531,16 @@ requiredScopes := auth_model.GetRequiredScopes(
 )
 ```
 
+**Scope 常量定义** (`models/auth/access_token_scope.go:80-81`):
+```go
+AccessTokenScopeReadRepository  AccessTokenScope = "read:repository"
+AccessTokenScopeWriteRepository AccessTokenScope = "write:repository"
+```
+
 **Scope 含义**：
-- `repo` (Write)：完整的仓库读写权限
-- 包含：创建/编辑 Release、上传附件、管理草稿等操作
-- 草稿属于写入操作范畴，因此需要 Write 级别的 Scope
+- `write:repository`：完整的仓库读写权限
+- `read:repository`：仓库只读权限
+- 草稿管理属于写入操作范畴，因此需要 Write 级别的 Scope
 
 ### 7.5 权限矩阵
 
@@ -466,8 +549,8 @@ requiredScopes := auth_model.GetRequiredScopes(
 | 浏览器（未登录） | ❌ | - | - | ❌ |
 | 浏览器（只读用户） | ✅ | ❌ | - | ❌ |
 | 浏览器（写入用户） | ✅ | ✅ | - | ✅ |
-| API Token（只读 Scope） | ✅ | ✅ | `repo:read` | ❌ |
-| API Token（写入 Scope） | ✅ | ✅ | `repo` | ✅ |
+| API Token（只读 Scope） | ✅ | ✅ | `read:repository` | ❌ |
+| API Token（写入 Scope） | ✅ | ✅ | `write:repository` | ✅ |
 
 ---
 

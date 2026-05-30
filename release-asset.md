@@ -94,7 +94,9 @@ type Attachment struct {
 | Git Tag 创建 | ❌ 不创建 | ✅ 立即创建 |
 | Sha1 字段 | 空字符串 | 实际 commit hash |
 | 通知发送 | ❌ 不发送 | ✅ NewRelease 通知 |
-| 列表可见性 | 仅写入权限用户可见 | 所有用户可见 |
+| Release 元数据可见性 | 仅写入权限用户可见 | 所有用户可见 |
+| 附件可见性（Release 上下文） | 仅写入权限用户可见 | 所有用户可见 |
+| 附件可见性（UUID 直链） | ⚠️ 不受草稿保护（见第六阶段详解） | 所有有仓库读权限的用户可见 |
 
 ---
 
@@ -214,7 +216,7 @@ opts := repo_model.FindReleasesOptions{
 IncludeDrafts: writeAccess,  // 同样仅写入权限可见
 ```
 
-### 单个 Release 访问控制
+### 单个 Release 访问控制（API 层）
 
 **草稿保护** (`routers/api/v1/repo/release.go:80-83`):
 ```go
@@ -224,13 +226,22 @@ if release.IsDraft && !canAccessReleaseDraft(ctx) {
 }
 ```
 
-**附件访问** (`routers/api/v1/repo/release_attachment.go:37-40`):
+**附件访问（API 层）** (`routers/api/v1/repo/release_attachment.go:37-40`):
 ```go
 if release.IsDraft && !canAccessReleaseDraft(ctx) {
     ctx.APIErrorNotFound()  // 草稿的附件也受保护
     return
 }
 ```
+
+### 可见性小结：API 层 vs UUID 直链
+
+| 访问路径 | 草稿附件受保护？ | 保护机制 | 代码依据 |
+|---------|-----------------|---------|---------|
+| API: `GET /repos/{owner}/{repo}/releases/{id}` | ✅ 受保护 | `IsDraft && !canAccessReleaseDraft` 显式检查 | `routers/api/v1/repo/release.go:80` |
+| API: `GET /repos/{owner}/{repo}/releases/{id}/assets` | ✅ 受保护 | `checkReleaseMatchRepo` 中检查草稿 | `routers/api/v1/repo/release_attachment.go:37` |
+| Web: `/releases/download/{tag}/{file}` | ✅ 受保护 | `IncludeDrafts` 查询过滤 | `routers/web/repo/repo.go:325` |
+| Web: `/attachments/{uuid}` | ⚠️ **不受保护** | 仅检查仓库读权限，不检查 `IsDraft` | `routers/web/repo/attachment.go:184` |
 
 ---
 
@@ -336,9 +347,9 @@ func attachmentReadScope(unitType unit.Type) (auth_model.AccessTokenScope, bool)
 | **第五层** | API Token Scope 验证（read:repository） | `routers/web/repo/attachment.go:189-194` |
 
 **鉴权缺陷说明**：
-- 前两层仅适用于 `/releases/download/{tag}/{filename}` 友好 URL 路径
-- 全局 UUID 直链 `/attachments/{uuid}` 绕过了前两层过滤
-- 导致 UUID 直链无法防止草稿附件泄露
+- 前两层仅适用于 `/releases/download/{tag}/{filename}` 友好 URL 路径，通过 `IncludeDrafts` 实现草稿过滤
+- 全局 UUID 直链 `/attachments/{uuid}` 绕过了前两层过滤，`ServeAttachment()` 只做仓库读权限检查
+- 因此 UUID 直链下草稿附件的可见性仅取决于仓库可见性（公开/私有），与 `IsDraft` 无关
 
 ---
 
@@ -364,15 +375,17 @@ func attachmentReadScope(unitType unit.Type) (auth_model.AccessTokenScope, bool)
 
 ### 6.3 各入口的可见性变化详解
 
+以下所有入口均遵循同一套草稿可见性规则：**草稿 Release 及其附件仅对有仓库写入权限的用户可见**。区别在于各入口实现此规则的方式不同。
+
 #### 1. Release 列表 API (`GET /repos/{owner}/{repo}/releases`)
-- **草稿时**：仅写入权限用户能看到 Release 及其附件列表
-- **转正后**：所有用户都能看到 Release 及其附件列表
-- **控制逻辑**：`FindReleasesOptions` 中的 `IncludeDrafts` 参数
+- **控制逻辑**：`FindReleasesOptions` 中的 `IncludeDrafts` 参数 (`routers/api/v1/repo/release.go:178`)
+- **草稿时**：`IncludeDrafts = canAccessReleaseDraft(ctx)`，仅写入权限用户能看到 Release 及其附件列表
+- **转正后**：`IsDraft = false`，不依赖 `IncludeDrafts` 过滤，所有用户都能看到
 
 #### 2. 单个 Release API (`GET /repos/{owner}/{repo}/releases/{id}`)
-- **草稿时**：无权限用户返回 404
+- **控制逻辑**：显式 `IsDraft` 检查 (`routers/api/v1/repo/release.go:80-83`)
+- **草稿时**：无写入权限用户返回 404
 - **转正后**：所有用户都能获取详情，包含附件 URL
-- **控制逻辑**：`routers/api/v1/repo/release.go:80-83`
 
 #### 3. Web 端友好下载 URL (`/releases/download/{tag}/{filename}`)
 
@@ -384,8 +397,9 @@ releases, err := db.Find[repo_model.Release](ctx, repo_model.FindReleasesOptions
     TagNames:      tagNames,
 })
 ```
+- **控制逻辑**：`IncludeDrafts` 查询过滤（与入口1一致）
 - **草稿时**：无写入权限用户查询不到 Release，返回 404
-- **转正后**：所有用户都能下载
+- **转正后**：所有有仓库读权限的用户可下载
 
 **latest 别名下载分支** (`routers/web/repo/repo.go:344-360`):
 ```go
@@ -431,7 +445,6 @@ unitType, repoID, err := repo_service.GetAttachmentLinkedTypeAndRepoID(ctx, atta
 
 if repo == nil {  // 全局路由访问时 ctx.Repo.Repository 为 nil
     repo, err = repo_model.GetRepositoryByID(ctx, repoID)
-    // GetDoerRepoPermission 接受 user 为 nil（未登录用户）
     perm, err = access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
 }
 
@@ -439,62 +452,73 @@ if !perm.CanRead(unitType) {  // 仅检查 Releases 读权限
     ctx.HTTPError(http.StatusNotFound)
     return
 }
+// ⚠️ 此处没有检查 release.IsDraft
 ```
 
-**未登录用户权限处理** (`models/perm/access/repo_permission.go:433-437`):
+**未登录用户权限处理** (`models/perm/access/repo_permission.go:407-437`):
 ```go
-// anonymous visit public repo
+// anonymous user visit private repo → AccessModeNone
+if user == nil && repo.IsPrivate {
+    perm.AccessMode = perm_model.AccessModeNone
+    return perm, nil
+}
+// anonymous visit public repo → AccessModeRead
 if user == nil {
-    perm.AccessMode = perm_model.AccessModeRead  // 公开仓库赋予读权限
+    perm.AccessMode = perm_model.AccessModeRead
     return perm, nil
 }
 ```
 
-**可见性分析**：
-- **草稿时**：
-  - 公开仓库：
-    - 未登录用户：`ctx.Doer == nil` → `GetDoerRepoPermission` 返回 `AccessModeRead` → **可下载**
-    - 已登录普通用户：只要有读权限就可下载
-    - ⚠️ **存在安全隐患**：草稿保护完全失效
-  - 私有仓库：
-    - 未登录用户：`user == nil && repo.IsPrivate` → `AccessModeNone` → 不可下载
-    - 只有仓库读权限用户可下载
-  - **关键缺失**：整个权限检查链路**完全没有检查**关联 Release 的 `IsDraft` 状态
-- **转正后**：
-  - 公开仓库：所有人（包括未登录）可下载
-  - 私有仓库：有仓库读权限用户可下载
+**可见性分析（区分公开/私有仓库）**：
 
-**核心问题根源**：
-- UUID 直链绕过了 `/releases/download` 路径的 `IncludeDrafts` 过滤
-- `ServeAttachment()` 只校验仓库读权限，不感知 Release 的草稿状态
+| 仓库类型 | 草稿时 | 转正后 | 根因 |
+|---------|--------|--------|------|
+| **公开仓库** | ⚠️ **所有人均可下载**（包括未登录用户） | 所有人均可下载 | `CanRead(TypeReleases)` 在公开仓库对所有用户返回 true，且不检查 `IsDraft` |
+| **私有仓库** | 仅仓库读权限用户可下载 | 仅仓库读权限用户可下载 | 未登录用户返回 `AccessModeNone`，已登录用户需有读权限 |
+
+**问题总结**：
+- UUID 直链通过 `ServeAttachment()` 处理，该函数**完全不检查**关联 Release 的 `IsDraft` 状态
+- 对于公开仓库：草稿附件和已发布附件的可见性完全相同——均对所有用户开放
+- 对于私有仓库：虽然未登录用户被 `AccessModeNone` 拒绝，但有仓库读权限的用户可以访问草稿附件
+- 这与 Release 上下文（API/Web 列表）中的草稿保护逻辑不一致
 
 ### 6.4 安全注意事项
 
-**UUID 直接访问的权限漏洞分析**：
-- 通用附件服务 `ServeAttachment()` 只检查：
-  1. 附件是否属于当前仓库（仓库归属检查）
-  2. 用户是否有 Releases 单元的读取权限（`perm.CanRead(unit.TypeReleases)`）
-- **完全不检查关联 Release 的 `IsDraft` 状态**
-- 公开仓库场景下：攻击者若猜到 UUID，可绕过草稿保护下载附件
+**UUID 直链的草稿保护缺失**：
+
+`ServeAttachment()` 的权限检查链路 (`routers/web/repo/attachment.go:153-195`)：
+1. 仓库归属检查 → 防止跨仓库访问
+2. `perm.CanRead(unit.TypeReleases)` → 检查仓库读权限
+3. `attachmentReadScope` → Token Scope 检查 (`read:repository`)
+
+**缺失的检查**：关联 Release 的 `IsDraft` 状态
+
+**影响范围（按仓库类型区分）**：
+
+| 仓库类型 | 影响 | 说明 |
+|---------|------|------|
+| 公开仓库 | 🔴 严重 | 任何人（含未登录）均可通过 UUID 直链下载草稿附件，与 Release 列表中的草稿保护完全矛盾 |
+| 私有仓库 | 🟡 中等 | 已登录且有仓库读权限的用户可下载草稿附件，但该用户本来也能看到仓库内容；未登录用户被拒绝 |
 
 **修复建议（需考虑全局路由上下文，与真实函数签名一致）**：
 ```go
-// 在 ServeAttachment() 的权限检查后增加草稿状态检查
+// 在 ServeAttachment() 的 perm.CanRead 检查之后，增加草稿状态检查
 if unitType == unit.TypeReleases {
     rel, err := repo_model.GetReleaseByID(ctx, attach.ReleaseID)
     if err == nil && rel.IsDraft {
-        // 需要动态获取权限（兼容全局路由 ctx.Repo.Repository == nil 的情况）
+        // 复用与 canAccessReleaseDraft 一致的写入权限判断
         var canWrite bool
         if ctx.Repo.Repository != nil {
             canWrite = ctx.Repo.Permission.CanWrite(unit.TypeReleases)
         } else {
-            // 真实函数签名: GetDoerRepoPermission(ctx, repo *repo_model.Repository, user)
-            // 需要先通过 RepoID 获取 Repository 对象
-            repo, err := repo_model.GetRepositoryByID(ctx, rel.RepoID)
-            if err == nil {
-                perm, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
-                if err == nil {
-                    canWrite = perm.CanWrite(unit.TypeReleases)
+            // 全局路由下 ctx.Repo.Repository 可能为 nil，需动态获取
+            // GetRepositoryByID 签名: (ctx, id int64) (*Repository, error)  — models/repo/repo.go:835
+            r, rErr := repo_model.GetRepositoryByID(ctx, rel.RepoID)
+            if rErr == nil {
+                // GetDoerRepoPermission 签名: (ctx, repo *Repository, user) (Permission, error)  — models/perm/access/repo_permission.go:384
+                p, pErr := access_model.GetDoerRepoPermission(ctx, r, ctx.Doer)
+                if pErr == nil {
+                    canWrite = p.CanWrite(unit.TypeReleases)
                 }
             }
         }
@@ -505,10 +529,6 @@ if unitType == unit.TypeReleases {
     }
 }
 ```
-
-**代码依据**：
-- `GetRepositoryByID(ctx, id int64) (*Repository, error)` - `models/repo/repo.go:835`
-- `GetDoerRepoPermission(ctx, repo *Repository, user) (Permission, error)` - `models/perm/access/repo_permission.go:384`
 
 ---
 
@@ -657,6 +677,7 @@ AccessTokenScopeWriteRepository AccessTokenScope = "write:repository"
 ## 注意事项
 
 1. **草稿与 Git Tag 的分离**：草稿 Release 不创建真实的 Git tag，只有发布时才创建
-2. **附件权限继承**：草稿 Release 的附件也受草稿权限保护，无权限用户无法访问
+2. **附件权限保护的分层**：草稿附件在 Release 上下文（API 列表、Web 列表、友好下载 URL）中受 `IsDraft` 保护，但在 UUID 直链路径中**不检查草稿状态**，公开仓库的草稿附件对所有人可下载
 3. **通知时机**：只有非草稿状态才会触发通知，草稿转正时触发 `NewRelease` 而非 `UpdateRelease`
 4. **附件关联校验**：附件必须属于同一仓库且未被其他 Release 使用才能关联
+5. **latest 路径的特殊性**：`GetLatestReleaseByRepoID` 硬编码 `is_draft: false`，无论用户权限如何都不返回草稿

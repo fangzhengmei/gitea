@@ -1,724 +1,382 @@
-# Webhook 事件投递与过滤协作流程分析
+# Webhook 投递失败链路状态表
 
-## 整体架构概览
-
-Webhook 系统采用**事件捕获 → 规则匹配 → 任务入队 → 异步投递**的分层协作模式。与之前理解不同的是：**失败任务没有自动重试机制**，所有任务一旦被 worker 取出处理，就会被标记为 `is_delivered=true`（无论成功失败）。
-
-| 层级 | 文件路径 | 核心职责 |
-|------|----------|----------|
-| 事件捕获 | `services/webhook/notifier.go` | 监听系统事件，转换为 webhook 载荷 |
-| 规则匹配 | `services/webhook/webhook.go` | 事件过滤、分支匹配、任务创建 |
-| 任务模型 | `models/webhook/hooktask.go` | 投递任务存储、状态管理 |
-| 投递执行 | `services/webhook/deliver.go` | HTTP 请求构建、发送、结果记录 |
-| 队列管理 | `modules/queue/workerqueue.go` | 异步处理、去重 |
-
----
-
-## 一、事件捕获阶段
-
-### 1.1 注册监听入口
-
-**代码位置**: `services/webhook/notifier.go:32-45`
-
-```go
-func init() {
-    notify_service.RegisterNotifier(NewNotifier())
-}
-
-type webhookNotifier struct {
-    notify_service.NullNotifier
-}
-
-func NewNotifier() notify_service.Notifier {
-    return &webhookNotifier{}
-}
-```
-
-**机制说明**:
-- `webhookNotifier` 实现了 `notify_service.Notifier` 接口
-- 通过 `init()` 函数在包加载时自动注册到全局通知服务
-- 采用观察者模式，系统所有事件会广播给所有已注册的 notifier
-
-### 1.2 事件处理方法集
-
-**代码位置**: `services/webhook/notifier.go:47-1063`
-
-系统为每种事件类型提供了对应的处理方法，部分关键方法包括：
-
-| 事件类型 | 处理方法 | 触发时机 |
-|----------|----------|----------|
-| 代码推送 | `PushCommits` | 用户 push 代码时 |
-| Issue 创建 | `NewIssue` | 新建 Issue 时 |
-| PR 创建 | `NewPullRequest` | 新建 Pull Request 时 |
-| PR 合并 | `MergePullRequest` | PR 被合并时 |
-| 评论创建 | `CreateIssueComment` | 新增评论时 |
-| 标签变更 | `IssueChangeLabels` | Issue/PR 标签变化时 |
-| 里程碑变更 | `IssueChangeMilestone` | 里程碑变化时 |
-| 代码评审 | `PullRequestReview` | PR 评审提交时 |
-| Release 发布 | `NewRelease` | Release 发布时 |
-
-**典型事件处理流程**（以 PushCommits 为例）：
-
-```go
-// services/webhook/notifier.go:646-668
-func (m *webhookNotifier) PushCommits(ctx context.Context, pusher *user_model.User, 
-    repo *repo_model.Repository, opts *repository.PushUpdateOptions, 
-    commits *repository.PushCommits) {
-    
-    apiPusher := convert.ToUser(ctx, pusher, nil)
-    apiCommits, apiHeadCommit, err := commits.ToAPIPayloadCommits(ctx, repo)
-    
-    if err := PrepareWebhooks(ctx, EventSource{Repository: repo}, 
-        webhook_module.HookEventPush, &api.PushPayload{
-            Ref:          opts.RefFullName.String(),
-            Before:       opts.OldCommitID,
-            After:        opts.NewCommitID,
-            Commits:      apiCommits,
-            TotalCommits: commits.Len,
-            HeadCommit:   apiHeadCommit,
-            Repo:         convert.ToRepo(ctx, repo, ...),
-            Pusher:       apiPusher,
-            Sender:       apiPusher,
-        }); err != nil {
-        log.Error("PrepareWebhooks: %v", err)
-    }
-}
-```
-
-**设计要点**:
-1. 每个事件方法负责将领域模型转换为 API 载荷结构
-2. 统一调用 `PrepareWebhooks(ctx, source, eventType, payload)` 进入下一阶段
-3. 事件失败仅记录日志，不阻塞主业务流程
-
----
-
-## 二、规则匹配阶段
-
-### 2.1 Webhook 收集与分发
-
-**代码位置**: `services/webhook/webhook.go:179-227`
-
-```go
-func PrepareWebhooks(ctx context.Context, source EventSource, 
-    event webhook_module.HookEventType, p api.Payloader) error {
-    
-    var ws []*webhook_model.Webhook
-    
-    // 1. 收集仓库级 webhook
-    if source.Repository != nil {
-        repoHooks, err := db.Find[webhook_model.Webhook](ctx, 
-            webhook_model.ListWebhookOptions{
-                RepoID:   source.Repository.ID,
-                IsActive: optional.Some(true),
-            })
-        ws = append(ws, repoHooks...)
-    }
-    
-    // 2. 收集所有者（用户/组织）级 webhook
-    if owner != nil {
-        ownerHooks, err := db.Find[webhook_model.Webhook](ctx, 
-            webhook_model.ListWebhookOptions{
-                OwnerID:  owner.ID,
-                IsActive: optional.Some(true),
-            })
-        ws = append(ws, ownerHooks...)
-    }
-    
-    // 3. 收集系统级 webhook
-    systemHooks, err := webhook_model.GetSystemWebhooks(ctx, optional.Some(true))
-    ws = append(ws, systemHooks...)
-    
-    // 4. 逐个 webhook 进行过滤
-    for _, w := range ws {
-        if err := PrepareWebhook(ctx, w, event, p); err != nil {
-            return err
-        }
-    }
-    return nil
-}
-```
-
-**三级 Webhook 生效范围**:
-1. **系统级**: 管理员配置，对所有仓库生效
-2. **所有者级**: 用户/组织配置，对其下所有仓库生效
-3. **仓库级**: 具体仓库配置，仅对当前仓库生效
-
-### 2.2 单 Webhook 过滤逻辑
-
-**代码位置**: `services/webhook/webhook.go:135-177`
-
-```go
-func PrepareWebhook(ctx context.Context, w *webhook_model.Webhook, 
-    event webhook_module.HookEventType, p api.Payloader) error {
-    
-    // 过滤器1: 全局开关
-    if setting.DisableWebhooks {
-        return nil
-    }
-    
-    // 过滤器2: 事件类型匹配
-    if !w.HasEvent(event) {
-        return nil
-    }
-    
-    // 过滤器3: 空 commit 推送优化
-    if pushEvent, ok := p.(*api.PushPayload); ok &&
-        w.Type != webhook_module.GITEA && w.Type != webhook_module.GOGS &&
-        len(pushEvent.Commits) == 0 {
-        return nil
-    }
-    
-    // 过滤器4: 分支过滤
-    if ref := getPayloadRef(p); ref != "" {
-        if !checkBranchFilter(w.BranchFilter, ref) {
-            return nil
-        }
-    }
-    
-    // 过滤通过: 创建任务并入队
-    payload, err := p.JSONPayload()
-    task, err := webhook_model.CreateHookTask(ctx, &webhook_model.HookTask{
-        HookID:         w.ID,
-        PayloadContent: string(payload),
-        EventType:      event,
-        PayloadVersion: 2,
-    })
-    
-    return enqueueHookTask(task.ID)
-}
-```
-
-### 2.3 事件类型匹配详解
-
-**代码位置**: `models/webhook/webhook.go:171-184`
-
-```go
-func (w *Webhook) HasEvent(evt webhook_module.HookEventType) bool {
-    // 模式1: 发送所有事件
-    if w.SendEverything {
-        return true
-    }
-    // 模式2: 仅推送事件
-    if w.PushOnly {
-        return evt == webhook_module.HookEventPush
-    }
-    // 模式3: 事件组映射（评审子事件归组）
-    checkEvt := evt
-    switch evt {
-    case webhook_module.HookEventPullRequestReviewApproved,
-         webhook_module.HookEventPullRequestReviewRejected,
-         webhook_module.HookEventPullRequestReviewComment:
-        checkEvt = webhook_module.HookEventPullRequestReview
-    }
-    // 模式4: 精确事件匹配
-    return w.HookEvents[checkEvt]
-}
-```
-
-### 2.4 分支过滤逻辑
-
-**代码位置**: `services/webhook/webhook.go:114-130`
-
-```go
-func checkBranchFilter(branchFilter string, ref git.RefName) bool {
-    // 空或通配符直接通过
-    if branchFilter == "" || branchFilter == "*" || branchFilter == "**" {
-        return true
-    }
-    // 编译 glob 模式
-    g, err := glob.Compile(branchFilter)
-    // 匹配分支名或完整 ref 名
-    if ref.IsBranch() && g.Match(ref.BranchName()) {
-        return true
-    }
-    return g.Match(ref.String())
-}
-```
-
-**适用事件类型**（通过 `getPayloadRef` 提取 ref）:
-- `HookEventPush` - 推送事件
-- `HookEventCreate` - 创建分支/标签
-- `HookEventDelete` - 删除分支/标签
-
----
-
-## 三、任务创建与入队
-
-### 3.1 HookTask 数据模型
-
-**代码位置**: `models/webhook/hooktask.go:44-65`
-
-```go
-type HookTask struct {
-    ID             int64                          `xorm:"pk autoincr"`
-    HookID         int64                          `xorm:"index"`
-    UUID           string                         `xorm:"unique"`
-    PayloadContent string                         `xorm:"LONGTEXT"`
-    PayloadVersion int                            `xorm:"DEFAULT 1"`  // v2: 原始事件
-    EventType      webhook_module.HookEventType
-    IsDelivered    bool                           // 关键状态字段
-    Delivered      timeutil.TimeStampNano
-    IsSucceed      bool                           // 投递结果
-    RequestContent string                         `xorm:"LONGTEXT"`
-    ResponseContent string                        `xorm:"LONGTEXT"`
-}
-```
-
-**状态字段说明**:
-- `IsDelivered`: 是否已被投递处理（**只要被 worker 取出处理就设为 true，无论成功失败**）
-- `IsSucceed`: 投递是否成功（HTTP 2xx 视为成功）
-
-### 3.2 任务创建
-
-**代码位置**: `models/webhook/hooktask.go:119-130`
-
-```go
-func CreateHookTask(ctx context.Context, t *HookTask) (*HookTask, error) {
-    t.UUID = gouuid.New().String()
-    if t.Delivered == 0 {
-        t.Delivered = timeutil.TimeStampNanoNow()
-    }
-    if t.PayloadVersion == 0 {
-        return nil, errors.New("missing HookTask.PayloadVersion")
-    }
-    return t, db.Insert(ctx, t)
-}
-```
-
-**新建任务初始状态**:
-- `IsDelivered = false` - 未被处理
-- `IsSucceed = false` - 未成功
-
-### 3.3 入队操作
-
-**代码位置**: `services/webhook/webhook.go:106-112`
-
-```go
-func enqueueHookTask(taskID int64) error {
-    err := hookQueue.Push(taskID)
-    if err != nil && err != queue.ErrAlreadyInQueue {
-        return err
-    }
-    return nil
-}
-```
-
-**队列特性**:
-- 使用 `CreateUniqueQueue` 创建唯一队列，相同 taskID 不会重复入队
-- `ErrAlreadyInQueue` 错误被静默忽略
-
----
-
-## 四、任务状态流转与失败处理（核心修正部分）
-
-### 4.1 队列初始化
-
-**代码位置**: `services/webhook/deliver.go:308-336`
-
-```go
-func Init() error {
-    // HTTP 客户端配置
-    timeout := time.Duration(setting.Webhook.DeliverTimeout) * time.Second
-    webhookHTTPClient = &http.Client{
-        Timeout: timeout,
-        Transport: &http.Transport{...},
-    }
-    
-    // 创建唯一队列（去重）
-    hookQueue = queue.CreateUniqueQueue(
-        graceful.GetManager().ShutdownContext(),
-        "webhook_sender",
-        handler,
-    )
-    go graceful.GetManager().RunWithCancel(hookQueue)
-    
-    // 系统启动时恢复未被处理过的任务
-    go graceful.GetManager().RunWithShutdownContext(
-        populateWebhookSendingQueue,
-    )
-    
-    return nil
-}
-```
-
-### 4.2 任务处理器（handler）
-
-**代码位置**: `services/webhook/webhook.go:77-104`
-
-```go
-func handler(items ...int64) []int64 {
-    ctx := graceful.GetManager().HammerContext()
-    
-    for _, taskID := range items {
-        task, err := webhook_model.GetHookTaskByID(ctx, taskID)
-        if err != nil {
-            continue
-        }
-        // 幂等检查: 已投递则跳过
-        if task.IsDelivered {
-            log.Trace("Task[%d] has already been delivered", task.ID)
-            continue
-        }
-        // 实际投递
-        if err := Deliver(ctx, task); err != nil {
-            log.Error("Unable to deliver webhook task[%d]: %v", task.ID, err)
-        }
-    }
-    
-    return nil  // 关键点: 总是返回 nil，所有任务都视为"已处理"
-}
-```
-
-⚠️ **关键发现 1**: handler 总是返回 `nil`，意味着：
-- 无论任务成功或失败，都不会返回给队列层
-- **队列的退避重试机制对 webhook 完全不生效**
-- 不会有任何自动重试
-
-### 4.3 Deliver 函数中的状态标记
+## Deliver 函数执行顺序与关键检查点
 
 **代码位置**: `services/webhook/deliver.go:148-272`
 
-```go
-func Deliver(ctx context.Context, t *webhook_model.HookTask) error {
-    w, err := webhook_model.GetWebhookByID(ctx, t.HookID)
-    
-    // ⚠️ 关键发现 2: 内存中先设为 true（第 165 行）
-    t.IsDelivered = true
-    
-    // ... 构建 HTTP 请求 ...
-    
-    t.ResponseInfo = &webhook_model.HookResponse{...}
-    
-    // ⚠️ 关键发现 3: 在发送 HTTP 请求之前，原子标记数据库（第 204 行）
-    updated, err := webhook_model.MarkTaskDelivered(ctx, t)
-    if !updated {
-        log.Trace("Webhook Task[%d] already delivered", t.ID)
-        return nil
-    }
-    
-    // defer 块: 更新任务状态和 webhook 最后状态
-    defer func() {
-        t.Delivered = timeutil.TimeStampNanoNow()
-        // 更新任务记录（包含 IsSucceed 状态）
-        if err := webhook_model.UpdateHookTask(ctx, t); err != nil {
-            log.Error("UpdateHookTask [%d]: %v", t.ID, err)
-        }
-        // 更新 webhook 最后状态
-        if t.IsSucceed {
-            w.LastStatus = webhook_module.HookStatusSucceed
-        } else {
-            w.LastStatus = webhook_module.HookStatusFail
-        }
-        webhook_model.UpdateWebhookLastStatus(ctx, w)
-    }()
-    
-    // 检查 webhook 是否激活
-    if !w.IsActive {
-        return nil  // IsSucceed 保持 false，但不算"失败"
-    }
-    
-    // 发送 HTTP 请求
-    resp, err := webhookHTTPClient.Do(req.WithContext(ctx))
-    if err != nil {
-        t.ResponseInfo.Body = fmt.Sprintf("Delivery: %v", err)
-        return err  // IsSucceed 保持 false
-    }
-    defer resp.Body.Close()
-    
-    // 判断成功（2xx 状态码）
-    t.IsSucceed = resp.StatusCode/100 == 2
-    t.ResponseInfo.Status = resp.StatusCode
-    
-    // 读取响应
-    p, err := util.ReadWithLimit(resp.Body, 1024*1024)
-    t.ResponseInfo.Body = string(p)
-    
-    return nil
-}
 ```
+Deliver() 执行流程（行号标注）
 
-⚠️ **关键发现 4**: `MarkTaskDelivered` 在 HTTP 请求发送**之前**执行！
+[150] w, err := GetWebhookByID(t.HookID)
+[152]   if err != nil { return err }                        ← 失败点 A
 
-```go
-// models/webhook/hooktask.go:188-195
-func MarkTaskDelivered(ctx context.Context, task *HookTask) (bool, error) {
-    count, err := db.GetEngine(ctx).ID(task.ID).
-        Where("is_delivered = ?", false).  // 只有 false 才更新
-        Cols("is_delivered").
-        Update(&HookTask{ID: task.ID, IsDelivered: true})  // 设为 true
-    return count != 0, err
-}
-```
+[165] t.IsDelivered = true                                  ← 内存标记（仅进程内）
 
-**状态流转结论**:
-- 只要任务被 worker 取出并进入 `Deliver` 函数，`is_delivered` 就会被设为 `true`
-- 这个标记发生在网络请求发送之前
-- **无论投递成功还是失败，is_delivered 永远是 true**
+[167] newRequest := webhookRequesters[w.Type]
+[172] req, body, err := newRequest(ctx, w, t)
+[173]   if err != nil { return fmt.Errorf("cannot create") } ← 失败点 B
 
-### 4.4 启动时任务恢复
+[178] t.RequestInfo = &HookRequest{...}
 
-**代码位置**: `services/webhook/deliver.go:338-366`
+[189] authorization, err := w.HeaderAuthorization()
+[190]   if err != nil { return fmt.Errorf("cannot get Auth") } ← 失败点 C
 
-```go
-func populateWebhookSendingQueue(ctx context.Context) {
-    lowerID := int64(0)
-    for {
-        // ⚠️ 关键发现 5: 只查询 is_delivered=false 的任务
-        taskIDs, err := webhook_model.FindUndeliveredHookTaskIDs(ctx, lowerID)
-        if err != nil {
-            return
-        }
-        if len(taskIDs) == 0 {
-            return
-        }
-        lowerID = taskIDs[len(taskIDs)-1]
-        
-        for _, taskID := range taskIDs {
-            if err := enqueueHookTask(taskID); err != nil {
-                log.Error("Unable to push HookTask[%d] to queue: %v", taskID, err)
-            }
-        }
-    }
-}
+[198] t.ResponseInfo = &HookResponse{...}
 
-// models/webhook/hooktask.go:173-186
-func FindUndeliveredHookTaskIDs(ctx context.Context, lowerID int64) ([]int64, error) {
-    return tasks, db.GetEngine(ctx).
-        Select("id").
-        Table(new(HookTask)).
-        Where("is_delivered=?", false).  // 只查未投递的
-        And("id > ?", lowerID).
-        Asc("id").
-        Limit(batchSize).
-        Find(&tasks)
-}
-```
+════════════════════════════════════════════════════════════
+                    MarkTaskDelivered 边界
+════════════════════════════════════════════════════════════
 
-⚠️ **关键发现 6**: `populateWebhookSendingQueue` 的真实作用
-- 不是恢复"失败任务"，而是恢复**从未被处理过的任务**
-- 场景：系统崩溃时，有些任务已创建但未被 worker 取走（is_delivered=false）
-- 失败任务的 is_delivered=true，不会被这个函数处理
+[204] updated, err := MarkTaskDelivered(ctx, t)             ← 原子写 DB
+[206]   if err != nil { return fmt.Errorf("unable to mark") } ← 失败点 D
+[209]   if !updated { return nil }                           ← 幂等短路
 
-### 4.5 队列层的退避机制（与 webhook 无关）
+[216] defer func() {                                         ← 注册最终落库
+[217]   t.Delivered = timeutil.TimeStampNanoNow()
+[226]   UpdateHookTask(ctx, t)                              ← 全量写回
+[231-235] UpdateWebhookLastStatus(ctx, w)                   ← 更新状态
+[240] }()
 
-**代码位置**: `modules/queue/workergroup.go:103-125`
+[242] if setting.DisableWebhooks { return fmt.Errorf("...") }  ← 失败点 E
 
-```go
-func (q *WorkerPoolQueue[T]) doWorkerHandle(batch []T) {
-    unhandled := q.safeHandler(batch...)
-    
-    // 全部失败时退避重试
-    if len(unhandled) == len(batch) && unhandledItemRequeueDuration.Load() != 0 {
-        log.Error("Queue %q failed to handle batch, backoff", q.GetName())
-        select {
-        case <-q.ctxRun.Done():
-        case <-time.After(time.Duration(unhandledItemRequeueDuration.Load())):
-        }
-    }
-    
-    // 未处理项重新入队
-    for _, item := range unhandled {
-        if err := q.Push(item); err != nil {
-            log.Error("Failed to requeue item: %v", err)
-        }
-    }
-}
-```
+[246] if !w.IsActive { return nil }                         ← 失败点 F
 
-⚠️ **关键发现 7**: 这个退避机制对 webhook **不生效**
-- webhook 的 handler 总是返回 `nil`（`unhandled` 为空）
-- 所以退避条件 `len(unhandled) == len(batch)` 永远为 false
-- webhook 投递失败不会触发任何队列层的重试
+[251] resp, err := webhookHTTPClient.Do(req)
+[252]   if err != nil {                                     ← 失败点 G
+[253]     t.ResponseInfo.Body = fmt.Sprintf("Delivery: %v", err)
+[254]     return fmt.Errorf("unable to deliver")
+[255]   }
 
-### 4.6 手动重放机制（唯一的"重试"方式）
-
-**代码位置**: `routers/web/repo/setting/webhook.go:721-740`
-
-```go
-// ReplayWebhook replays a webhook
-func ReplayWebhook(ctx *context.Context) {
-    hookTaskUUID := ctx.PathParam("uuid")
-    
-    orCtx, w := checkWebhook(ctx)
-    if ctx.Written() {
-        return
-    }
-    
-    // 调用重放服务
-    if err := webhook_service.ReplayHookTask(ctx, w, hookTaskUUID); err != nil {
-        ctx.ServerError("ReplayHookTask", err)
-        return
-    }
-    
-    ctx.Flash.Success(ctx.Tr("repo.settings.webhook.delivery.success"))
-    ctx.Redirect(fmt.Sprintf("%s/%d", orCtx.Link, w.ID))
-}
-```
-
-**重放实现**:
-
-```go
-// models/webhook/hooktask.go:153-171
-func ReplayHookTask(ctx context.Context, hookID int64, uuid string) (*HookTask, error) {
-    task, exist, err := db.Get[HookTask](ctx, builder.Eq{"hook_id": hookID, "uuid": uuid})
-    if !exist {
-        return nil, ErrHookTaskNotExist{...}
-    }
-    
-    // ⚠️ 关键: 创建一个全新任务，而不是修改旧的
-    return CreateHookTask(ctx, &HookTask{
-        HookID:         task.HookID,
-        PayloadContent: task.PayloadContent,
-        EventType:      task.EventType,
-        PayloadVersion: task.PayloadVersion,
-    })
-}
-```
-
-**重放机制说明**:
-- **触发方式**: 用户在 Web UI 点击"重放"按钮
-- **实现原理**: 基于旧任务的 payload 创建一个**全新的 HookTask**
-- **新任务状态**: `is_delivered=false`, `is_succeed=false`
-- **旧任务状态**: 保持不变（历史记录）
-
----
-
-## 五、投递执行阶段
-
-### 5.1 请求签名与 Headers
-
-**代码位置**: `services/webhook/deliver.go:97-146`
-
-```go
-func addDefaultHeaders(req *http.Request, secret []byte, 
-    w *webhook_model.Webhook, t *webhook_model.HookTask, 
-    payloadContent []byte) error {
-    
-    // HMAC 签名（SHA1 和 SHA256）
-    if len(secret) > 0 {
-        sig1 := hmac.New(sha1.New, secret)
-        sig256 := hmac.New(sha256.New, secret)
-        io.MultiWriter(sig1, sig256).Write(payloadContent)
-        signatureSHA1 = hex.EncodeToString(sig1.Sum(nil))
-        signatureSHA256 = hex.EncodeToString(sig256.Sum(nil))
-    }
-    
-    // 标准 Headers（兼容 Gitea/Gogs/GitHub）
-    req.Header.Add("X-Gitea-Delivery", t.UUID)
-    req.Header.Add("X-Gitea-Event", event)
-    req.Header.Add("X-Gitea-Signature", signatureSHA256)
-    req.Header.Add("X-Hub-Signature", "sha1="+signatureSHA1)
-    req.Header.Add("X-Hub-Signature-256", "sha256="+signatureSHA256)
-    return nil
-}
+[259] t.IsSucceed = resp.StatusCode/100 == 2
+[265] p, err := util.ReadWithLimit(resp.Body, ...)
+[266]   if err != nil {                                     ← 失败点 H
+[267]     t.ResponseInfo.Body = fmt.Sprintf("read body: %s", err)
+[268]     return fmt.Errorf("unable to read response")
+[269]   }
+[270] t.ResponseInfo.Body = string(p)
+[271] return nil                                            ← 成功
 ```
 
 ---
 
-## 六、完整状态流转图（修正版）
+## 一、MarkTaskDelivered 之前的失败场景
 
+此阶段特征：`MarkTaskDelivered` 尚未执行或执行失败，数据库 `is_delivered` 仍为 `false`。defer 块未注册，不会有 `UpdateHookTask` 调用。
+
+### 场景 A：GetWebhookByID 失败
+
+| 项目 | 值 |
+|------|----|
+| **触发条件** | webhook 配置被删除，或数据库故障 |
+| **代码位置** | `deliver.go:151-154` |
+| **内存 t.IsDelivered** | `false`（此行在 L165 之前，未执行到） |
+| **DB is_delivered** | `false` |
+| **DB is_succeed** | `false` |
+| **RequestInfo** | `nil`，未落库 |
+| **ResponseInfo** | `nil`，未落库 |
+| **defer 是否注册** | 否 |
+| **handler 对 error 的处理** | 仅 log.Error，返回 nil |
+| **恢复入口** | ✅ **系统重启时 `populateWebhookSendingQueue` 重新入队** |
+| **恢复前提** | webhook 记录需已恢复，否则同错循环 |
+| **实际可恢复性** | 低 — 若 webhook 已被删除，每次重启都会重试并失败 |
+
+### 场景 B：请求构建失败（newRequest 返回 error）
+
+| 项目 | 值 |
+|------|----|
+| **触发条件** | URL 格式无效、Content-Type 不合法、HTTP Method 不支持、Matrix txnID 计算失败 |
+| **代码位置** | `deliver.go:172-175` |
+| **内存 t.IsDelivered** | `true`（L165 已执行，但仅内存） |
+| **DB is_delivered** | `false`（MarkTaskDelivered 未执行） |
+| **DB is_succeed** | `false` |
+| **RequestInfo** | `nil`（L178 未执行到），未落库 |
+| **ResponseInfo** | `nil`，未落库 |
+| **defer 是否注册** | 否 |
+| **handler 对 error 的处理** | 仅 log.Error，返回 nil |
+| **恢复入口** | ✅ **系统重启时 `populateWebhookSendingQueue` 重新入队** |
+| **恢复前提** | 请求构建的根因已修复（如 URL 格式修正） |
+| **实际可恢复性** | 中 — URL 格式错误属持久性问题，重启后仍会失败；Matrix txnID 等瞬时错误可恢复 |
+
+**newRequest 可能失败的具体子因**:
+
+| 子因 | 来源函数 | 持久性 |
+|------|----------|--------|
+| URL 解析失败 | `url.Parse(w.URL)` | 持久 |
+| http.NewRequest 失败 | Go 标准库 | 持久（非法 URL） |
+| Content-Type 无效 | `newDefaultRequest:60` | 持久 |
+| HTTP Method 不支持 | `newDefaultRequest:87,90` | 持久 |
+| Matrix txnID 计算失败 | `getMatrixTxnID` | 瞬时（payload 编码） |
+
+### 场景 C：授权头解析失败（HeaderAuthorization 返回 error）
+
+| 项目 | 值 |
+|------|----|
+| **触发条件** | `secret.DecryptSecret` 解密失败（SECRET_KEY 变更、密文损坏） |
+| **代码位置** | `deliver.go:189-191` |
+| **内存 t.IsDelivered** | `true`（仅内存） |
+| **DB is_delivered** | `false` |
+| **DB is_succeed** | `false` |
+| **RequestInfo** | 已在内存赋值（L178-186），但 **未落库**（defer 未注册） |
+| **ResponseInfo** | `nil` |
+| **defer 是否注册** | 否 |
+| **handler 对 error 的处理** | 仅 log.Error，返回 nil |
+| **恢复入口** | ✅ **系统重启时 `populateWebhookSendingQueue` 重新入队** |
+| **恢复前提** | SECRET_KEY 已恢复或 Authorization 头已重设 |
+| **实际可恢复性** | 低 — SECRET_KEY 变更后所有加密字段均不可逆，需手动重设 |
+
+**HeaderAuthorization 失败的具体原因**:
+
+```go
+// models/webhook/webhook.go:211-216
+func (w Webhook) HeaderAuthorization() (string, error) {
+    if w.HeaderAuthorizationEncrypted == "" {
+        return "", nil    // 空 → 直接返回，不会失败
+    }
+    return secret.DecryptSecret(setting.SecretKey, w.HeaderAuthorizationEncrypted)
+    // 失败条件: setting.SecretKey 与加密时不同，或密文被篡改
+}
 ```
-任务创建 → HookTask{is_delivered: false, is_succeed: false}
-    ↓
-入队 → hookQueue.Push(taskID)
-    ↓
-队列 worker 取出
-    ↓
-handler() 调用 Deliver()
-    ├─ 内存中设置 is_delivered=true
-    └─ MarkTaskDelivered() 原子更新数据库
-            ↓
-            │ [is_delivered 现在一定是 true 了]
-            ↓
-发送 HTTP 请求
-    ├─ 成功 (2xx) → is_succeed=true
-    └─ 失败 (非2xx/网络错误) → is_succeed=false
-            ↓
-defer 块更新数据库状态
-    ↓
-最终状态: is_delivered=true, is_succeed=?
 
+### 场景 D：MarkTaskDelivered 自身数据库操作失败
 
-失败后的可能性:
-├─ 队列层: 不会自动重试（handler 返回 nil）
-├─ 系统重启: 不会恢复（is_delivered=true）
-└─ 手动重放: 用户点击 → 创建新任务（全新的生命周期）
-```
+| 项目 | 值 |
+|------|----|
+| **触发条件** | 数据库连接中断、事务冲突等 |
+| **代码位置** | `deliver.go:204-208` |
+| **内存 t.IsDelivered** | `true`（仅内存） |
+| **DB is_delivered** | `false`（UPDATE 失败，行未变更） |
+| **DB is_succeed** | `false` |
+| **RequestInfo** | 已在内存赋值，但 **未落库** |
+| **ResponseInfo** | 已在内存赋值，但 **未落库** |
+| **defer 是否注册** | 否（L216 在此之后） |
+| **handler 对 error 的处理** | 仅 log.Error，返回 nil |
+| **恢复入口** | ✅ **系统重启时 `populateWebhookSendingQueue` 重新入队** |
+| **实际可恢复性** | 高 — 数据库临时故障恢复后即可成功 |
 
 ---
 
-## 七、关键设计决策与真相
+## 二、MarkTaskDelivered 之后的失败场景
 
-### 7.1 无自动重试设计
+此阶段特征：`MarkTaskDelivered` 已成功（`is_delivered=true` 已写入 DB），defer 块已注册。无论后续发生什么，defer 都会执行 `UpdateHookTask` 全量写回和 `UpdateWebhookLastStatus` 状态更新。
 
-**代码事实**:
-- `handler` 总是返回 `nil` → 队列层不重试
-- `is_delivered` 在发送前就标记为 true → 重启也不会恢复
-- 失败任务只能通过手动重放来"重试"
+### 场景 E：全局 Webhook 被禁用（DisableWebhooks = true）
 
-**设计意图推测**:
-1. Webhook 投递失败通常是目标服务问题，立即重试成功率极低
-2. 避免因大量失败请求耗尽系统资源（连接、内存、CPU）
-3. 失败保留在数据库中，管理员可查看并决定是否手动重发
-4. 手动重放创建新任务，便于追踪每次投递历史
+| 项目 | 值 |
+|------|----|
+| **触发条件** | `setting.DisableWebhooks = true` |
+| **代码位置** | `deliver.go:242-244` |
+| **内存 t.IsDelivered** | `true` |
+| **DB is_delivered** | `true`（MarkTaskDelivered 已写入） |
+| **DB is_succeed** | `false`（从未设为 true） |
+| **RequestInfo** | 已在内存赋值 → **defer 会落库** |
+| **ResponseInfo** | 已在内存赋值 → **defer 会落库**（空 Body） |
+| **defer 是否注册** | ✅ 是，会执行 |
+| **Deliver 返回值** | `fmt.Errorf("webhook task skipped (webhooks disabled)")` |
+| **handler 对 error 的处理** | log.Error，返回 nil |
+| **w.LastStatus** | `HookStatusFail`（defer 中 is_succeed=false 分支） |
+| **恢复入口** | ❌ 无自动恢复（is_delivered=true） |
+| **手动重放** | ✅ 用户在 UI 点击"重放"创建新任务 |
+| **注意** | 即使重新启用 Webhooks，此任务也不会被重试 |
 
-### 7.2 提前标记 is_delivered
+### 场景 F：Webhook 未激活（IsActive = false）
 
-**代码事实**: `MarkTaskDelivered` 在 HTTP 请求发送之前执行
+| 项目 | 值 |
+|------|----|
+| **触发条件** | webhook 被用户禁用 |
+| **代码位置** | `deliver.go:246-249` |
+| **内存 t.IsDelivered** | `true` |
+| **DB is_delivered** | `true` |
+| **DB is_succeed** | `false` |
+| **RequestInfo** | 已落库 |
+| **ResponseInfo** | 已落库（空 Body） |
+| **defer 是否注册** | ✅ 是，会执行 |
+| **Deliver 返回值** | `nil`（不是 error！） |
+| **handler 对 error 的处理** | 无 error，正常结束 |
+| **w.LastStatus** | `HookStatusFail`（defer 中 is_succeed=false 分支） |
+| **恢复入口** | ❌ 无自动恢复 |
+| **手动重放** | ✅ 用户在 UI 点击"重放"创建新任务 |
+| **特殊之处** | 返回 `nil` 而非 error，handler 不记录任何错误日志；defer 中日志为 "Hook delivery skipped as webhook is inactive" |
 
-**设计意图**:
-1. **幂等性保障**: 避免并发场景下重复投递
-2. **防止雪崩**: 系统重启后不会重复处理已经在投递中的任务
-3. **代价**: 任务处理过程中崩溃会导致该任务"丢失"（is_delivered=true 但实际未完成）
+### 场景 G：HTTP 请求失败（网络错误 / 超时 / DNS 解析失败）
 
-### 7.3 唯一队列去重
+| 项目 | 值 |
+|------|----|
+| **触发条件** | 目标服务器不可达、超时、TLS 错误、代理失败、主机白名单拒绝 |
+| **代码位置** | `deliver.go:251-255` |
+| **内存 t.IsDelivered** | `true` |
+| **DB is_delivered** | `true` |
+| **DB is_succeed** | `false`（从未设为 true） |
+| **RequestInfo** | 已落库（包含完整请求头和 Body） |
+| **ResponseInfo.Body** | `"Delivery: <error message>"` → **defer 会落库** |
+| **ResponseInfo.Status** | `0`（未赋值，无 HTTP 响应） |
+| **defer 是否注册** | ✅ 是，会执行 |
+| **Deliver 返回值** | `fmt.Errorf("unable to deliver webhook task[%d]...")` |
+| **handler 对 error 的处理** | log.Error，返回 nil |
+| **w.LastStatus** | `HookStatusFail` |
+| **恢复入口** | ❌ 无自动恢复 |
+| **手动重放** | ✅ 用户在 UI 点击"重放"创建新任务 |
 
-**效果**: 相同 `taskID` 重复入队时返回 `ErrAlreadyInQueue` 并被静默忽略。
+**HTTP 失败的具体子因**:
 
-**适用场景**:
-- 系统重启时 `populateWebhookSendingQueue` 可能重复入队
-- 手动重放功能不会触发（创建的是新任务，ID 不同）
-
-### 7.4 Payload 版本设计
-
-- **Version 1**: 存储发送给 URL 的最终 JSON（已按 webhook 类型转换）
-- **Version 2**: 存储原始事件数据，投递时按 webhook 类型动态转换
-
-**优势**: Version 2 支持重新投递时升级转换逻辑。
-
----
-
-## 八、常见误解澄清表
-
-| 误解 | 代码事实 | 证据位置 |
+| 子因 | 错误来源 | 可恢复性 |
 |------|----------|----------|
-| 失败任务会自动重试 | handler 返回 nil，不会触发队列重试 | `services/webhook/webhook.go:103` |
-| 系统重启会恢复失败任务 | 只恢复 is_delivered=false 的任务，失败任务 is_delivered=true | `models/webhook/hooktask.go:181` |
-| is_delivered 表示"投递成功" | is_delivered 表示"已被处理"，无论成功失败 | `services/webhook/deliver.go:165,204` |
-| 队列退避用于 webhook 失败 | webhook handler 总是返回 nil，退避逻辑不触发 | `modules/queue/workergroup.go:103` |
-| 重放是重试旧任务 | 重放创建全新的 HookTask，旧任务保持不变 | `models/webhook/hooktask.go:165-170` |
-| is_succeed=false 会被重试 | is_succeed 仅用于展示，不影响重试逻辑 | 全代码搜索无相关逻辑 |
+| 目标服务器宕机 | `net/http: connection refused` | 瞬时 |
+| 请求超时 | `context deadline exceeded` | 瞬时 |
+| DNS 解析失败 | `lookup: no such host` | 持久或瞬时 |
+| TLS 证书错误 | `certificate verify failed`（SkipTLSVerify=false） | 持久 |
+| 主机白名单拒绝 | `webhook can only call allowed HTTP servers` | 持久 |
+| 代理错误 | proxy 配置错误 | 持久 |
+
+### 场景 H：HTTP 响应读取失败
+
+| 项目 | 值 |
+|------|----|
+| **触发条件** | 响应 Body 超过 1MB 限制、连接中断 |
+| **代码位置** | `deliver.go:265-269` |
+| **内存 t.IsDelivered** | `true` |
+| **DB is_delivered** | `true` |
+| **DB is_succeed** | `false` |
+| **RequestInfo** | 已落库 |
+| **ResponseInfo.Body** | `"read body: <error>"` → 落库 |
+| **ResponseInfo.Status** | HTTP 状态码已赋值 → 落库 |
+| **defer 是否注册** | ✅ 是 |
+| **Deliver 返回值** | `fmt.Errorf("unable to deliver...unable to read response body")` |
+| **w.LastStatus** | `HookStatusFail` |
+| **恢复入口** | ❌ 无自动恢复 |
+| **手动重放** | ✅ |
+| **注意** | 请求实际已到达目标服务器，目标可能已处理（非幂等接口有重复风险） |
 
 ---
 
-## 九、代码溯源索引
+## 三、综合状态对比表
 
-| 功能模块 | 文件路径 | 关键行号 |
-|----------|----------|----------|
-| Notifier 注册 | `services/webhook/notifier.go` | 32-45 |
-| Push 事件处理 | `services/webhook/notifier.go` | 646-668 |
-| Webhook 收集 | `services/webhook/webhook.go` | 179-227 |
-| 单 Webhook 过滤 | `services/webhook/webhook.go` | 135-177 |
-| 事件类型匹配 | `models/webhook/webhook.go` | 171-184 |
-| 分支过滤 | `services/webhook/webhook.go` | 114-130 |
-| HookTask 创建 | `models/webhook/hooktask.go` | 119-130 |
-| 队列初始化 | `services/webhook/deliver.go` | 308-336 |
-| 任务处理器 handler | `services/webhook/webhook.go` | 77-104 |
-| 投递主函数 | `services/webhook/deliver.go` | 148-272 |
-| 提前标记 is_delivered | `services/webhook/deliver.go` | 165,204 |
-| 原子标记投递 | `models/webhook/hooktask.go` | 188-195 |
-| 启动恢复任务 | `services/webhook/deliver.go` | 338-366 |
+### 3.1 MarkTaskDelivered 之前 vs 之后
+
+| 维度 | 之前（A/B/C/D） | 之后（E/F/G/H） |
+|------|-----------------|-----------------|
+| **DB is_delivered** | `false` | `true` |
+| **defer UpdateHookTask** | 未注册，不执行 | 已注册，必执行 |
+| **RequestInfo 落库** | ❌ 不会 | ✅ 会 |
+| **ResponseInfo 落库** | ❌ 不会 | ✅ 会 |
+| **w.LastStatus 更新** | ❌ 不更新 | ✅ 更新为 Fail |
+| **重启可恢复** | ✅ `populateWebhookSendingQueue` 重新入队 | ❌ is_delivered=true 被跳过 |
+| **手动重放** | ✅ 也可，但重启已能自动恢复 | ✅ **唯一的恢复手段** |
+| **UI 可见性** | 不出现在"最近投递"列表 | 出现在"最近投递"列表，标红失败 |
+
+### 3.2 四种指定场景完整对照
+
+| 场景 | 失败点 | 代码行 | DB is_delivered | DB is_succeed | Request 落库 | Response 落库 | LastStatus | 重启恢复 | 手动重放 |
+|------|--------|--------|-----------------|---------------|-------------|--------------|------------|----------|----------|
+| **请求构建失败** | B | `deliver.go:172` | `false` | `false` | ❌ | ❌ | 不更新 | ✅ | ✅ |
+| **授权头解析失败** | C | `deliver.go:189` | `false` | `false` | ❌（内存有值但不落库） | ❌ | 不更新 | ✅ | ✅ |
+| **未激活返回** | F | `deliver.go:246` | `true` | `false` | ✅ | ✅（空） | `Fail` | ❌ | ✅ |
+| **HTTP 失败** | G | `deliver.go:251` | `true` | `false` | ✅ | ✅（含错误信息） | `Fail` | ❌ | ✅ |
+
+### 3.3 所有失败点完整对照
+
+| 失败点 | 触发条件 | 行号 | 相对边界 | DB is_delivered | defer 注册 | 重启恢复 | 手动重放 |
+|--------|----------|------|----------|-----------------|-----------|----------|----------|
+| A | GetWebhookByID 失败 | 152 | **之前** | `false` | ❌ | ✅ | ✅ |
+| B | 请求构建失败 | 174 | **之前** | `false` | ❌ | ✅ | ✅ |
+| C | 授权头解析失败 | 191 | **之前** | `false` | ❌ | ✅ | ✅ |
+| D | MarkTaskDelivered DB 错误 | 207 | **边界上** | `false` | ❌ | ✅ | ✅ |
+| E | DisableWebhooks | 243 | **之后** | `true` | ✅ | ❌ | ✅ |
+| F | Webhook 未激活 | 248 | **之后** | `true` | ✅ | ❌ | ✅ |
+| G | HTTP 请求失败 | 254 | **之后** | `true` | ✅ | ❌ | ✅ |
+| H | 响应读取失败 | 268 | **之后** | `true` | ✅ | ❌ | ✅ |
+
+---
+
+## 四、恢复路径详解
+
+### 4.1 重启恢复（仅限 is_delivered=false）
+
+**触发**: Gitea 进程启动时
+
+```
+Init()
+  └─ populateWebhookSendingQueue()
+       └─ FindUndeliveredHookTaskIDs(ctx, lowerID)
+            └─ WHERE is_delivered = false   ← 只查未投递的
+                 └─ enqueueHookTask(taskID)
+                      └─ hookQueue.Push(taskID)
+                           └─ handler() → Deliver() 重新执行
+```
+
+**适用场景**: A / B / C / D
+
+**限制**:
+- 仅在启动时执行一次
+- 若根因未修复，任务会在下次重启时再次失败，形成 **重启循环**
+- 场景 A（webhook 已删除）属于永久性循环
+- 场景 C（SECRET_KEY 变更）属于永久性循环
+
+### 4.2 手动重放（唯一通用恢复方式）
+
+**触发**: 用户在 Web UI 点击"重放"按钮
+
+```
+ReplayWebhook(ctx)
+  └─ ReplayHookTask(ctx, hookID, uuid)
+       └─ CreateHookTask(ctx, &HookTask{...})   ← 创建全新任务
+            └─ enqueueHookTask(newTask.ID)       ← 新 ID 入队
+```
+
+**适用场景**: 所有（A/B/C/D/E/F/G/H）
+
+**特点**:
+- 创建全新 HookTask（新 ID、新 UUID）
+- 新任务 `is_delivered=false`
+- 旧任务记录保持不变
+- 需用户主动操作
+
+### 4.3 队列退避（对 webhook 不生效）
+
+```
+handler() 总是返回 nil → unhandled 为空 → 退避条件不满足 → 不触发
+```
+
+**结论**: 队列退避机制与 webhook 投递完全无关。
+
+---
+
+## 五、场景 F 的特殊语义
+
+场景 F（`!w.IsActive`）是 MarkTaskDelivered 之后**唯一返回 `nil` 而非 error 的失败路径**。这带来几个特殊后果：
+
+| 对比维度 | 场景 F（未激活） | 其他之后场景（E/G/H） |
+|----------|-----------------|---------------------|
+| Deliver 返回值 | `nil` | `error` |
+| handler 日志级别 | 无 error 日志 | `log.Error` |
+| defer 日志内容 | "Hook delivery skipped as webhook is inactive" | "Hook delivery failed" |
+| 实际意义 | 用户主动禁用，不算异常 | 属于投递异常 |
+
+**关键点**: 虽然 Deliver 返回 `nil`，但 `is_succeed=false`，`w.LastStatus=HookStatusFail`。这意味着：
+- 禁用 webhook 期间的所有事件都会被标记为失败
+- 重新激活后，`LastStatus` 仍为 `Fail`，直到下次成功投递才更新
+- UI 上"最近投递"列表中会出现大量红色记录
+
+---
+
+## 六、代码溯源索引
+
+| 代码位置 | 文件路径 | 行号 |
+|----------|----------|------|
+| GetWebhookByID | `services/webhook/deliver.go` | 151 |
+| 内存 t.IsDelivered=true | `services/webhook/deliver.go` | 165 |
+| 请求构建 newRequest | `services/webhook/deliver.go` | 172 |
+| 授权头解析 HeaderAuthorization | `services/webhook/deliver.go` | 189 |
+| 解密实现 DecryptSecret | `models/webhook/webhook.go` | 211-216 |
+| MarkTaskDelivered（边界） | `services/webhook/deliver.go` | 204 |
+| MarkTaskDelivered DB 实现 | `models/webhook/hooktask.go` | 188-195 |
+| defer 注册（落库） | `services/webhook/deliver.go` | 216-240 |
+| DisableWebhooks 检查 | `services/webhook/deliver.go` | 242 |
+| IsActive 检查 | `services/webhook/deliver.go` | 246 |
+| HTTP 请求发送 | `services/webhook/deliver.go` | 251 |
+| 响应读取 | `services/webhook/deliver.go` | 265 |
+| handler 处理器 | `services/webhook/webhook.go` | 77-104 |
+| 重启恢复 populateWebhookSendingQueue | `services/webhook/deliver.go` | 338-366 |
 | 查询未投递任务 | `models/webhook/hooktask.go` | 173-186 |
-| 队列退避机制 | `modules/queue/workergroup.go` | 103-125 |
-| 手动重放路由 | `routers/web/repo/setting/webhook.go` | 721-740 |
-| 重放实现 | `models/webhook/hooktask.go` | 153-171 |
+| 手动重放 ReplayHookTask | `models/webhook/hooktask.go` | 153-171 |
+| UpdateHookTask 全量写回 | `models/webhook/hooktask.go` | 148-151 |
+| BeforeUpdate 序列化 | `models/webhook/hooktask.go` | 73-80 |

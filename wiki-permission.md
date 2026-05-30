@@ -85,7 +85,7 @@ func findWikiRepoCommit(ctx *context.Context) (*git.Repository, *git.Commit, err
 
 ### 2.4 分支变更入口
 
-通过 `ChangeDefaultWikiBranch` (`services/wiki/wiki.go:382-410`) 修改，操作原子性由数据库事务保证：
+通过 `ChangeDefaultWikiBranch` (`services/wiki/wiki.go:382-410`) 修改。**注意：数据库事务只能回滚数据库操作，无法回滚 Git 操作！**
 
 ```go
 func ChangeDefaultWikiBranch(ctx context.Context, repo *repo_model.Repository, newBranch string) error {
@@ -93,6 +93,7 @@ func ChangeDefaultWikiBranch(ctx context.Context, repo *repo_model.Repository, n
         return fmt.Errorf("invalid branch name: %s", newBranch)
     }
     return db.WithTx(ctx, func(ctx context.Context) error {
+        // 步骤1: 先更新数据库
         repo.DefaultWikiBranch = newBranch
         if err := repo_model.UpdateRepositoryColsNoAutoTime(ctx, repo, "default_wiki_branch"); err != nil {
             return fmt.Errorf("unable to update database: %w", err)
@@ -103,6 +104,7 @@ func ChangeDefaultWikiBranch(ctx context.Context, repo *repo_model.Repository, n
         oldDefBranch, err := gitrepo.GetDefaultBranch(ctx, repo.WikiStorageRepo())
         if err != nil { return fmt.Errorf("unable to get default branch: %w", err) }
         if oldDefBranch == newBranch { return nil }
+        // 步骤2: 再重命名 Git 分支（这一步不在数据库事务范围内！）
         err = gitrepo.RenameBranch(ctx, repo.WikiStorageRepo(), oldDefBranch, newBranch)
         if err != nil { return fmt.Errorf("unable to rename default branch: %w", err) }
         return nil
@@ -110,7 +112,26 @@ func ChangeDefaultWikiBranch(ctx context.Context, repo *repo_model.Repository, n
 }
 ```
 
-此函数同时：1) 更新数据库字段；2) 在 Git 仓库中重命名分支。两者在同一事务中完成。
+### 2.5 事务边界与失败场景分析
+
+**关键问题**：`db.WithTx` 只能保证数据库操作的原子性，**Git 分支重命名不在数据库事务范围内**。这意味着：
+
+1. **数据库更新成功 + Git 重命名失败** → **数据库状态与 Git 仓库状态不一致**
+   - 数据库：`default_wiki_branch = newBranch`（已提交，无法回滚）
+   - Git：分支仍为 `oldDefBranch`
+   - **Web 端影响**：用户下一次访问 Wiki 时，`findWikiRepoCommit` 检测到分支不存在，自动从 Git 仓库读取真实默认分支并**反向修正数据库**，最终恢复一致
+   - **API 端影响**：由于 API 没有自动同步机制，所有 Wiki API 返回 404，直到 Web 端触发一次修正或管理员手动重新设置分支
+
+2. **Git 重命名成功但事务后续失败** → 理论上不可能，因为 Git 重命名是函数的最后一步
+
+**恢复机制**（仅 Web 端）：`findWikiRepoCommit` 的自动分支同步是一个意外的"自愈"机制，能够修复数据库与 Git 状态不一致的问题。这也解释了为什么 Web 端和 API 端在分支同步行为上的差异是有意设计的（Web 面向普通用户需要更高容错性，API 面向集成需要确定性）。
+
+**Web 端 vs API 端在分支不一致时的表现对比**：
+| 场景 | Web 端行为 | API 端行为 |
+|-----|-----------|-----------|
+| 数据库分支不存在于 Git | 自动从 Git 读取真实分支并回写数据库，重试成功 | 返回 404 错误 |
+| 自动恢复 | ✅ 一次访问即可恢复 | ❌ 永久失败直到手动干预 |
+| 状态最终一致性 | 最终一致 | 需要外部干预 |
 
 ## 3. 页面写入流程（存储机制）
 
@@ -359,42 +380,98 @@ func WebPathFromRequest(s string) WebPath {
 > - This problem should have been 99% fixed, but it needs more tests.
 > - The old wiki code's behavior is always using %2F, instead of subdirectory, so there are a lot of legacy "%2F" files in user wikis.
 
-### 6.3 对页面定位的影响
+### 6.3 `findEntryForFile` 的 QueryUnescape 回退机制
 
-当 Wiki 页面名包含 `/` 或 `%2F` 时：
-
-1. **请求阶段**：URL `/wiki/some/path` 被 Web 框架拆分为路径段，`ctx.PathParamRaw("*")` 得到 `some/path`
-2. **规范化**：`WebPathFromRequest` 将其转为 `some%2Fpath`，确保路径不被子目录化
-3. **Git 查找**：`WebPathToGitPath` 将 `some%2Fpath` 转为 Git 文件名 `some%2Fpath.md`
-4. **实际文件**：Git 仓库中文件名为 `some%2Fpath.md`，而非 `some/path.md`
-
-**潜在问题**：如果用户通过 Git 命令行直接创建了包含真实 `/` 的 Wiki 文件（如 `some/path.md`），Gitea 的路径转换机制无法定位到该文件，因为 `WebPathFromRequest` 会把 `/` 转为 `%2F`。
-
-### 6.4 对历史查询的影响
-
-历史查询依赖 `GitPath` 定位文件 (`routers/web/repo/wiki.go:310`, `routers/api/v1/repo/wiki.go:438-443`)：
+`findEntryForFile` (`routers/web/repo/wiki.go:81-96` 和 `routers/api/v1/repo/wiki.go:455-470`) 提供了**双重路径查找**机制：
 
 ```go
-// Web 端
-commitsCount, _ := gitrepo.FileCommitsCount(ctx, ctx.Repo.Repository.WikiStorageRepo(),
-    ctx.Repo.Repository.DefaultWikiBranch, pageFilename)
-
-// API 端
-commitsHistory, err := wikiGitRepo.CommitsByFileAndRange(
-    git.CommitsByFileAndRangeOptions{
-        Revision: ctx.Repo.Repository.DefaultWikiBranch,
-        File:     pageFilename,   // ← 这个值来自 WebPathToGitPath 的转换结果
-        Page:     page,
-    })
+func findEntryForFile(commit *git.Commit, target string) (*git.TreeEntry, error) {
+    // 第一遍查找：使用原始路径（含 %2F 编码）
+    entry, err := commit.GetTreeEntryByPath(target)
+    if entry != nil {
+        return entry, nil
+    }
+    // 第二遍查找：QueryUnescape 后重试（%2F → /）
+    var unescapedTarget string
+    if unescapedTarget, err = url.QueryUnescape(target); err != nil {
+        return nil, err
+    }
+    return commit.GetTreeEntryByPath(unescapedTarget)
+}
 ```
 
-`pageFilename` 来自 `wikiContentsByName` / `wikiEntryByName` 的返回值，该值由 `WebPathToGitPath` 转换得到。因此：
+**Web 端 vs API 端的细微差异**：
+- Web 端第一遍查找失败且错误非 `IsErrNotExist` 时直接返回错误
+- API 端第一遍查找的任何错误（包括 `IsErrNotExist`）都触发第二遍查找
+- **实际效果**：两者在正常情况下行为一致
 
-- **正常路径**（如 `Home-Page`）：`WebPathToGitPath("Home-Page")` → `Home-Page.md` → 历史查询正常
-- **含 `%2F` 的路径**（如 `some%2Fpath`）：`WebPathToGitPath("some%2Fpath")` → `some%2Fpath.md` → 历史查询正常，前提是文件确实以此名存储
-- **含真实 `/` 的路径**（如通过 Git CLI 创建的 `dir/page.md`）：路径转换后变为 `%2F` 形式，导致 `git rev-list` 找不到文件，历史查询返回 0 条记录
+### 6.4 对页面定位的影响：%2F 与真实斜杠的两种场景
 
-### 6.5 Dash Marker 机制
+**场景 A：Gitea 创建的含 %2F 页面**
+1. **请求阶段**：URL `/wiki/some%2Fpath` 被 Web 框架解码，`ctx.PathParamRaw("*")` 得到 `some/path`
+2. **规范化**：`WebPathFromRequest` 将其强制转为 `some%2Fpath`
+3. **Git 查找**：`WebPathToGitPath` → `some%2Fpath.md`
+4. **第一遍查找**：`findEntryForFile("some%2Fpath.md")` → 找到 Gitea 创建的文件
+5. **结果**：页面正常显示
+
+**场景 B：Git CLI 创建的含真实斜杠页面**
+1. **请求阶段**：URL `/wiki/some/path` → `ctx.PathParamRaw("*")` 得到 `some/path`
+2. **规范化**：`WebPathFromRequest` 强制转为 `some%2Fpath`
+3. **Git 查找**：`WebPathToGitPath` → `some%2Fpath.md`
+4. **第一遍查找**：`findEntryForFile("some%2Fpath.md")` → 找不到（Git 中是 `some/path.md`）
+5. **第二遍查找**：QueryUnescape 后 `some/path.md` → **成功找到**
+6. **结果**：页面内容正常显示 ✅
+
+**关键发现**：`findEntryForFile` 的 QueryUnescape 回退机制**扩展了兼容性**，使得通过 Git CLI 创建的真实目录结构文件也能被访问。但这只解决了"页面能看到"的问题，**历史统计仍然可能失败**（见 §6.7）。
+
+### 6.6 `pageFilename` 的来源与历史查询参数不一致问题
+
+`pageFilename` 是历史查询的关键参数，但它**并非来自实际找到的文件的真实路径**，而是始终来源于 `WebPathToGitPath` 的转换结果：
+
+```go
+// Web 端 wikiEntryByName (routers/web/repo/wiki.go:147-169)
+func wikiEntryByName(ctx *context.Context, commit *git.Commit, wikiName wiki_service.WebPath) (*git.TreeEntry, string, bool, bool) {
+    gitFilename := wiki_service.WebPathToGitPath(wikiName)  // ← 转换后的路径
+    entry, err := findEntryForFile(commit, gitFilename)    // ← 用转换后的路径查找
+    // ... 即使 findEntryForFile 通过 QueryUnescape 找到了真实路径的文件
+    return entry, gitFilename, false, isRaw  // ← 返回的仍然是转换后的 gitFilename！
+}
+
+// API 端 wikiContentsByName (routers/api/v1/repo/wiki.go:514-528)
+func wikiContentsByName(...) (string, string) {
+    gitFilename := wiki_service.WebPathToGitPath(wikiName)  // ← 转换后的路径
+    entry, err := findEntryForFile(commit, gitFilename)    // ← 用转换后的路径查找
+    return wikiContentsByEntry(ctx, entry), gitFilename    // ← 返回的仍然是转换后的 gitFilename！
+}
+```
+
+### 6.7 页面命中路径与历史统计参数不一致的具体情形
+
+**问题核心**：`findEntryForFile` 可能通过 QueryUnescape 回退找到真实路径的文件（如 `some/path.md`），但返回给历史查询的 `pageFilename` 仍然是 `WebPathToGitPath` 转换后的路径（如 `some%2Fpath.md`）。
+
+**不一致场景的完整流程**：
+
+| 步骤 | 操作 | 路径值 |
+|-----|------|--------|
+| 1 | URL 请求 | `/wiki/some/path` |
+| 2 | `WebPathFromRequest` | 转为 `some%2Fpath` |
+| 3 | `WebPathToGitPath` | 转为 `some%2Fpath.md` |
+| 4 | `findEntryForFile` 第一遍查找 | 尝试 `some%2Fpath.md` → 失败 |
+| 5 | `findEntryForFile` QueryUnescape 回退 | 尝试 `some/path.md` → **成功找到** |
+| 6 | `wikiContentsByName` 返回 | `entry`(真实文件对象), `gitFilename`=`some%2Fpath.md` |
+| 7 | `FileCommitsCount` 查询参数 | `some%2Fpath.md` → **Git 中不存在此文件！** |
+| 8 | 结果 | 页面内容显示正常，但**历史版本数为 0** |
+
+**具体影响**：
+1. **页面显示**：✅ 正常（通过 QueryUnescape 回退找到文件）
+2. **历史计数**：❌ 始终为 0（用错误的文件名查询）
+3. **历史列表**：❌ 空列表（同上）
+4. **编辑功能**：✅ 编辑会覆盖真实路径的文件（因为操作的是 TreeEntry 对象，而非路径字符串）
+5. **重命名功能**：❌ 重命名后新文件会以 `%2F` 形式创建，而非继承真实斜杠结构
+
+**修正建议**：应使用 `entry.Name()` 而非 `gitFilename` 作为历史查询参数，但需要考虑对已有历史数据的兼容性。
+
+### 6.8 Dash Marker 机制
 
 为处理标题中包含连字符 `-` 与空格转换的歧义，引入了 dash marker (`.-`) (`services/wiki/wiki_path.go:53-63`)：
 
@@ -460,11 +537,49 @@ API: TokenAuth → RepoAssignment → mustEnableWiki → Handler
 
 ### 8.3 路径转换对历史一致性的影响
 
-历史查询依赖 `GitPath` 定位文件，而 `GitPath` 由 `WebPathToGitPath` 从 `WebPath` 转换得到。`%2F` 约束确保了：
-- 写入时的 GitPath 和读取时的 GitPath **始终一致**（都经过 `WebPathToGitPath` 转换）
-- 历史查询使用的 `pageFilename` 与写入时的文件名**一致**
+**正常情况（Gitea 创建的文件）**：
+- 写入：UserTitle → WebPath → WebPathToGitPath → GitPath → Git Commit
+- 读取：URL → WebPathFromRequest → WebPath → WebPathToGitPath → GitPath → 查找
+- 历史查询：GitPath → `git rev-list` → 结果正确
 
-但如果通过 Git CLI 绕过 Gitea 创建了包含真实 `/` 的文件，路径转换将导致读取/历史查询无法定位到该文件。
+`%2F` 约束确保了写入和读取的 GitPath **始终一致**，历史查询参数与写入时的文件名一致。
+
+**异常情况（Git CLI 创建的含真实 `/` 文件）**：
+- 页面内容查找：✅ 成功（通过 `findEntryForFile` 的 QueryUnescape 回退）
+- 历史查询参数：❌ 错误（使用 `WebPathToGitPath` 转换后的路径，而非真实文件路径）
+- 历史查询结果：❌ 空列表 / 0 条记录
+
+### 8.4 页面命中与历史统计的路径不一致问题详解
+
+**不一致的根因**：`wikiContentsByName` / `wikiEntryByName` 返回的 `gitFilename` 始终是 `WebPathToGitPath(wikiName)` 的结果，而非实际找到的文件的 `entry.Name()`。
+
+```go
+// 代码中的问题：
+func wikiEntryByName(...) (*git.TreeEntry, string, bool, bool) {
+    gitFilename := wiki_service.WebPathToGitPath(wikiName)  // 预期路径
+    entry, err := findEntryForFile(commit, gitFilename)    // 实际查找（可能通过回退找到不同路径）
+    // 返回的仍然是预期路径，而非实际找到的文件路径！
+    return entry, gitFilename, noEntry, isRaw
+}
+```
+
+**不一致的影响矩阵**：
+
+| 功能模块 | 正常 %2F 文件 | Git CLI 创建的真实 `/` 文件 |
+|---------|--------------|-------------------------|
+| 页面内容显示 | ✅ | ✅ |
+| 历史版本数显示 | ✅ | ❌ 显示 0 |
+| 历史版本列表 | ✅ | ❌ 空列表 |
+| 编辑保存 | ✅ | ✅（覆盖真实路径） |
+| 重命名页面 | ✅ | ❌（新文件以 %2F 形式创建） |
+| 删除页面 | ✅ | ✅（通过 TreeEntry 操作） |
+
+**潜在修复方案**：
+1. **方案 A**：在 `findEntryForFile` 中同时返回实际命中的路径
+2. **方案 B**：在 `wikiEntryByName` 中通过 `entry.Name()` 获取真实路径
+3. **方案 C**：在调用历史查询的地方使用 `entry.Name()` 而非传入的 `pageFilename`
+
+**注意**：修复需要考虑对已有 `%2F` 格式文件的历史查询兼容性。
 
 ## 9. 安全边界总结
 
@@ -475,7 +590,7 @@ API: TokenAuth → RepoAssignment → mustEnableWiki → Handler
 3. **操作二次检查**: 处理函数内部再次检查 `CanWrite`
 4. **仓库状态检查**: `RepoMustNotBeArchived()` / `mustNotBeArchived()` 防止归档仓库写入
 
-### 9.2 Web 与 API 鉴权差异清单
+### 9.2 Web 与 API 行为差异清单
 
 | 差异点 | Web 端 | API 端 |
 |-------|--------|--------|
@@ -483,6 +598,7 @@ API: TokenAuth → RepoAssignment → mustEnableWiki → Handler
 | 默认分支同步 | 自动修正数据库与 Git 仓库的不一致 | 不修正，直接失败 |
 | 写操作认证 | `reqSignIn` (session) | `reqToken()` (API token) |
 | `_Sidebar`/`_Footer` API 可见性 | 不涉及 JSON API | `ListWikiPages` 会暴露 |
+| `findEntryForFile` 错误处理 | 非 `IsErrNotExist` 错误直接返回 | 任何错误都触发 QueryUnescape 回退 |
 
 ### 9.3 存储安全
 
@@ -491,7 +607,28 @@ API: TokenAuth → RepoAssignment → mustEnableWiki → Handler
 - **并发控制**: 全局锁防止并发写入冲突
 - **路径验证**: `validateWebPath()` 防止保留名称（`_pages`、`_new`、`_edit`、`raw`）和路径遍历攻击
 
-### 9.4 特殊文件处理
+### 9.4 已知边界问题与风险
+
+#### 9.4.1 事务边界风险
+
+`ChangeDefaultWikiBranch` 的数据库事务无法回滚 Git 操作：
+- 数据库更新成功但 Git 分支重命名失败 → 状态不一致
+- Web 端可通过自动同步自愈，API 端永久失败
+
+#### 9.4.2 路径查找与历史统计不一致
+
+`findEntryForFile` 的 QueryUnescape 回退机制与历史查询参数不匹配：
+- 页面内容可正常显示（通过回退找到文件）
+- 但历史版本统计始终为 0（使用错误的文件名查询）
+- 影响范围：Git CLI 创建的含真实 `/` 路径的文件
+
+#### 9.4.3 路径穿透风险
+
+`findEntryForFile` 的 QueryUnescape 机制可能被用于绕过路径验证：
+- 理论上可通过精心构造的 `%2e%2e%2f` 尝试路径遍历
+- 实际风险较低，因为 `WebPathFromRequest` 会先经过 `util.PathJoinRelX` 规范化
+
+### 9.5 特殊文件处理
 
 | 特殊页面 | 侧边栏页面列表 | 页面列表页 | API 列表 | 内容渲染 |
 |---------|--------------|----------|---------|---------|

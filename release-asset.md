@@ -234,6 +234,243 @@ if release.IsDraft && !canAccessReleaseDraft(ctx) {
 
 ---
 
+## 第五阶段：附件下载入口鉴权深度分析
+
+### 5.1 Web 端附件下载入口的鉴权流程
+
+**下载入口路由** (`routers/web/web.go:1474`):
+```go
+m.Get("/releases/download/{vTag}/{fileName}", webAuth.AllowBasic, webAuth.AllowOAuth2, repo.RedirectDownload)
+```
+
+**核心鉴权函数** (`routers/web/repo/repo.go:317-363`):
+
+#### 步骤 1：查询 Release 时复用草稿过滤规则
+```go
+releases, err := db.Find[repo_model.Release](ctx, repo_model.FindReleasesOptions{
+    IncludeDrafts: ctx.Repo.Permission.CanWrite(unit.TypeReleases),  // 关键：复用写入权限判断
+    RepoID:        curRepo.ID,
+    TagNames:      tagNames,
+})
+```
+
+**复用机制解析**：
+- `IncludeDrafts` 参数直接绑定到用户的仓库写入权限
+- 无写入权限的用户：`IncludeDrafts = false`，查询结果自动过滤草稿
+- 有写入权限的用户：`IncludeDrafts = true`，可以看到草稿
+- **这是草稿可见规则的第一层复用**
+
+#### 步骤 2：通过 tag 名隐式过滤草稿
+- 如果用户无写入权限，查询结果中不包含草稿 Release
+- 即使攻击者知道草稿的 tag 名，也无法通过 tag 名查询到草稿 Release
+- 最终效果：`len(releases) == 0`，返回 404
+
+#### 步骤 3：获取并返回附件
+```go
+if len(releases) == 1 {
+    release := releases[0]
+    att, err := repo_model.GetAttachmentByReleaseIDFileName(ctx, release.ID, fileName)
+    if att != nil {
+        ServeAttachment(ctx, att.UUID)  // 进入通用附件服务逻辑
+        return
+    }
+}
+```
+
+### 5.2 通用附件服务的二次鉴权
+
+**函数** (`routers/web/repo/attachment.go:135-195`): `ServeAttachment()`
+
+#### 权限检查链路：
+1. **仓库归属检查**：
+   ```go
+   if attach.CreatedUnix > repo_model.LegacyAttachmentMissingRepoIDCutoff && 
+      ctx.Repo.Repository != nil && ctx.Repo.Repository.ID != attach.RepoID {
+       ctx.HTTPError(http.StatusNotFound)
+       return
+   }
+   ```
+
+2. **关联类型与权限检查**：
+   ```go
+   unitType, repoID, err := repo_service.GetAttachmentLinkedTypeAndRepoID(ctx, attach)
+   // unitType = unit.TypeReleases (当 attach.ReleaseID != 0 时)
+   
+   if !perm.CanRead(unitType) {  // 检查 Releases 单元的读取权限
+       ctx.HTTPError(http.StatusNotFound)
+       return
+   }
+   ```
+
+3. **Token Scope 检查**（API Token 访问时）：
+   ```go
+   if requiredScope, ok := attachmentReadScope(unitType); ok {
+       context.CheckTokenScopes(ctx, repo, requiredScope)
+   }
+   ```
+
+### 5.3 附件下载入口的鉴权复用总结
+
+| 鉴权层级 | 复用机制 | 代码位置 |
+|---------|---------|---------|
+| **第一层** | 查询时通过 `IncludeDrafts` 过滤草稿 | `routers/web/repo/repo.go:325` |
+| **第二层** | 仅能查询到有权限的 Release | `FindReleasesOptions.ToConds()` |
+| **第三层** | 通用附件服务的仓库归属检查 | `routers/web/repo/attachment.go:148` |
+| **第四层** | Releases 单元读取权限检查 | `routers/web/repo/attachment.go:184` |
+| **第五层** | API Token Scope 验证 | `routers/web/repo/attachment.go:189-194` |
+
+---
+
+## 第六阶段：草稿转正后附件可见性变化
+
+### 6.1 数据库层面的变化
+
+**草稿转正操作**：`UpdateRelease()` 将 `IsDraft` 从 `true` 改为 `false`
+
+**关键观察**：
+- **附件记录本身不发生任何变化**
+- `Attachment.ReleaseID` 保持不变
+- 附件与 Release 的关联关系在草稿阶段就已建立
+
+### 6.2 可见性变化的触发点
+
+**变化的核心是查询条件，而非数据本身**：
+
+| 阶段 | 查询条件 `IncludeDrafts` | 结果 |
+|------|-------------------------|------|
+| **草稿时** | 无写入权限用户：`false` | 附件不可见 |
+| **正式发布后** | 所有用户：`true`（因为 `IsDraft=false` 不依赖此 flag） | 附件对所有人可见 |
+
+### 6.3 各入口的可见性变化详解
+
+#### 1. Release 列表 API (`GET /repos/{owner}/{repo}/releases`)
+- **草稿时**：仅写入权限用户能看到 Release 及其附件列表
+- **转正后**：所有用户都能看到 Release 及其附件列表
+- **控制逻辑**：`FindReleasesOptions` 中的 `IncludeDrafts` 参数
+
+#### 2. 单个 Release API (`GET /repos/{owner}/{repo}/releases/{id}`)
+- **草稿时**：无权限用户返回 404
+- **转正后**：所有用户都能获取详情，包含附件 URL
+- **控制逻辑**：`routers/api/v1/repo/release.go:80-83`
+
+#### 3. Web 端友好下载 URL (`/releases/download/{tag}/{filename}`)
+- **草稿时**：无权限用户查询不到 Release，返回 404
+- **转正后**：所有用户都能下载
+- **控制逻辑**：`routers/web/repo/repo.go:325` 的 `IncludeDrafts` 参数
+
+#### 4. UUID 直接访问 (`/attachments/{uuid}`)
+- **草稿时**：
+  - 写入权限用户：可下载（通过 `CanRead(unit.TypeReleases)` 检查）
+  - 其他用户：也可下载 ⚠️ **存在安全隐患**
+- **转正后**：所有用户都能下载
+- **问题**：UUID 直接访问不检查 Release 的草稿状态！
+
+### 6.4 安全注意事项
+
+**UUID 直接访问的权限漏洞**：
+- 通用附件服务 `ServeAttachment()` 只检查：
+  1. 附件是否属于当前仓库
+  2. 用户是否有 Releases 单元的读取权限
+- **不检查关联 Release 的 `IsDraft` 状态**
+- 攻击者若猜到 UUID，可绕过草稿保护下载附件
+
+**建议修复方向**：
+在 `ServeAttachment()` 中增加对 Release 草稿状态的检查：
+```go
+if unitType == unit.TypeReleases {
+    rel, _ := repo_model.GetReleaseByID(ctx, attach.ReleaseID)
+    if rel != nil && rel.IsDraft && !ctx.Repo.Permission.CanWrite(unit.TypeReleases) {
+        ctx.HTTPError(http.StatusNotFound)
+        return
+    }
+}
+```
+
+---
+
+## 第七阶段：API Token 与登录态在草稿访问上的差异
+
+### 7.1 草稿访问权限函数分析
+
+**函数** (`routers/api/v1/repo/release.go:24-37`): `canAccessReleaseDraft()`
+
+```go
+func canAccessReleaseDraft(ctx *context.APIContext) bool {
+    // 第一步：基础权限检查
+    if !ctx.IsSigned || !ctx.Repo.Permission.CanWrite(unit.TypeReleases) {
+        return false
+    }
+    
+    // 第二步：区分登录态与 API Token
+    if ctx.Data["IsApiToken"] != true {
+        // 分支 A：用户登录态（非 API Token）
+        return true
+    }
+    
+    // 分支 B：API Token 访问
+    scope := ctx.Data["ApiTokenScope"].(auth_model.AccessTokenScope)
+    requiredScopes := auth_model.GetRequiredScopes(auth_model.Write, auth_model.AccessTokenScopeCategoryRepository)
+    allow, _ := scope.HasScope(requiredScopes...)
+    return allow
+}
+```
+
+### 7.2 两种访问方式的对比
+
+| 维度 | 用户登录态（Session/Cookie） | API Token 访问 |
+|------|-----------------------------|----------------|
+| **识别标志** | `ctx.Data["IsApiToken"] != true` | `ctx.Data["IsApiToken"] == true` |
+| **权限判断** | 只需有仓库写入权限 | 写入权限 + Token Scope 检查 |
+| **Required Scope** | 不需要 | `repo`（Write 级别）|
+| **典型场景** | Web 界面操作、浏览器访问 | 第三方工具、CI/CD |
+
+### 7.3 访问场景详解
+
+#### 场景 1：Web 浏览器访问（登录态）
+- 用户通过账号密码登录，持有 Session Cookie
+- `IsApiToken = false`
+- 只要有仓库写入权限，即可访问草稿
+- **无需额外 Scope 检查**
+
+#### 场景 2：使用 Personal Access Token 调用 API
+- 请求头：`Authorization: token <personal-access-token>`
+- `IsApiToken = true`
+- 双重检查：
+  1. Token 所属用户有仓库写入权限
+  2. Token 具有 `repo` (Write) Scope
+
+#### 场景 3：使用 OAuth2 Token 调用 API
+- 请求头：`Authorization: Bearer <oauth2-token>`
+- `IsApiToken = true`
+- 同样需要双重检查
+
+### 7.4 Scope 详细说明
+
+**Required Scopes 计算** (`routers/api/v1/repo/release.go:34`):
+```go
+requiredScopes := auth_model.GetRequiredScopes(
+    auth_model.Write,                          // 权限级别：Write
+    auth_model.AccessTokenScopeCategoryRepository  // 类别：Repository
+)
+```
+
+**Scope 含义**：
+- `repo` (Write)：完整的仓库读写权限
+- 包含：创建/编辑 Release、上传附件、管理草稿等操作
+- 草稿属于写入操作范畴，因此需要 Write 级别的 Scope
+
+### 7.5 权限矩阵
+
+| 访问方式 | 已登录 | 仓库写入权限 | Token Scope | 可访问草稿 |
+|---------|--------|-------------|-------------|-----------|
+| 浏览器（未登录） | ❌ | - | - | ❌ |
+| 浏览器（只读用户） | ✅ | ❌ | - | ❌ |
+| 浏览器（写入用户） | ✅ | ✅ | - | ✅ |
+| API Token（只读 Scope） | ✅ | ✅ | `repo:read` | ❌ |
+| API Token（写入 Scope） | ✅ | ✅ | `repo` | ✅ |
+
+---
+
 ## 完整流程图
 
 ```

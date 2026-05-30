@@ -382,47 +382,123 @@ func WebPathFromRequest(s string) WebPath {
 
 ### 6.3 `findEntryForFile` 的 QueryUnescape 回退机制
 
-`findEntryForFile` (`routers/web/repo/wiki.go:81-96` 和 `routers/api/v1/repo/wiki.go:455-470`) 提供了**双重路径查找**机制：
+Web 端和 API 端的 `findEntryForFile` 都有双重路径查找机制，但**错误处理逻辑完全不同**，导致回退触发条件有本质差异。
 
+**Web 端 `findEntryForFile`** (`routers/web/repo/wiki.go:81-96`)：
 ```go
 func findEntryForFile(commit *git.Commit, target string) (*git.TreeEntry, error) {
-    // 第一遍查找：使用原始路径（含 %2F 编码）
     entry, err := commit.GetTreeEntryByPath(target)
+    // 关键：只有非 IsErrNotExist 错误才返回
+    if err != nil && !git.IsErrNotExist(err) {
+        return nil, err
+    }
     if entry != nil {
         return entry, nil
     }
-    // 第二遍查找：QueryUnescape 后重试（%2F → /）
-    var unescapedTarget string
-    if unescapedTarget, err = url.QueryUnescape(target); err != nil {
-        return nil, err
-    }
+    // 回退：文件不存在时继续尝试 QueryUnescape
+    unescapedTarget, err := url.QueryUnescape(target)
+    if err != nil { return nil, err }
     return commit.GetTreeEntryByPath(unescapedTarget)
 }
 ```
 
-**Web 端 vs API 端的细微差异**：
-- Web 端第一遍查找失败且错误非 `IsErrNotExist` 时直接返回错误
-- API 端第一遍查找的任何错误（包括 `IsErrNotExist`）都触发第二遍查找
-- **实际效果**：两者在正常情况下行为一致
+**Web 端回退触发条件**：
+- ✅ `err == git.IsErrNotExist`（文件不存在）→ 触发回退
+- ✅ `err == nil && entry == nil`（无错误但无 entry，理论上不可能）→ 触发回退
+- ❌ 其他错误（权限、IO 错误等）→ 直接返回，不触发回退
 
-### 6.4 对页面定位的影响：%2F 与真实斜杠的两种场景
+**API 端 `findEntryForFile`** (`routers/api/v1/repo/wiki.go:455-470`)：
+```go
+func findEntryForFile(commit *git.Commit, target string) (*git.TreeEntry, error) {
+    entry, err := commit.GetTreeEntryByPath(target)
+    // 关键：任何错误都直接返回，包括 IsErrNotExist
+    if err != nil {
+        return nil, err
+    }
+    if entry != nil {
+        return entry, nil
+    }
+    // 回退：只有 err == nil && entry == nil 才触发（理论上不可能）
+    unescapedTarget, err := url.QueryUnescape(target)
+    if err != nil { return nil, err }
+    return commit.GetTreeEntryByPath(unescapedTarget)
+}
+```
 
-**场景 A：Gitea 创建的含 %2F 页面**
+**API 端回退触发条件**：
+- ❌ `err == git.IsErrNotExist`（文件不存在）→ **直接返回错误，不触发回退**
+- ✅ `err == nil && entry == nil`（理论上不可能）→ 触发回退
+- ❌ 其他错误 → 直接返回，不触发回退
+
+**重大差异结论**：
+- Web 端 QueryUnescape 回退正常工作，能找到 Git CLI 创建的含真实 `/` 的文件
+- API 端 QueryUnescape 回退**几乎永远不会被触发**，因为文件不存在时 API 端直接返回错误了
+- 这是一个代码缺陷，API 端与 Web 端行为不一致
+
+### 6.4 对页面定位的影响：%2F 与真实斜杠的三种场景
+
+**场景 A：Gitea 创建的含 %2F 页面（Web 端和 API 端表现一致）**
 1. **请求阶段**：URL `/wiki/some%2Fpath` 被 Web 框架解码，`ctx.PathParamRaw("*")` 得到 `some/path`
 2. **规范化**：`WebPathFromRequest` 将其强制转为 `some%2Fpath`
 3. **Git 查找**：`WebPathToGitPath` → `some%2Fpath.md`
 4. **第一遍查找**：`findEntryForFile("some%2Fpath.md")` → 找到 Gitea 创建的文件
-5. **结果**：页面正常显示
+5. **结果**：页面正常显示 ✅
 
-**场景 B：Git CLI 创建的含真实斜杠页面**
+**场景 B：Git CLI 创建的含真实斜杠页面（Web 端）**
 1. **请求阶段**：URL `/wiki/some/path` → `ctx.PathParamRaw("*")` 得到 `some/path`
 2. **规范化**：`WebPathFromRequest` 强制转为 `some%2Fpath`
 3. **Git 查找**：`WebPathToGitPath` → `some%2Fpath.md`
 4. **第一遍查找**：`findEntryForFile("some%2Fpath.md")` → 找不到（Git 中是 `some/path.md`）
-5. **第二遍查找**：QueryUnescape 后 `some/path.md` → **成功找到**
+5. **第二遍查找**（Web 端触发）：QueryUnescape 后 `some/path.md` → **成功找到**
 6. **结果**：页面内容正常显示 ✅
 
-**关键发现**：`findEntryForFile` 的 QueryUnescape 回退机制**扩展了兼容性**，使得通过 Git CLI 创建的真实目录结构文件也能被访问。但这只解决了"页面能看到"的问题，**历史统计仍然可能失败**（见 §6.7）。
+**场景 C：Git CLI 创建的含真实斜杠页面（API 端）**
+1. **请求阶段**：`GET /repos/{owner}/{repo}/wiki/page/some/path` → 路径参数为 `some/path`
+2. **规范化**：`WebPathFromRequest` 强制转为 `some%2Fpath`
+3. **Git 查找**：`WebPathToGitPath` → `some%2Fpath.md`
+4. **第一遍查找**：`findEntryForFile("some%2Fpath.md")` → 找不到（Git 中是 `some/path.md`）
+5. **错误处理**：`err == IsErrNotExist` → **API 端直接返回 404，不触发回退**
+6. **结果**：页面不存在 ❌
+
+**关键发现**：
+- Web 端 QueryUnescape 回退正常工作，兼容 Git CLI 创建的真实目录文件
+- API 端 QueryUnescape 回退几乎不触发，**真实 `/` 文件在 API 端完全无法访问**
+- 但 Web 端即使页面能显示，**历史统计仍然可能失败**（见 §6.7）
+
+### 6.5 `pageFilename` 与 `entry.Name()` 的使用区别
+
+`pageFilename` 和 `entry.Name()` 在代码中有明确的使用分工：
+
+| 用途 | 使用变量 | 来源 |
+|-----|---------|------|
+| 历史查询 `FileCommitsCount` | `pageFilename` | `WebPathToGitPath(wikiName)`（转换后的预期路径） |
+| 历史查询 `CommitsByFileAndRange` | `pageFilename` | `WebPathToGitPath(wikiName)`（转换后的预期路径） |
+| 遍历文件列表转换 WebPath | `entry.Name()` | Git TreeEntry 的实际文件名 |
+| 检测渲染类型 `DetectRendererTypeByFilename` | `entry.Name()` | Git TreeEntry 的实际文件名 |
+| 获取最后提交 `GetCommitByPath` | `entry.Name()` | Git TreeEntry 的实际文件名 |
+| `PageMeta.GitEntryName` 字段 | `entry.Name()` | Git TreeEntry 的实际文件名 |
+
+**关键代码**：
+```go
+// Web 端 wikiEntryByName (routers/web/repo/wiki.go:147-169)
+func wikiEntryByName(...) (*git.TreeEntry, string, bool, bool) {
+    gitFilename := wiki_service.WebPathToGitPath(wikiName)  // 预期路径
+    entry, err := findEntryForFile(commit, gitFilename)    // 实际查找
+    // 即使 findEntryForFile 通过回退找到真实路径的文件
+    return entry, gitFilename, false, isRaw  // 返回的仍然是预期路径！
+}
+
+// 使用 entry.Name() 的场景（遍历文件列表）
+for _, entry := range entries {
+    wikiName, err := wiki_service.GitPathToWebPath(entry.Name())  // ← 用真实文件名
+    // ...
+    pages = append(pages, PageMeta{
+        GitEntryName: entry.Entry.Name(),  // ← 存储真实文件名
+    })
+}
+```
+
+**不一致的根因**：历史查询使用的是 `pageFilename`（预期路径），而不是实际找到的 `entry.Name()`（真实路径）。
 
 ### 6.6 `pageFilename` 的来源与历史查询参数不一致问题
 
@@ -598,37 +674,94 @@ func wikiEntryByName(...) (*git.TreeEntry, string, bool, bool) {
 | 默认分支同步 | 自动修正数据库与 Git 仓库的不一致 | 不修正，直接失败 |
 | 写操作认证 | `reqSignIn` (session) | `reqToken()` (API token) |
 | `_Sidebar`/`_Footer` API 可见性 | 不涉及 JSON API | `ListWikiPages` 会暴露 |
-| `findEntryForFile` 错误处理 | 非 `IsErrNotExist` 错误直接返回 | 任何错误都触发 QueryUnescape 回退 |
+| `findEntryForFile` 错误处理 | `IsErrNotExist` 时触发 QueryUnescape 回退 | **任何错误都直接返回**，回退几乎永不触发 |
+| Git CLI 创建的真实 `/` 文件 | ✅ 可访问（通过回退） | ❌ 完全无法访问（无回退） |
+| Wiki 原始文件支持 | 支持（`.md` 回退） | 不支持（无二次查找逻辑） |
+| `ListWikiPages` 计数口径 | 无 TotalCount 头 | **TotalCount = 未过滤的 entries 总数**，与实际返回数不一致 |
 
-### 9.3 存储安全
+### 9.3 `ListWikiPages` 计数口径与过滤口径不一致问题
+
+**API 端 `ListWikiPages`** (`routers/api/v1/repo/wiki.go:310-338`) 存在**计数口径与过滤口径不一致**的问题：
+
+```go
+// 过滤逻辑
+for i, entry := range entries {
+    if i < skip || i >= maxNum || !entry.IsRegular() {
+        continue  // 跳过分页外的和非普通文件
+    }
+    wikiName, err := wiki_service.GitPathToWebPath(entry.Name())
+    if err != nil {
+        if repo_model.IsErrWikiInvalidFileName(err) {
+            continue  // 跳过无效文件名
+        }
+        // ...
+    }
+    pages = append(pages, ...)
+}
+
+// 计数逻辑
+ctx.SetLinkHeader(int64(len(entries)), limit)       // ← 使用未过滤的 entries 总数
+ctx.SetTotalCountHeader(int64(len(entries)))        // ← 使用未过滤的 entries 总数
+```
+
+**问题**：
+- **过滤口径**：排除非普通文件（目录、符号链接）、无效文件名
+- **计数口径**：`len(entries)`（所有条目，包括目录、符号链接等）
+- **结果**：`X-Total-Count` 头返回的总数大于实际返回的页面数，分页信息不准确
+
+**示例场景**：
+- Git 仓库中有 10 个条目：8 个 `.md` 文件 + 1 个目录 + 1 个无效文件名
+- API 返回 `X-Total-Count: 10`
+- 实际返回 `pages` 数组只有 8 个元素
+- 影响：客户端分页逻辑混乱，最后一页可能为空
+
+### 9.4 存储安全
 
 - **独立仓库**: Wiki 与代码仓库分离，避免互相影响
 - **Git 签名**: 支持 GPG 签名 Wiki 提交 (`services/wiki/wiki.go:202`)
 - **并发控制**: 全局锁防止并发写入冲突
 - **路径验证**: `validateWebPath()` 防止保留名称（`_pages`、`_new`、`_edit`、`raw`）和路径遍历攻击
 
-### 9.4 已知边界问题与风险
+### 9.5 已知边界问题与风险
 
-#### 9.4.1 事务边界风险
+#### 9.5.1 事务边界风险
 
 `ChangeDefaultWikiBranch` 的数据库事务无法回滚 Git 操作：
 - 数据库更新成功但 Git 分支重命名失败 → 状态不一致
 - Web 端可通过自动同步自愈，API 端永久失败
 
-#### 9.4.2 路径查找与历史统计不一致
+#### 9.5.2 `findEntryForFile` 回退机制不一致
+
+Web 端和 API 端的 `findEntryForFile` 错误处理逻辑不同：
+- Web 端：`IsErrNotExist` 时触发 QueryUnescape 回退，能找到真实 `/` 文件
+- API 端：任何错误直接返回，回退几乎永不触发，真实 `/` 文件完全无法访问
+- 影响范围：API 集成和第三方应用
+
+#### 9.5.3 路径查找与历史统计不一致
 
 `findEntryForFile` 的 QueryUnescape 回退机制与历史查询参数不匹配：
 - 页面内容可正常显示（通过回退找到文件）
-- 但历史版本统计始终为 0（使用错误的文件名查询）
-- 影响范围：Git CLI 创建的含真实 `/` 路径的文件
+- 但历史版本统计始终为 0（使用 `pageFilename` 而非 `entry.Name()` 查询）
+- 影响范围：Git CLI 创建的含真实 `/` 路径的文件（仅 Web 端）
 
-#### 9.4.3 路径穿透风险
+#### 9.5.4 `ListWikiPages` 计数口径不一致
+
+API 端 `ListWikiPages` 的 TotalCount 使用未过滤的 entries 总数：
+- 过滤口径：排除非普通文件、无效文件名
+- 计数口径：`len(entries)`（含目录、符号链接等）
+- 影响：客户端分页逻辑混乱，最后一页可能为空
+
+#### 9.5.5 API 端不支持 Wiki 原始文件
+
+Web 端 `wikiEntryByName` 有二次查找逻辑（去掉 `.md` 后缀重试），支持访问非 `.md` 格式的原始文件；API 端 `wikiContentsByName` 只有一次查找，不支持原始文件。
+
+#### 9.5.6 路径穿透风险
 
 `findEntryForFile` 的 QueryUnescape 机制可能被用于绕过路径验证：
 - 理论上可通过精心构造的 `%2e%2e%2f` 尝试路径遍历
 - 实际风险较低，因为 `WebPathFromRequest` 会先经过 `util.PathJoinRelX` 规范化
 
-### 9.5 特殊文件处理
+### 9.6 特殊文件处理
 
 | 特殊页面 | 侧边栏页面列表 | 页面列表页 | API 列表 | 内容渲染 |
 |---------|--------------|----------|---------|---------|

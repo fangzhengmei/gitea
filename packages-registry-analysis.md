@@ -382,11 +382,18 @@ func NewLocalStorage(ctx context.Context, config *setting.Storage) (ObjectStorag
 
 **本地存储参数表（与代码一致）**：
 
-| 参数 | 配置键名 | 说明 | 默认值 | 可配置 | 代码引用 |
-|-----|---------|------|--------|--------|---------|
-| **STORAGE_TYPE** | `STORAGE_TYPE` | 存储类型，必须为 `local` | `local` | ✓ | `modules/setting/storage.go:248` |
-| **PATH** | `PATH` | 存储根目录（绝对路径）<br>支持目标节和覆盖节双重配置 | `{AppDataPath}/packages/` | ✓ | `modules/setting/storage.go:251,269` |
-| **TemporaryPath** | `TEMPORARY_PATH` | 临时文件目录（用于原子写入） | `{PATH}/tmp` | ❌ | `modules/storage/local.go:38-41` |
+| 参数 | 配置键名 | 环境变量键名 | 说明 | 默认值 | 可配置 | 代码引用 |
+|-----|---------|-------------|------|--------|--------|---------|
+| **STORAGE_TYPE** | `STORAGE_TYPE` | `GITEA__STORAGE__STORAGE_TYPE`<br>`GITEA__STORAGE_0x2E_PACKAGES__STORAGE_TYPE`<br>`GITEA__PACKAGES__STORAGE_TYPE` | 存储类型，必须为 `local` | `local` | ✓ | `modules/setting/storage.go:248` |
+| **PATH** | `PATH` | `GITEA__STORAGE__PATH`<br>`GITEA__STORAGE_0x2E_PACKAGES__PATH`<br>`GITEA__PACKAGES__PATH` | 存储根目录（绝对路径）<br>支持目标节和覆盖节双重配置 | `{AppDataPath}/packages/` | ✓ | `modules/setting/storage.go:251,269` |
+| **TemporaryPath** | `TEMPORARY_PATH` | `GITEA__STORAGE__TEMPORARY_PATH`<br>`GITEA__STORAGE_0x2E_PACKAGES__TEMPORARY_PATH` | 临时文件目录（用于原子写入）<br>⚠️ 配置项存在但解析代码未读取 | `{PATH}/tmp` | ❌ | `modules/storage/local.go:38-41` |
+
+> **环境变量配置说明**：Gitea 支持通过 `GITEA__SECTION__KEY` 格式的环境变量覆盖配置（`modules/setting/config_env.go:98-110`），其中 `_0x2E_` 表示点号（`.`）。例如：
+> - `GITEA__STORAGE__PATH` 对应 `[storage]` 节的 `PATH`
+> - `GITEA__STORAGE_0x2E_PACKAGES__PATH` 对应 `[storage.packages]` 节的 `PATH`
+> - `GITEA__PACKAGES__PATH` 对应 `[packages]` 节的 `PATH`
+> 
+> 即使如此，`TEMPORARY_PATH` 仍无法通过环境变量配置，因为 `getStorageForLocal` 函数根本不读取该配置项。
 
 **PATH 参数计算逻辑**：
 1. 从**目标节**（targetSec）读取 `PATH`
@@ -424,7 +431,7 @@ PATH = /data/my-packages
 # 包存储路径 → /data/my-packages/
 ```
 
-> **重要说明**：以上所有方案中，`TEMPORARY_PATH` 均无法通过配置文件修改，始终为 `{PATH}/tmp`。如果需要自定义临时目录，需通过代码修改或环境变量注入。
+> **重要说明**：`TEMPORARY_PATH` 虽然在 `Storage` 结构体中定义（`modules/setting/storage.go:85`），且 `NewLocalStorage` 函数也会读取该字段（`modules/storage/local.go:38`），但由于 `getStorageForLocal` 配置解析函数未实现对 `TEMPORARY_PATH` 配置项的读取（`modules/setting/storage.go:246-284`），因此**无论通过配置文件还是环境变量（`GITEA__STORAGE__TEMPORARY_PATH` 等），均无法配置临时目录**，始终使用默认值 `{PATH}/tmp`。如需自定义，必须修改 `getStorageForLocal` 函数的代码，增加对 `TEMPORARY_PATH` 配置项的读取逻辑。
 
 **MinIO/S3 存储配置**：
 
@@ -482,20 +489,20 @@ func getDefaultStorageSection(rootCfg ConfigProvider) ConfigSection {
 
 **MinIO/S3 参数表（与代码一致）**：
 
-| 参数 | 配置键名 | 说明 | 默认值 | 可覆盖 | 代码引用 |
-|-----|---------|------|--------|--------|---------|
-| **STORAGE_TYPE** | `STORAGE_TYPE` | 存储类型，必须为 `minio` | `local` | - | `modules/setting/storage.go:288` |
-| **Endpoint** | `MINIO_ENDPOINT` | MinIO/S3 服务器地址 | `localhost:9000` | - | `modules/setting/storage.go:108` |
-| **AccessKeyID** | `MINIO_ACCESS_KEY_ID` | 访问密钥 ID | 空 | - | `modules/setting/storage.go:109` |
-| **SecretAccessKey** | `MINIO_SECRET_ACCESS_KEY` | 秘密访问密钥 | 空 | - | `modules/setting/storage.go:110` |
-| **Bucket** | `MINIO_BUCKET` | Bucket 名称 | `gitea` | ✓ | `modules/setting/storage.go:111,308` |
-| **Location** | `MINIO_LOCATION` | 区域 | `us-east-1` | - | `modules/setting/storage.go:112` |
-| **BasePath** | `MINIO_BASE_PATH` | 基础路径前缀 | `packages/` | ✓ | `modules/setting/storage.go:307` |
-| **UseSSL** | `MINIO_USE_SSL` | 是否使用 SSL | `false` | - | `modules/setting/storage.go:113` |
-| **InsecureSkipVerify** | `MINIO_INSECURE_SKIP_VERIFY` | 跳过证书验证 | `false` | - | `modules/setting/storage.go:114` |
-| **ChecksumAlgorithm** | `MINIO_CHECKSUM_ALGORITHM` | 校验算法 | `default` | - | `modules/setting/storage.go:115` |
-| **BucketLookUpType** | `MINIO_BUCKET_LOOKUP_TYPE` | Bucket 查找方式 | `auto` | - | `modules/setting/storage.go:116` |
-| **ServeDirect** | `SERVE_DIRECT` | 是否直接重定向到存储 | `false` | ✓ | `modules/setting/storage.go:306` |
+| 参数 | 配置键名 | 环境变量键名示例 | 说明 | 默认值 | 可覆盖 | 代码引用 |
+|-----|---------|-----------------|------|--------|--------|---------|
+| **STORAGE_TYPE** | `STORAGE_TYPE` | `GITEA__STORAGE__STORAGE_TYPE` | 存储类型，必须为 `minio` | `local` | - | `modules/setting/storage.go:288` |
+| **Endpoint** | `MINIO_ENDPOINT` | `GITEA__STORAGE__MINIO_ENDPOINT` | MinIO/S3 服务器地址 | `localhost:9000` | - | `modules/setting/storage.go:108` |
+| **AccessKeyID** | `MINIO_ACCESS_KEY_ID` | `GITEA__STORAGE__MINIO_ACCESS_KEY_ID` | 访问密钥 ID | 空 | - | `modules/setting/storage.go:109` |
+| **SecretAccessKey** | `MINIO_SECRET_ACCESS_KEY` | `GITEA__STORAGE__MINIO_SECRET_ACCESS_KEY` | 秘密访问密钥 | 空 | - | `modules/setting/storage.go:110` |
+| **Bucket** | `MINIO_BUCKET` | `GITEA__STORAGE__MINIO_BUCKET`<br>`GITEA__PACKAGES__MINIO_BUCKET` | Bucket 名称 | `gitea` | ✓ | `modules/setting/storage.go:111,308` |
+| **Location** | `MINIO_LOCATION` | `GITEA__STORAGE__MINIO_LOCATION` | 区域 | `us-east-1` | - | `modules/setting/storage.go:112` |
+| **BasePath** | `MINIO_BASE_PATH` | `GITEA__STORAGE__MINIO_BASE_PATH`<br>`GITEA__PACKAGES__MINIO_BASE_PATH` | 基础路径前缀 | `packages/` | ✓ | `modules/setting/storage.go:307` |
+| **UseSSL** | `MINIO_USE_SSL` | `GITEA__STORAGE__MINIO_USE_SSL` | 是否使用 SSL | `false` | - | `modules/setting/storage.go:113` |
+| **InsecureSkipVerify** | `MINIO_INSECURE_SKIP_VERIFY` | `GITEA__STORAGE__MINIO_INSECURE_SKIP_VERIFY` | 跳过证书验证 | `false` | - | `modules/setting/storage.go:114` |
+| **ChecksumAlgorithm** | `MINIO_CHECKSUM_ALGORITHM` | `GITEA__STORAGE__MINIO_CHECKSUM_ALGORITHM` | 校验算法 | `default` | - | `modules/setting/storage.go:115` |
+| **BucketLookUpType** | `MINIO_BUCKET_LOOKUP_TYPE` | `GITEA__STORAGE__MINIO_BUCKET_LOOKUP_TYPE` | Bucket 查找方式 | `auto` | - | `modules/setting/storage.go:116` |
+| **ServeDirect** | `SERVE_DIRECT` | `GITEA__STORAGE_0x2E_PACKAGES__SERVE_DIRECT`<br>`GITEA__PACKAGES__SERVE_DIRECT` | 是否直接重定向到存储 | `false` | ✓ | `modules/setting/storage.go:306` |
 
 > **BasePath 计算规则**：
 > - 若 `[storage]` 节配置了 `MINIO_BASE_PATH = /base/`，且目标节类型为全局默认，则包存储路径为 `/base/packages/`
@@ -551,15 +558,15 @@ func getDefaultStorageSection(rootCfg ConfigProvider) ConfigSection {
 
 **Azure Blob 参数表（与代码一致）**：
 
-| 参数 | 配置键名 | 说明 | 默认值 | 可覆盖 | 代码引用 |
-|-----|---------|------|--------|--------|---------|
-| **STORAGE_TYPE** | `STORAGE_TYPE` | 存储类型，必须为 `azureblob` | `local` | - | `modules/setting/storage.go:317` |
-| **Endpoint** | `AZURE_BLOB_ENDPOINT` | Azure Blob 服务端点 | 空 | - | `modules/setting/storage.go:117` |
-| **AccountName** | `AZURE_BLOB_ACCOUNT_NAME` | 存储账户名称 | 空 | - | `modules/setting/storage.go:118` |
-| **AccountKey** | `AZURE_BLOB_ACCOUNT_KEY` | 存储账户密钥 | 空 | - | `modules/setting/storage.go:119` |
-| **Container** | `AZURE_BLOB_CONTAINER` | 容器名称 | `gitea` | ✓ | `modules/setting/storage.go:120,337` |
-| **BasePath** | `AZURE_BLOB_BASE_PATH` | 基础路径前缀 | `packages/` | ✓ | `modules/setting/storage.go:336` |
-| **ServeDirect** | `SERVE_DIRECT` | 是否直接重定向到存储 | `false` | ✓ | `modules/setting/storage.go:335` |
+| 参数 | 配置键名 | 环境变量键名示例 | 说明 | 默认值 | 可覆盖 | 代码引用 |
+|-----|---------|-----------------|------|--------|--------|---------|
+| **STORAGE_TYPE** | `STORAGE_TYPE` | `GITEA__STORAGE__STORAGE_TYPE` | 存储类型，必须为 `azureblob` | `local` | - | `modules/setting/storage.go:317` |
+| **Endpoint** | `AZURE_BLOB_ENDPOINT` | `GITEA__STORAGE__AZURE_BLOB_ENDPOINT` | Azure Blob 服务端点 | 空 | - | `modules/setting/storage.go:117` |
+| **AccountName** | `AZURE_BLOB_ACCOUNT_NAME` | `GITEA__STORAGE__AZURE_BLOB_ACCOUNT_NAME` | 存储账户名称 | 空 | - | `modules/setting/storage.go:118` |
+| **AccountKey** | `AZURE_BLOB_ACCOUNT_KEY` | `GITEA__STORAGE__AZURE_BLOB_ACCOUNT_KEY` | 存储账户密钥 | 空 | - | `modules/setting/storage.go:119` |
+| **Container** | `AZURE_BLOB_CONTAINER` | `GITEA__STORAGE__AZURE_BLOB_CONTAINER`<br>`GITEA__PACKAGES__AZURE_BLOB_CONTAINER` | 容器名称 | `gitea` | ✓ | `modules/setting/storage.go:120,337` |
+| **BasePath** | `AZURE_BLOB_BASE_PATH` | `GITEA__STORAGE__AZURE_BLOB_BASE_PATH`<br>`GITEA__PACKAGES__AZURE_BLOB_BASE_PATH` | 基础路径前缀 | `packages/` | ✓ | `modules/setting/storage.go:336` |
+| **ServeDirect** | `SERVE_DIRECT` | `GITEA__STORAGE_0x2E_PACKAGES__SERVE_DIRECT`<br>`GITEA__PACKAGES__SERVE_DIRECT` | 是否直接重定向到存储 | `false` | ✓ | `modules/setting/storage.go:335` |
 
 **MinIO 认证链** (`modules/storage/minio.go:164-193`)：
 ```

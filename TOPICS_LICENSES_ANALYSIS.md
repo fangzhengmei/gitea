@@ -283,10 +283,140 @@ licenseUpdaterQueue = queue.CreateUniqueQueue(
 )
 ```
 
-**队列触发场景**：
-1. 仓库推送后：`services/repository/migrate.go:172`
-2. 镜像同步后：`services/mirror/mirror_pull.go:420`
-3. 定时同步：`services/repository/license.go:94-115` 的 `SyncRepoLicenses`
+**队列触发场景**（共6个入口点）：
+
+| 场景 | 代码位置 | 触发条件 |
+|------|---------|---------|
+| 迁移导入 | `services/repository/migrate.go:171` | 迁移完成后无条件触发 |
+| 镜像同步 | `services/mirror/mirror_pull.go:417` | 镜像拉取完成后触发 |
+| 定时任务 | `services/repository/license.go:106` | 默认禁用，每年运行一次 |
+| 默认分支变更(API) | `services/repository/branch.go:737` | 变更默认分支后，非空仓库触发 |
+| 默认分支变更(Private API) | `routers/private/default_branch.go:38` | Git钩子调用变更默认分支后触发 |
+| 仓库编辑(API) | `routers/api/v1/repo/repo.go:734` | 编辑仓库时默认分支变更后触发 |
+| 默认分支Push | `routers/private/hook_post_receive.go:275` | Push到默认分支时触发 |
+
+#### 2.2.4.1 许可证更新队列入口点完整分析
+
+**入口点1：迁移导入
+- **文件**：`services/repository/migrate.go:170-173`
+- **触发条件**：迁移完成后，无论是否为镜像，无条件触发
+- **代码**：
+```go
+// Update repo license
+if err := AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{RepoID: repo.ID}); err != nil {
+    log.Error("Failed to add repo to license updater queue: %v", err)
+}
+```
+
+**入口点2：镜像同步
+- **文件**：`services/mirror/mirror_pull.go:416-422`
+- **触发条件**：镜像拉取完成后，无论仓库是否为空，无条件触发
+- **代码**：
+```go
+// Update License
+if err = repo_service.AddRepoToLicenseUpdaterQueue(&repo_service.LicenseUpdaterOptions{
+    RepoID: m.Repo.ID,
+}); err != nil {
+    log.Error("SyncMirrors [repo: %-v]: unable to add repo to license updater queue: %v", m.Repo, err)
+    return false
+}
+```
+
+**入口点3：定时任务
+- **文件**：`services/repository/license.go:104-107` + `services/cron/tasks_basic.go:159-167`
+- **触发条件**：默认禁用（`Enabled: false`），调度周期为 `@annually`（每年一次），不随 `registerSyncRepoLicenses()` 注册
+- **代码**：
+```go
+// SyncRepoLicenses 内部遍历所有非空、非镜像仓库，逐个加入队列
+return AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{RepoID: repo.ID})
+
+// 定时任务注册
+func registerSyncRepoLicenses() {
+    RegisterTaskFatal("sync_repo_licenses", &BaseConfig{
+        Enabled:    false,   // 默认禁用！
+        RunAtStart: false,
+        Schedule:   "@annually",  // 每年一次
+    }, func(ctx context.Context, _ *user_model.User, config Config) error {
+        return repo_service.SyncRepoLicenses(ctx)
+    })
+}
+```
+
+**入口点4：默认分支变更(API)
+- **文件**：`services/repository/branch.go:736-742`
+- **触发条件**：通过 API 变更默认分支后，仓库非空时触发
+- **代码**：
+```go
+if !repo.IsEmpty {
+    if err := AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{
+        RepoID: repo.ID,
+    }); err != nil {
+        log.Error("AddRepoToLicenseUpdaterQueue: %v", err)
+    }
+}
+```
+
+**入口点5：默认分支变更(Private API)
+- **文件**：`routers/private/default_branch.go:38-45`
+- **触发条件**：通过 Git 钩子调用 Private API 变更默认分支后，无条件触发（无论仓库是否为空）
+- **代码**：
+```go
+if err := repo_service.AddRepoToLicenseUpdaterQueue(&repo_service.LicenseUpdaterOptions{
+    RepoID: ctx.Repo.Repository.ID,
+}); err != nil {
+    ctx.JSON(http.StatusInternalServerError, private.Response{
+        Err: fmt.Sprintf("Unable to set default branch on repository: %s/%s Error: %v", ownerName, repoName, err),
+    })
+    return
+}
+```
+
+**入口点6：仓库编辑(API)
+- **文件**：`routers/api/v1/repo/repo.go:716-740`
+- **触发条件**：编辑仓库设置时，默认分支发生变更且仓库非空时触发
+- **代码**：
+```go
+updateRepoLicense := false
+if opts.DefaultBranch != nil && repo.DefaultBranch != *opts.DefaultBranch && (repo.IsEmpty || gitrepo.IsBranchExist(ctx, ctx.Repo.Repository, *opts.DefaultBranch)) {
+    repo.DefaultBranch = *opts.DefaultBranch
+    if !repo.IsEmpty {
+        if err := gitrepo.SetDefaultBranch(ctx, repo, repo.DefaultBranch); err != nil {
+            ctx.APIErrorInternal(err)
+            return err
+        }
+        updateRepoLicense = true
+    }
+}
+// ... 保存仓库 ...
+if updateRepoLicense {
+    if err := repo_service.AddRepoToLicenseUpdaterQueue(&repo_service.LicenseUpdaterOptions{
+        RepoID: ctx.Repo.Repository.ID,
+    }); err != nil {
+        ctx.APIErrorInternal(err)
+        return err
+    }
+}
+```
+
+**入口点7：默认分支Push
+- **文件**：`routers/private/hook_post_receive.go:274-280`
+- **触发条件**：Git 接收后，当推送分支为默认分支时触发
+- **代码**：
+```go
+branch := refFullName.BranchName()
+if branch == baseRepo.DefaultBranch {
+    if err := repo_service.AddRepoToLicenseUpdaterQueue(&repo_service.LicenseUpdaterOptions{
+        RepoID: repo.ID,
+    }); err != nil {
+        ctx.JSON(http.StatusInternalServerError, private.Response{Err: err.Error()})
+        return
+    }
+}
+```
+
+> **⚠️ 错误修正说明**：原文档中"仓库推送后：`services/repository/migrate.go:172` 是错误的，该位置实际是**迁移导入**的触发点，不是代码推送的触发点在 `routers/private/hook_post_receive.go:275`。
+
+---
 
 #### 2.2.5 检测执行流程
 
@@ -504,7 +634,167 @@ type SearchRepoOptions struct {
 }
 ```
 
-### 3.2 话题搜索实现
+### 3.2 搜索执行路径与SQL结构
+
+仓库搜索采用 **"以repository为基表，叠加topic/language等子查询进行过滤"** 的架构。
+
+#### 3.2.1 整体执行流程
+
+`SearchRepository` 函数 (`models/repo/repo_list.go:561-564`)：
+```go
+func SearchRepository(ctx context.Context, opts SearchRepoOptions) (RepositoryList, int64, error) {
+    cond := SearchRepositoryCondition(opts)  // 构建过滤条件
+    return SearchRepositoryByCondition(ctx, opts, cond, true)
+}
+```
+
+`SearchRepositoryByCondition` 函数 (`models/repo/repo_list.go:572-598`)：
+```go
+func SearchRepositoryByCondition(ctx context.Context, opts SearchRepoOptions, cond builder.Cond, loadAttributes bool) (RepositoryList, int64, error) {
+    // 1. 执行查询（以repository为基表）
+    sess, count, err := searchRepositoryByCondition(ctx, opts, cond)
+    
+    // 2. 查询结果仅包含repository表字段
+    repos := make(RepositoryList, 0, defaultSize)
+    if err := sess.Find(&repos); err != nil {
+        return nil, 0, fmt.Errorf("Repo: %w", err)
+    }
+    
+    // 3. 加载关联属性（Owners + LanguageStats）
+    if loadAttributes {
+        if err := repos.LoadAttributes(ctx); err != nil {
+            return nil, 0, fmt.Errorf("LoadAttributes: %w", err)
+        }
+    }
+    return repos, count, nil
+}
+```
+
+#### 3.2.2 SQL 结构分析
+
+`searchRepositoryByCondition` 函数 (`models/repo/repo_list.go:600-640`) 核心逻辑：
+```go
+sess := db.GetEngine(ctx)
+
+// 先 COUNT
+count, err = sess.Where(cond).Count(new(Repository))
+
+// 再查询 + 分页
+sess = sess.Where(cond).OrderBy(orderBy.String(), args...)
+sess = sess.Limit(opts.PageSize, (page-1)*opts.PageSize)
+```
+
+生成的 SQL 伪代码：
+```sql
+-- 基表：repository
+SELECT * FROM repository
+
+-- 叠加权限过滤
+WHERE is_private = false 
+  AND owner_id NOT IN (SELECT id FROM user WHERE visibility IN ('limited', 'private'))
+
+-- 叠加 topic 子查询
+  AND id IN (
+    SELECT repo_topic.repo_id FROM repo_topic
+    INNER JOIN topic ON topic.id = repo_topic.topic_id
+    WHERE topic.name LIKE '%keyword%'
+    GROUP BY repo_topic.repo_id
+  )
+
+-- 叠加 language 子查询
+  AND id IN (
+    SELECT repo_id FROM language_stat
+    WHERE language = 'Go' AND is_primary = true
+  )
+
+-- 叠加其他子查询
+  AND id IN (SELECT repo_id FROM star WHERE uid = ?)  -- starredBy
+  AND id IN (SELECT repo_id FROM watch WHERE user_id = ?)  -- watchedBy
+  AND id IN (SELECT team_repo.repo_id FROM team_repo WHERE team_repo.team_id = ?)  -- team
+
+-- 排序 + 分页
+ORDER BY ... LIMIT ? OFFSET ?
+```
+
+**子查询叠加顺序**（`SearchRepositoryCondition` 函数）：
+1. 权限过滤（`Private`/`AllPublic`/`AllLimited`）
+2. 属性过滤（`IsPrivate`/`Template`/`Fork`/`Mirror`/`Archived`）
+3. 关联过滤（`StarredByID`/`WatchedByID`/`OwnerID`/`TeamID`）
+4. **Topic 过滤**（`Keyword` + `TopicOnly`）
+5. **Language 过滤**（`Language`）
+6. 其他过滤（`OnlyShowRelevant`/`HasMilestones`）
+
+#### 3.2.3 LoadAttributes 边界
+
+`RepositoryList.LoadAttributes` 函数 (`models/repo/repo_list.go:145-151`)：
+```go
+func (repos RepositoryList) LoadAttributes(ctx context.Context) error {
+    if err := repos.LoadOwners(ctx); err != nil {  // 批量加载所有者
+        return err
+    }
+    return repos.LoadLanguageStats(ctx)  // 批量加载语言统计
+}
+```
+
+> **关键边界**：`LoadAttributes` **不加载 Licenses**，Licenses 的读取延迟到 `convert.ToRepo` 中执行，导致 N+1 查询问题。
+
+---
+
+### 3.3 结果组装边界
+
+搜索结果的组装分为三个清晰的边界阶段：
+
+#### 3.3.1 阶段1：数据查询（Repository 层）
+
+**边界入口**：`repo_model.SearchRepository(ctx, opts)` → `routers/api/v1/repo/repo.go:194`
+```go
+repos, count, err := repo_model.SearchRepository(ctx, opts)
+```
+
+**输出**：`RepositoryList`，仅包含：
+- `repository` 表所有字段（含 `topics` JSON 冗余字段）
+- 通过 `LoadAttributes` 加载的 `Owner` 和 `LanguageStats`
+
+**不包含**：Licenses 信息
+
+#### 3.3.2 阶段2：API 层循环处理
+
+**边界入口**：`routers/api/v1/repo/repo.go:203-220`
+```go
+results := make([]*api.Repository, len(repos))
+for i, repo := range repos {
+    // 2a: 加载 Owner（注意：LoadAttributes 已加载，此处重复加载？）
+    if err = repo.LoadOwner(ctx); err != nil { ... }
+    
+    // 2b: 查询权限
+    permission, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
+    
+    // 2c: 转换为 API 结构（此处才读取 Licenses）
+    results[i] = convert.ToRepo(ctx, repo, permission)
+}
+```
+
+#### 3.3.3 阶段3：ToRepo 转换（Convert 层）
+
+**边界入口**：`convert.ToRepo` → `services/convert/repository.go:188-264`
+```go
+func innerToRepo(...) *api.Repository {
+    // ... 其他字段处理
+    
+    // ✅ Topics：直接读取 repository.topics 冗余字段（无额外查询）
+    Topics: util.SliceNilAsEmpty(repo.Topics),
+    
+    // ❌ Licenses：每个仓库一次额外查询（N+1 问题）
+    repoLicenses, err := repo_model.GetRepoLicenses(ctx, repo)
+    Licenses: util.SliceNilAsEmpty(repoLicenses.StringList()),
+}
+```
+
+**性能瓶颈**：每页 50 个结果 → 50 次额外的 Licenses 查询
+
+---
+
+### 3.4 话题搜索实现
 
 `SearchRepositoryCondition` 函数 (`models/repo/repo_list.go:456-492`) 中的话题搜索逻辑：
 
@@ -551,7 +841,7 @@ if opts.Keyword != "" {
 3. **子查询优化**：通过 `repo_topic` 和 `topic` 关联表查询匹配的仓库ID
 4. **结果合并**：非 TopicOnly 模式下，结果合并仓库名称和描述匹配
 
-### 3.3 "仅显示相关" 过滤器
+### 3.5 "仅显示相关" 过滤器
 
 `OnlyShowRelevant` 选项 (`models/repo/repo_list.go:533-554`)：
 
@@ -581,7 +871,7 @@ if opts.OnlyShowRelevant {
 
 **注意**：PostgreSQL 和其他数据库使用不同的 JSON 字段检查语法。
 
-### 3.4 话题搜索 API
+### 3.6 话题搜索 API
 
 独立的话题搜索接口 (`routers/api/v1/repo/topic.go:258-306`)：
 
@@ -613,11 +903,11 @@ func (opts *FindTopicOptions) ToConds() builder.Cond {
 
 ---
 
-### 3.5 SearchRepository 结果组装时许可字段读取流程
+### 3.7 SearchRepository 结果组装时许可字段读取流程
 
 搜索结果组装时，**Topics 字段从冗余字段直接读取，Licenses 字段需要额外查询数据库**。
 
-#### 3.5.1 API 层搜索入口
+#### 3.7.1 API 层搜索入口
 
 `Search` 函数 (`routers/api/v1/repo/repo.go:46-227`)：
 ```go
@@ -648,7 +938,7 @@ func Search(ctx *context.APIContext) {
 }
 ```
 
-#### 3.5.2 ToRepo 转换中的许可字段读取
+#### 3.7.2 ToRepo 转换中的许可字段读取
 
 `ToRepo` 函数 (`services/convert/repository.go:188-264`)：
 ```go
@@ -679,11 +969,11 @@ func innerToRepo(ctx context.Context, repo *repo_model.Repository, permissionInR
 
 ---
 
-### 3.6 许可字段未参与仓库搜索过滤的原因分析
+### 3.8 许可字段未参与仓库搜索过滤的原因分析
 
 **代码入口**：`models/repo/repo_list.go:154-213` (`SearchRepoOptions` 结构定义)
 
-#### 3.6.1 现状：无 License 过滤选项
+#### 3.8.1 现状：无 License 过滤选项
 
 `SearchRepoOptions` 结构中缺少 License 相关字段：
 ```go
@@ -700,7 +990,7 @@ type SearchRepoOptions struct {
 - ✅ 有语言过滤逻辑（`Language` 字段）
 - ❌ 无任何 License 相关过滤逻辑
 
-#### 3.6.2 根本原因分析
+#### 3.8.2 根本原因分析
 
 **原因 1：许可证识别的异步性**
 ```
@@ -730,7 +1020,7 @@ WHERE repo_license.license = 'MIT'
 - 每次查询都需要 JOIN repo_license 表
 - 为了性能而未实现（话题有冗余字段，许可没有）
 
-#### 3.6.3 代码位置总结
+#### 3.8.3 代码位置总结
 
 | 检查点 | 文件路径 | 行号 | 状态 |
 |--------|---------|------|------|
@@ -987,10 +1277,14 @@ type CreateRepoOption struct {
     └─ repo_service.InitLicenseClassifier
         └─ licenseclassifier.NewClassifier(.85) + 加载内置许可证模板
     ↓
-[触发检测]
-    ├─ 代码推送
-    ├─ 镜像同步
-    └─ 定时任务 SyncRepoLicenses
+[触发检测] 共7个入口点
+    ├─ 1. 默认分支Push         → routers/private/hook_post_receive.go:275
+    ├─ 2. 迁移导入             → services/repository/migrate.go:171
+    ├─ 3. 镜像同步             → services/mirror/mirror_pull.go:417
+    ├─ 4. 定时任务             → services/cron/tasks_basic.go:159 (默认禁用)
+    ├─ 5. 默认分支变更(API)    → services/repository/branch.go:737
+    ├─ 6. 默认分支变更(Private)→ routers/private/default_branch.go:38
+    └─ 7. 仓库编辑(API)        → routers/api/v1/repo/repo.go:734
     ↓
 [异步队列] services/repository/license.go
     └─ licenseUpdaterQueue → repoLicenseUpdater
@@ -1011,7 +1305,7 @@ type CreateRepoOption struct {
     ↓
 [展示层]
     ├─ API: GET /repos/{owner}/{repo}/licenses
-    ├─ API: ToRepo() → licenses 字段（需额外查询）
+    ├─ API: ToRepo() → licenses 字段（需额外查询，N+1）
     └─ Web: prepareHomeSidebarLicenses → 侧边栏展示
 ```
 
@@ -1030,13 +1324,16 @@ type CreateRepoOption struct {
 | **数据冗余字段** | `repository.topics`（JSON 数组） | 无冗余字段 |
 | **更新方式** | 同步更新 | 创建仓库：同步写入；代码推送：异步队列 |
 | **搜索过滤** | 支持 TopicOnly 精确匹配 + 模糊匹配 | 不支持搜索过滤 |
+| **搜索SQL结构** | 基表 + topic子查询（INNER JOIN repo_topic+topic） | 不适用 |
 | **搜索结果读取** | 直接读取 repository.topics 字段（高性能） | 额外查询 repo_license 表（N+1 问题） |
+| **LoadAttributes加载** | 无需额外加载（冗余字段） | LoadAttributes不加载，延迟到ToRepo |
 | **未实现搜索的原因** | - | 1. 异步识别非实时 2. 无冗余字段需 JOIN 3. 性能考虑 |
 | **数量限制** | 每仓库最多25个 | 无限制（支持多许可） |
 | **API 接口** | 5个（CRUD + 搜索） | 3个（查询 + 模板） |
 | **性能优化** | topics JSON 冗余字段 | 异步队列处理 |
 | **创建时写入** | SaveTopics 同步写入 | 直接写入 repo_license 表（绕过 Classifier） |
 | **占位符填充** | 不适用 | Owner/Email/Repo/Year 自动替换 |
+| **队列入口点数量** | 不适用 | 7个（迁移/镜像/定时/3个默认分支变更/Push） |
 
 ---
 
@@ -1049,6 +1346,8 @@ type CreateRepoOption struct {
 | **创建时检测** | ✅ 同步验证 | ✅ 同步写入（用户指定） |
 | **推送后检测** | 不适用 | ✅ 异步自动检测 |
 | **性能权衡** | 以存储空间换查询性能 | 以查询性能（N+1）换取实现简单 |
+| **数据一致性** | 同步强一致 | 创建时强一致，推送后异步最终一致 |
+| **定时任务** | 无 | ✅ SyncRepoLicenses（默认禁用，每年一次） |
 
 ---
 
@@ -1060,14 +1359,14 @@ type CreateRepoOption struct {
 | 许可模型 | `models/repo/license.go` | `RepoLicense`, `UpdateRepoLicenses`, `GetRepoLicenses` |
 | 话题API | `routers/api/v1/repo/topic.go` | `ListTopics`, `UpdateTopics`, `AddTopic`, `DeleteTopic`, `TopicSearch` |
 | 许可API | `routers/api/v1/repo/license.go` | `GetLicenses` |
-| 仓库搜索API | `routers/api/v1/repo/repo.go` | `Search`, `CreateUserRepo` |
+| 仓库搜索API | `routers/api/v1/repo/repo.go` | `Search`, `CreateUserRepo`, `Edit` |
 | 话题Web | `routers/web/repo/topic.go` | `TopicsPost` |
 | 话题搜索Web | `routers/web/explore/topic.go` | `TopicSearch` |
-| 许可检测服务 | `services/repository/license.go` | `InitLicenseClassifier`, `detectLicense`, `UpdateRepoLicenses`, `SyncRepoLicenses` |
+| 许可检测服务 | `services/repository/license.go` | `InitLicenseClassifier`, `detectLicense`, `UpdateRepoLicenses`, `SyncRepoLicenses`, `AddRepoToLicenseUpdaterQueue` |
 | 仓库创建服务 | `services/repository/create.go` | `CreateRepositoryDirectly`, `prepareRepoCommit`, `initRepository` |
 | 许可模板处理 | `modules/repository/license.go` | `GetLicense`, `fillLicensePlaceholder`, `LicenseValues` |
 | 仓库主页展示 | `routers/web/repo/view_home.go` | `prepareHomeSidebarRepoTopics`, `prepareHomeSidebarLicenses` |
-| 搜索逻辑 | `models/repo/repo_list.go` | `SearchRepositoryCondition`, `SearchRepoOptions` |
+| 搜索逻辑 | `models/repo/repo_list.go` | `SearchRepository`, `SearchRepositoryCondition`, `SearchRepoOptions`, `SearchRepositoryByCondition`, `searchRepositoryByCondition`, `RepositoryList.LoadAttributes` |
 | 数据转换 | `services/convert/repository.go` | `ToRepo`, `innerToRepo` |
 | 话题转换 | `services/convert/convert.go` | `ToTopicResponse` |
 | API结构体 | `modules/structs/repo_topic.go` | `TopicResponse`, `RepoTopicOptions` |
@@ -1076,3 +1375,9 @@ type CreateRepoOption struct {
 | 路由注册 | `routers/api/v1/api.go` | 话题和许可API路由定义 |
 | 系统初始化 | `routers/init.go` | `InitLicenseClassifier` 调用 |
 | 队列初始化 | `services/repository/repository.go` | `licenseUpdaterQueue` 创建 |
+| 许可证队列入口（迁移） | `services/repository/migrate.go` | `AddRepoToLicenseUpdaterQueue` 调用 |
+| 许可证队列入口（分支变更） | `services/repository/branch.go` | `AddRepoToLicenseUpdaterQueue` 调用 |
+| 许可证队列入口（镜像） | `services/mirror/mirror_pull.go` | `AddRepoToLicenseUpdaterQueue` 调用 |
+| 许可证队列入口（Private API分支变更） | `routers/private/default_branch.go` | `SetDefaultBranch` |
+| 许可证队列入口（Push） | `routers/private/hook_post_receive.go` | `HookPostReceive` |
+| 定时任务注册 | `services/cron/tasks_basic.go` | `registerSyncRepoLicenses` |

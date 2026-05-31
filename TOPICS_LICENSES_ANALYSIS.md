@@ -325,7 +325,108 @@ func UpdateRepoLicenses(ctx context.Context, repo *repo_model.Repository, commit
 }
 ```
 
-### 2.3 数据库更新策略
+### 2.3 创建仓库时许可证参数处理流程
+
+创建仓库时，许可证参数从 API 层到数据库的完整链路：
+
+#### 2.3.1 API 层参数接收
+
+`CreateUserRepo` 函数 (`routers/api/v1/repo/repo.go:229-249`)：
+```go
+func CreateUserRepo(ctx *context.APIContext, owner *user_model.User, opt api.CreateRepoOption) {
+    // ...
+    repo, err := repo_service.CreateRepository(ctx, ctx.Doer, owner, repo_service.CreateRepoOptions{
+        // ...
+        License:          opt.License,  // 许可证参数传递
+        // ...
+    })
+}
+```
+
+#### 2.3.2 服务层参数传递
+
+`CreateRepoOptions` 结构 (`services/repository/create.go:38-57`)：
+```go
+type CreateRepoOptions struct {
+    // ...
+    License          string  // 用户选择的许可证
+    AutoInit         bool    // 是否自动初始化
+    // ...
+}
+```
+
+#### 2.3.3 初始化提交写入 LICENSE 文件
+
+`prepareRepoCommit` 函数 (`services/repository/create.go:126-141`)：
+```go
+// LICENSE
+if len(opts.License) > 0 {
+    // 1. 获取许可证模板并填充占位符
+    data, err = repo_module.GetLicense(opts.License, &repo_module.LicenseValues{
+        Owner: repo.OwnerName,      // 所有者名称
+        Email: authorSig.Email,     // 邮箱
+        Repo:  repo.Name,           // 仓库名称
+        Year:  time.Now().Format("2006"),  // 当前年份
+    })
+    if err != nil {
+        return fmt.Errorf("getLicense[%s]: %w", opts.License, err)
+    }
+
+    // 2. 写入 LICENSE 文件到临时目录
+    if err = os.WriteFile(filepath.Join(tmpDir, "LICENSE"), data, 0o644); err != nil {
+        return fmt.Errorf("write LICENSE: %w", err)
+    }
+}
+```
+
+**许可证模板占位符填充** (`modules/repository/license.go:23-56`)：
+```go
+func GetLicense(name string, values *LicenseValues) ([]byte, error) {
+    data, err := options.License(name)
+    if err != nil {
+        return nil, fmt.Errorf("GetLicense[%s]: %w", name, err)
+    }
+    return fillLicensePlaceholder(name, values, data), nil
+}
+```
+
+支持的占位符包括：
+- `Owner`: `<name of author>`, `<owner>`, `[NAME]` 等
+- `Email`: `[EMAIL]`
+- `Repo`: `<program>` 等
+- `Year`: `<year>`, `[YEAR]`, `{YEAR}` 等
+
+#### 2.3.4 创建仓库时直接写入许可证记录
+
+**关键**：创建仓库时不经过异步队列，直接同步写入数据库！
+
+`CreateRepositoryDirectly` 函数 (`services/repository/create.go:311-325`)：
+```go
+// 6 - update licenses
+var licenses []string
+if len(opts.License) > 0 {
+    licenses = append(licenses, opts.License)
+
+    // 获取当前 HEAD commit ID
+    var stdout string
+    stdout, _, err = gitrepo.RunCmdString(ctx, repo, gitcmd.NewCommand("rev-parse", "HEAD"))
+    if err != nil {
+        log.Error("CreateRepository(git rev-parse HEAD) in %v: Stdout: %s\nError: %v", repo, stdout, err)
+        return nil, fmt.Errorf("CreateRepository(git rev-parse HEAD): %w", err)
+    }
+    
+    // 直接写入 repo_license 表（同步操作）
+    if err = repo_model.UpdateRepoLicenses(ctx, repo, stdout, licenses); err != nil {
+        return nil, err
+    }
+}
+```
+
+> **重要区别**：创建仓库时选择的许可证使用用户指定的 license name 直接写入，**不经过 Google License Classifier 检测**。这与后续推送代码时的自动检测流程不同。
+
+---
+
+### 2.4 数据库更新策略
 
 `UpdateRepoLicenses` 模型函数 (`models/repo/license.go:47-90`)：
 
@@ -509,6 +610,133 @@ func (opts *FindTopicOptions) ToConds() builder.Cond {
     return cond
 }
 ```
+
+---
+
+### 3.5 SearchRepository 结果组装时许可字段读取流程
+
+搜索结果组装时，**Topics 字段从冗余字段直接读取，Licenses 字段需要额外查询数据库**。
+
+#### 3.5.1 API 层搜索入口
+
+`Search` 函数 (`routers/api/v1/repo/repo.go:46-227`)：
+```go
+func Search(ctx *context.APIContext) {
+    // 1. 构建搜索选项
+    opts := repo_model.SearchRepoOptions{
+        ListOptions:        utils.GetListOptions(ctx),
+        Actor:              ctx.Doer,
+        Keyword:            ctx.FormTrim("q"),
+        TopicOnly:          ctx.FormBool("topic"),  // 仅按话题搜索
+        // ... 其他选项
+    }
+
+    // 2. 执行搜索（仅查询 repository 表）
+    repos, count, err := repo_model.SearchRepository(ctx, opts)
+
+    // 3. 结果组装（转换为 API 格式）
+    results := make([]*api.Repository, len(repos))
+    for i, repo := range repos {
+        if err = repo.LoadOwner(ctx); err != nil {
+            // ... 错误处理
+        }
+        permission, err := access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
+        // 关键：调用 ToRepo 进行转换
+        results[i] = convert.ToRepo(ctx, repo, permission)
+    }
+    // ...
+}
+```
+
+#### 3.5.2 ToRepo 转换中的许可字段读取
+
+`ToRepo` 函数 (`services/convert/repository.go:188-264`)：
+```go
+func innerToRepo(ctx context.Context, repo *repo_model.Repository, permissionInRepo access_model.Permission, isParent bool) *api.Repository {
+    // ... 其他字段处理
+
+    // Topics：直接从 repository 表的 JSON 冗余字段读取（性能优化）
+    // 位置: services/convert/repository.go:262
+    Topics: util.SliceNilAsEmpty(repo.Topics),
+
+    // Licenses：需要额外查询 repo_license 表（N+1 查询问题）
+    // 位置: services/convert/repository.go:188-191
+    repoLicenses, err := repo_model.GetRepoLicenses(ctx, repo)
+    if err != nil {
+        return nil
+    }
+    // ...
+    // 位置: services/convert/repository.go:264
+    Licenses: util.SliceNilAsEmpty(repoLicenses.StringList()),
+}
+```
+
+**性能对比**：
+| 字段 | 读取方式 | 性能特点 |
+|------|---------|---------|
+| Topics | `repo.Topics`（JSON 字段） | 单次查询，高性能 |
+| Licenses | `repo_model.GetRepoLicenses(ctx, repo)`（额外查询） | 每个结果一次查询，N+1 性能问题 |
+
+---
+
+### 3.6 许可字段未参与仓库搜索过滤的原因分析
+
+**代码入口**：`models/repo/repo_list.go:154-213` (`SearchRepoOptions` 结构定义)
+
+#### 3.6.1 现状：无 License 过滤选项
+
+`SearchRepoOptions` 结构中缺少 License 相关字段：
+```go
+type SearchRepoOptions struct {
+    // ... 现有字段
+    TopicOnly bool          // ✅ 支持按话题过滤
+    Language string         // ✅ 支持按语言过滤
+    // License 字段缺失 ❌
+}
+```
+
+`SearchRepositoryCondition` 函数（`models/repo/repo_list.go:369-557`）中：
+- ✅ 有话题搜索逻辑（`TopicOnly` 模式）
+- ✅ 有语言过滤逻辑（`Language` 字段）
+- ❌ 无任何 License 相关过滤逻辑
+
+#### 3.6.2 根本原因分析
+
+**原因 1：许可证识别的异步性**
+```
+代码推送 → 异步队列（licenseUpdaterQueue）→ Google Classifier 检测 → 写入 repo_license 表
+```
+- 许可证识别是**异步**的，不是实时的
+- 搜索时许可证信息可能尚未更新
+- 基于异步数据的过滤可能导致结果不一致
+
+**原因 2：数据存储结构的性能问题**
+
+- **Topics**：`repository.topics` JSON 冗余字段 → 可直接过滤
+- **Licenses**：存储在独立 `repo_license` 表 → 需要 JOIN 查询
+
+如果要实现 License 过滤，SQL 会是这样：
+```sql
+SELECT * FROM repository
+INNER JOIN repo_license ON repository.id = repo_license.repo_id
+WHERE repo_license.license = 'MIT'
+```
+- JOIN 查询影响搜索性能
+- 多许可证场景需要 DISTINCT 或 GROUP BY，进一步降低性能
+
+**原因 3：缺少冗余字段设计**
+
+- Repository 表中没有 `licenses` JSON 冗余字段
+- 每次查询都需要 JOIN repo_license 表
+- 为了性能而未实现（话题有冗余字段，许可没有）
+
+#### 3.6.3 代码位置总结
+
+| 检查点 | 文件路径 | 行号 | 状态 |
+|--------|---------|------|------|
+| SearchRepoOptions 结构 | `models/repo/repo_list.go` | 154-213 | 无 License 字段 |
+| SearchRepositoryCondition 函数 | `models/repo/repo_list.go` | 369-557 | 无 License 过滤逻辑 |
+| API Search 函数参数 | `routers/api/v1/repo/repo.go` | 46-134 | 无 license 查询参数 |
 
 ---
 
@@ -728,6 +956,30 @@ type CreateRepoOption struct {
 
 ### 5.2 许可信息完整链路
 
+许可信息有两条独立的进入路径：**创建仓库时的同步写入** 和 **代码推送后的异步检测**。
+
+#### 5.2.1 创建仓库时的同步写入链路
+
+```
+用户创建仓库（选择许可证）
+    ↓
+[API层] routers/api/v1/repo/repo.go CreateUserRepo
+    └─ 接收 api.CreateRepoOption.License 参数
+    ↓
+[服务层] services/repository/create.go CreateRepositoryDirectly
+    ├─ prepareRepoCommit
+    │   ├─ repo_module.GetLicense(licenseName)  // 获取模板+填充占位符
+    │   │   └─ fillLicensePlaceholder(Owner/Email/Repo/Year)
+    │   └─ os.WriteFile("LICENSE")  // 写入临时目录
+    ├─ initRepoCommit  // 执行初始化提交
+    └─ 步骤6：同步写入 repo_license 表
+        ├─ git rev-parse HEAD  // 获取提交ID
+        └─ repo_model.UpdateRepoLicenses(ctx, repo, commitID, [license])
+            └─ 直接写入，不经过 Classifier 检测！
+```
+
+#### 5.2.2 代码推送后的异步检测链路
+
 ```
 系统启动
     ↓
@@ -745,7 +997,7 @@ type CreateRepoOption struct {
         ↓
 [检测层] services/repository/license.go
     ├─ UpdateRepoLicenses
-    │   ├─ GetBlobByPath("LICENSE")
+    │   ├─ GetBlobByPath("LICENSE")  // 读取 Git 仓库文件
     │   ├─ detectLicense (调用 google classifier)
     │   └─ repo_model.UpdateRepoLicenses
     └─ detectLicense
@@ -759,9 +1011,11 @@ type CreateRepoOption struct {
     ↓
 [展示层]
     ├─ API: GET /repos/{owner}/{repo}/licenses
-    ├─ API: ToRepo() → licenses 字段
+    ├─ API: ToRepo() → licenses 字段（需额外查询）
     └─ Web: prepareHomeSidebarLicenses → 侧边栏展示
 ```
+
+> **重要区别**：创建仓库时使用用户指定的 license name 直接写入；推送后使用 Google Classifier 自动检测。两者可能不一致！
 
 ---
 
@@ -773,11 +1027,28 @@ type CreateRepoOption struct {
 | **归一化策略** | 小写转换、去空、去重 | 自动检测，无需归一化 |
 | **识别技术** | 规则匹配（正则） | Google License Classifier v2，阈值0.85 |
 | **数据存储** | Topic + RepoTopic（多对多）+ repository.topics 冗余 | RepoLicense（联合唯一索引） |
-| **更新方式** | 同步更新 | 异步队列（避免阻塞） |
-| **搜索实现** | 子查询 JOIN + 精确/模糊匹配 | 暂不支持搜索过滤 |
+| **数据冗余字段** | `repository.topics`（JSON 数组） | 无冗余字段 |
+| **更新方式** | 同步更新 | 创建仓库：同步写入；代码推送：异步队列 |
+| **搜索过滤** | 支持 TopicOnly 精确匹配 + 模糊匹配 | 不支持搜索过滤 |
+| **搜索结果读取** | 直接读取 repository.topics 字段（高性能） | 额外查询 repo_license 表（N+1 问题） |
+| **未实现搜索的原因** | - | 1. 异步识别非实时 2. 无冗余字段需 JOIN 3. 性能考虑 |
 | **数量限制** | 每仓库最多25个 | 无限制（支持多许可） |
 | **API 接口** | 5个（CRUD + 搜索） | 3个（查询 + 模板） |
 | **性能优化** | topics JSON 冗余字段 | 异步队列处理 |
+| **创建时写入** | SaveTopics 同步写入 | 直接写入 repo_license 表（绕过 Classifier） |
+| **占位符填充** | 不适用 | Owner/Email/Repo/Year 自动替换 |
+
+---
+
+### 6.1 两个重要的设计决策对比
+
+| 设计决策 | 话题标签 | 许可信息 |
+|---------|---------|---------|
+| **冗余字段设计** | ✅ 有（repository.topics） | ❌ 无 |
+| **搜索过滤支持** | ✅ 支持 | ❌ 不支持 |
+| **创建时检测** | ✅ 同步验证 | ✅ 同步写入（用户指定） |
+| **推送后检测** | 不适用 | ✅ 异步自动检测 |
+| **性能权衡** | 以存储空间换查询性能 | 以查询性能（N+1）换取实现简单 |
 
 ---
 
@@ -789,15 +1060,18 @@ type CreateRepoOption struct {
 | 许可模型 | `models/repo/license.go` | `RepoLicense`, `UpdateRepoLicenses`, `GetRepoLicenses` |
 | 话题API | `routers/api/v1/repo/topic.go` | `ListTopics`, `UpdateTopics`, `AddTopic`, `DeleteTopic`, `TopicSearch` |
 | 许可API | `routers/api/v1/repo/license.go` | `GetLicenses` |
+| 仓库搜索API | `routers/api/v1/repo/repo.go` | `Search`, `CreateUserRepo` |
 | 话题Web | `routers/web/repo/topic.go` | `TopicsPost` |
 | 话题搜索Web | `routers/web/explore/topic.go` | `TopicSearch` |
 | 许可检测服务 | `services/repository/license.go` | `InitLicenseClassifier`, `detectLicense`, `UpdateRepoLicenses`, `SyncRepoLicenses` |
+| 仓库创建服务 | `services/repository/create.go` | `CreateRepositoryDirectly`, `prepareRepoCommit`, `initRepository` |
+| 许可模板处理 | `modules/repository/license.go` | `GetLicense`, `fillLicensePlaceholder`, `LicenseValues` |
 | 仓库主页展示 | `routers/web/repo/view_home.go` | `prepareHomeSidebarRepoTopics`, `prepareHomeSidebarLicenses` |
 | 搜索逻辑 | `models/repo/repo_list.go` | `SearchRepositoryCondition`, `SearchRepoOptions` |
-| 数据转换 | `services/convert/repository.go` | `ToRepo` |
+| 数据转换 | `services/convert/repository.go` | `ToRepo`, `innerToRepo` |
 | 话题转换 | `services/convert/convert.go` | `ToTopicResponse` |
 | API结构体 | `modules/structs/repo_topic.go` | `TopicResponse`, `RepoTopicOptions` |
-| 仓库结构体 | `modules/structs/repo.go` | `Repository.Topics`, `Repository.Licenses` |
+| 仓库结构体 | `modules/structs/repo.go` | `Repository.Topics`, `Repository.Licenses`, `CreateRepoOption.License` |
 | 许可模板 | `modules/options/base.go` | `License()` |
 | 路由注册 | `routers/api/v1/api.go` | 话题和许可API路由定义 |
 | 系统初始化 | `routers/init.go` | `InitLicenseClassifier` 调用 |

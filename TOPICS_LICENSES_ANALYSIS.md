@@ -758,10 +758,10 @@ func SearchRepository(ctx context.Context, opts SearchRepoOptions) (RepositoryLi
 `SearchRepositoryByCondition` 函数 (`models/repo/repo_list.go:572-598`)：
 ```go
 func SearchRepositoryByCondition(ctx context.Context, opts SearchRepoOptions, cond builder.Cond, loadAttributes bool) (RepositoryList, int64, error) {
-    // 1. 执行查询（以repository为基表）
+    // 1. 执行查询（以 repository 为基表，并叠加 topic/language 子查询进行过滤）
     sess, count, err := searchRepositoryByCondition(ctx, opts, cond)
     
-    // 2. 查询结果仅包含repository表字段
+    // 2. 结果集包含 repository 表字段（子查询仅用于 WHERE 过滤，不扩展结果列）
     repos := make(RepositoryList, 0, defaultSize)
     if err := sess.Find(&repos); err != nil {
         return nil, 0, fmt.Errorf("Repo: %w", err)
@@ -831,7 +831,74 @@ ORDER BY ... LIMIT ? OFFSET ?
 5. **Language 过滤**（`Language`）
 6. 其他过滤（`OnlyShowRelevant`/`HasMilestones`）
 
-#### 3.2.3 LoadAttributes 边界
+---
+
+#### 3.2.3 三层职责代码证据对照
+
+搜索执行路径分为三层，各层职责清晰，**以 repository 为基表，并叠加 topic/language 子查询进行过滤**是贯穿全链路的统一执行模型：
+
+| 层级 | 职责 | 代码证据 | 与基表关系 |
+|------|------|---------|-----------|
+| **条件构建层** | 组装所有过滤条件，构建子查询 | `SearchRepositoryCondition(opts)` → `builder.Cond` | 生成 `id IN (SELECT repo_id FROM repo_topic JOIN topic ...)` 形式的子查询条件 |
+| **查询执行层** | 以 repository 为基表执行查询 | `searchRepositoryByCondition()` → `sess.Where(cond).Find(&repos)` | `SELECT * FROM repository WHERE <cond>`，cond 中包含 topic/language 子查询 |
+| **结果组装层** | 加载关联数据，转换为 API 格式 | `repos.LoadAttributes()` → `ToRepo()` → `GetRepoLicenses()` | 结果集仅含 repository 表字段，Licenses 等额外数据需后续查询 |
+
+**代码证据1：条件构建层（生成子查询）**
+```go
+// models/repo/repo_list.go:456-492
+func SearchRepositoryCondition(opts SearchRepoOptions) builder.Cond {
+    // ...
+    // Topic 过滤：生成子查询
+    subQuery := builder.Select("repo_topic.repo_id").From("repo_topic").
+        Join("INNER", "topic", "topic.id = repo_topic.topic_id").
+        Where(subQueryCond).GroupBy("repo_topic.repo_id")
+    cond = cond.And(builder.In("id", subQuery))  // 叠加到基表查询条件
+    
+    // Language 过滤：生成子查询
+    cond = cond.And(builder.In("id", 
+        builder.Select("repo_id").From("language_stat").
+            Where(builder.Eq{"language": opts.Language, "is_primary": true})))
+}
+```
+
+**代码证据2：查询执行层（以 repository 为基表执行）**
+```go
+// models/repo/repo_list.go:600-640
+func searchRepositoryByCondition(ctx context.Context, opts SearchRepoOptions, cond builder.Cond) (xorm.Session, int64, error) {
+    sess := db.GetEngine(ctx)
+    // 基表：repository
+    count, err = sess.Where(cond).Count(new(Repository))  // COUNT 带子查询条件
+    sess = sess.Where(cond).OrderBy(orderBy.String()).Limit(...)
+    return sess, count, nil  // sess 已绑定 repository 表和所有子查询条件
+}
+```
+
+**代码证据3：结果组装层（后续加载额外数据）**
+```go
+// models/repo/repo_list.go:585-598
+func SearchRepositoryByCondition(...) {
+    sess, count, err := searchRepositoryByCondition(ctx, opts, cond)
+    // 结果集仅含 repository 表字段
+    repos := make(RepositoryList, 0, defaultSize)
+    if err := sess.Find(&repos); err != nil { ... }  // SELECT * FROM repository WHERE ...
+    
+    // LoadAttributes 批量加载 Owners 和 LanguageStats
+    if loadAttributes {
+        if err := repos.LoadAttributes(ctx); err != nil { ... }
+    }
+    return repos, count, nil
+}
+```
+
+> **一致性说明**：
+> - "以 repository 为基表"：查询执行层的 `FROM repository` 决定
+> - "叠加 topic/language 子查询过滤"：条件构建层生成 `IN (subquery)`，查询执行层通过 `WHERE cond` 应用
+> - 结果集仅含 repository 表字段是正常的，因为子查询只用于过滤，不用于扩展结果列
+> - 全文不再出现"仅查询 repository 表"等可能产生歧义的表述，统一使用标准描述
+
+---
+
+#### 3.2.4 LoadAttributes 边界
 
 `RepositoryList.LoadAttributes` 函数 (`models/repo/repo_list.go:145-151`)：
 ```go
@@ -855,14 +922,15 @@ func (repos RepositoryList) LoadAttributes(ctx context.Context) error {
 
 **边界入口**：`repo_model.SearchRepository(ctx, opts)` → `routers/api/v1/repo/repo.go:194`
 ```go
+// 执行搜索：以 repository 为基表，并叠加 topic/language 子查询进行过滤
 repos, count, err := repo_model.SearchRepository(ctx, opts)
 ```
 
-**输出**：`RepositoryList`，仅包含：
+**输出**：`RepositoryList`，包含：
 - `repository` 表所有字段（含 `topics` JSON 冗余字段）
-- 通过 `LoadAttributes` 加载的 `Owner` 和 `LanguageStats`
+- 通过 `LoadAttributes` 批量加载的 `Owner` 和 `LanguageStats`
 
-**不包含**：Licenses 信息
+**不包含**：Licenses 信息（需在 ToRepo 转换阶段单独查询）
 
 #### 3.3.2 阶段2：API 层循环处理
 
@@ -1028,7 +1096,7 @@ func Search(ctx *context.APIContext) {
         // ... 其他选项
     }
 
-    // 2. 执行搜索（仅查询 repository 表）
+    // 2. 执行搜索（以 repository 为基表，并叠加 topic/language 子查询进行过滤）
     repos, count, err := repo_model.SearchRepository(ctx, opts)
 
     // 3. 结果组装（转换为 API 格式）

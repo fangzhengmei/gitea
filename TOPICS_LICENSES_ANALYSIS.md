@@ -283,34 +283,42 @@ licenseUpdaterQueue = queue.CreateUniqueQueue(
 )
 ```
 
-**队列触发场景**（共6个入口点）：
+**队列触发场景**（共7个入口点）：
 
-| 场景 | 代码位置 | 触发条件 |
-|------|---------|---------|
-| 迁移导入 | `services/repository/migrate.go:171` | 迁移完成后无条件触发 |
-| 镜像同步 | `services/mirror/mirror_pull.go:417` | 镜像拉取完成后触发 |
-| 定时任务 | `services/repository/license.go:106` | 默认禁用，每年运行一次 |
-| 默认分支变更(API) | `services/repository/branch.go:737` | 变更默认分支后，非空仓库触发 |
-| 默认分支变更(Private API) | `routers/private/default_branch.go:38` | Git钩子调用变更默认分支后触发 |
-| 仓库编辑(API) | `routers/api/v1/repo/repo.go:734` | 编辑仓库时默认分支变更后触发 |
-| 默认分支Push | `routers/private/hook_post_receive.go:275` | Push到默认分支时触发 |
+| # | 场景 | 代码位置 | 调用层触发条件 | 最终过滤位置 |
+|---|------|---------|--------------|-------------|
+| 1 | 迁移导入 | `services/repository/migrate.go:171` | `if !repo.IsEmpty { ... }` 内部 | 调用层（已过滤空仓库） |
+| 2 | 镜像同步 | `services/mirror/mirror_pull.go:417` | 无条件 | 队列处理层（`repoLicenseUpdater` 过滤空仓库） |
+| 3 | 定时任务 | `services/repository/license.go:106` | 遍历所有仓库（`db.Iterate(ctx, nil, ...)`） | 队列处理层（`repoLicenseUpdater` 过滤空仓库） |
+| 4 | 默认分支变更(API) | `services/repository/branch.go:737` | `if !repo.IsEmpty { ... }` 内部 | 调用层（已过滤空仓库） |
+| 5 | 默认分支变更(Private API) | `routers/private/default_branch.go:38` | 无条件 | 队列处理层（`repoLicenseUpdater` 过滤空仓库） |
+| 6 | 仓库编辑(API) | `routers/api/v1/repo/repo.go:734` | `if updateRepoLicense { ... }`（要求 `!repo.IsEmpty`） | 调用层（已过滤空仓库） |
+| 7 | 默认分支Push | `routers/private/hook_post_receive.go:275` | `if branch == baseRepo.DefaultBranch { ... }` 内部 | 调用层（分支检查）+ 队列处理层（空仓库过滤） |
+
+> **⚠️ 事实修正**：原文档"迁移导入：无条件触发"错误，实际在 `if !repo.IsEmpty { ... }` 块内部；原文档数量"6个入口点"与实际7个不符，已修正。
 
 #### 2.2.4.1 许可证更新队列入口点完整分析
 
-**入口点1：迁移导入
+**入口点1：迁移导入**
 - **文件**：`services/repository/migrate.go:170-173`
-- **触发条件**：迁移完成后，无论是否为镜像，无条件触发
+- **调用位置**：在 `if !repo.IsEmpty { ... }` 块内部（line 136）
+- **触发条件**：迁移完成后，仓库非空时触发
 - **代码**：
 ```go
-// Update repo license
-if err := AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{RepoID: repo.ID}); err != nil {
-    log.Error("Failed to add repo to license updater queue: %v", err)
+if !repo.IsEmpty {
+    // ... 其他操作 ...
+    
+    // Update repo license
+    if err := AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{RepoID: repo.ID}); err != nil {
+        log.Error("Failed to add repo to license updater queue: %v", err)
+    }
 }
 ```
 
-**入口点2：镜像同步
+**入口点2：镜像同步**
 - **文件**：`services/mirror/mirror_pull.go:416-422`
-- **触发条件**：镜像拉取完成后，无论仓库是否为空，无条件触发
+- **调用位置**：在 `if !isEmpty { ... }` 块外部（line 414 之后）
+- **触发条件**：镜像拉取完成后，无条件触发（空仓库会在队列处理层被过滤）
 - **代码**：
 ```go
 // Update License
@@ -322,28 +330,41 @@ if err = repo_service.AddRepoToLicenseUpdaterQueue(&repo_service.LicenseUpdaterO
 }
 ```
 
-**入口点3：定时任务
-- **文件**：`services/repository/license.go:104-107` + `services/cron/tasks_basic.go:159-167`
-- **触发条件**：默认禁用（`Enabled: false`），调度周期为 `@annually`（每年一次），不随 `registerSyncRepoLicenses()` 注册
+**入口点3：定时任务**
+- **文件**：`services/repository/license.go:94-115` + `services/cron/tasks_basic.go:159-167`
+- **调用位置**：`db.Iterate(ctx, nil, ...)` 第二个参数为 `nil`，表示遍历**所有仓库**无条件
+- **触发条件**：默认禁用（`Enabled: false`），调度周期为 `@annually`（每年一次）
 - **代码**：
 ```go
-// SyncRepoLicenses 内部遍历所有非空、非镜像仓库，逐个加入队列
-return AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{RepoID: repo.ID})
+// SyncRepoLicenses：遍历所有仓库，无过滤条件
+func SyncRepoLicenses(ctx context.Context) error {
+    if err := db.Iterate(
+        ctx,
+        nil,  // ⚠️ nil 条件：遍历所有仓库
+        func(ctx context.Context, repo *repo_model.Repository) error {
+            return AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{RepoID: repo.ID})
+        },
+    ); err != nil {
+        return err
+    }
+    return nil
+}
 
-// 定时任务注册
+// 定时任务注册：默认禁用，每年一次
 func registerSyncRepoLicenses() {
     RegisterTaskFatal("sync_repo_licenses", &BaseConfig{
-        Enabled:    false,   // 默认禁用！
+        Enabled:    false,   // 默认禁用
         RunAtStart: false,
-        Schedule:   "@annually",  // 每年一次
+        Schedule:   "@annually",
     }, func(ctx context.Context, _ *user_model.User, config Config) error {
         return repo_service.SyncRepoLicenses(ctx)
     })
 }
 ```
 
-**入口点4：默认分支变更(API)
+**入口点4：默认分支变更(API)**
 - **文件**：`services/repository/branch.go:736-742`
+- **调用位置**：在 `if !repo.IsEmpty { ... }` 块内部
 - **触发条件**：通过 API 变更默认分支后，仓库非空时触发
 - **代码**：
 ```go
@@ -356,9 +377,10 @@ if !repo.IsEmpty {
 }
 ```
 
-**入口点5：默认分支变更(Private API)
+**入口点5：默认分支变更(Private API)**
 - **文件**：`routers/private/default_branch.go:38-45`
-- **触发条件**：通过 Git 钩子调用 Private API 变更默认分支后，无条件触发（无论仓库是否为空）
+- **调用位置**：无条件直接调用
+- **触发条件**：通过 Git 钩子调用 Private API 变更默认分支后，无条件触发（空仓库会在队列处理层被过滤）
 - **代码**：
 ```go
 if err := repo_service.AddRepoToLicenseUpdaterQueue(&repo_service.LicenseUpdaterOptions{
@@ -371,20 +393,22 @@ if err := repo_service.AddRepoToLicenseUpdaterQueue(&repo_service.LicenseUpdater
 }
 ```
 
-**入口点6：仓库编辑(API)
+**入口点6：仓库编辑(API)**
 - **文件**：`routers/api/v1/repo/repo.go:716-740`
+- **调用位置**：在 `if updateRepoLicense { ... }` 块内部，`updateRepoLicense` 仅在 `!repo.IsEmpty` 时为 true
 - **触发条件**：编辑仓库设置时，默认分支发生变更且仓库非空时触发
 - **代码**：
 ```go
 updateRepoLicense := false
-if opts.DefaultBranch != nil && repo.DefaultBranch != *opts.DefaultBranch && (repo.IsEmpty || gitrepo.IsBranchExist(ctx, ctx.Repo.Repository, *opts.DefaultBranch)) {
+if opts.DefaultBranch != nil && repo.DefaultBranch != *opts.DefaultBranch && 
+   (repo.IsEmpty || gitrepo.IsBranchExist(ctx, ctx.Repo.Repository, *opts.DefaultBranch)) {
     repo.DefaultBranch = *opts.DefaultBranch
     if !repo.IsEmpty {
         if err := gitrepo.SetDefaultBranch(ctx, repo, repo.DefaultBranch); err != nil {
             ctx.APIErrorInternal(err)
             return err
         }
-        updateRepoLicense = true
+        updateRepoLicense = true  // 仅在非空时设为true
     }
 }
 // ... 保存仓库 ...
@@ -398,9 +422,10 @@ if updateRepoLicense {
 }
 ```
 
-**入口点7：默认分支Push
+**入口点7：默认分支Push**
 - **文件**：`routers/private/hook_post_receive.go:274-280`
-- **触发条件**：Git 接收后，当推送分支为默认分支时触发
+- **调用位置**：在 `if branch == baseRepo.DefaultBranch { ... }` 块内部，无 `repo.IsEmpty` 检查
+- **触发条件**：Git 接收后，当推送分支为默认分支时触发（空仓库会在队列处理层被过滤）
 - **代码**：
 ```go
 branch := refFullName.BranchName()
@@ -414,7 +439,89 @@ if branch == baseRepo.DefaultBranch {
 }
 ```
 
-> **⚠️ 错误修正说明**：原文档中"仓库推送后：`services/repository/migrate.go:172` 是错误的，该位置实际是**迁移导入**的触发点，不是代码推送的触发点在 `routers/private/hook_post_receive.go:275`。
+> **⚠️ 事实修正说明**：
+> 1. 原文档"迁移导入：无条件触发"错误，实际在 `if !repo.IsEmpty { ... }` 块内部
+> 2. 原文档"仓库推送后：`services/repository/migrate.go:172`"错误，该位置是**迁移导入**的触发点，代码推送的真正触发点在 `routers/private/hook_post_receive.go:275`
+> 3. 原文档数量"6个入口点"与实际7个不符，已修正
+
+---
+
+#### 2.2.4.2 SyncRepoLicenses 与 repoLicenseUpdater 职责范围
+
+**职责划分清晰，过滤逻辑在队列处理层**：
+
+| 组件 | 职责 | 过滤逻辑 |
+|------|------|---------|
+| `SyncRepoLicenses` | 遍历所有仓库，将它们加入队列 | ❌ 无过滤（`db.Iterate(ctx, nil, ...)`） |
+| `repoLicenseUpdater` | 队列处理器，执行许可证检测 | ✅ `if repo.IsEmpty { continue }` |
+
+**1. SyncRepoLicenses 职责（生产者）**
+
+文件：`services/repository/license.go:94-115`
+```go
+func SyncRepoLicenses(ctx context.Context) error {
+    // 职责：遍历所有仓库，无过滤
+    // 第二个参数 nil 表示无条件遍历
+    return db.Iterate(ctx, nil, func(ctx context.Context, repo *repo_model.Repository) error {
+        // 直接入队，不做任何过滤
+        return AddRepoToLicenseUpdaterQueue(&LicenseUpdaterOptions{RepoID: repo.ID})
+    })
+}
+```
+
+**设计意图**：作为定时任务入口，不关心仓库状态，只负责全量调度。
+
+**2. repoLicenseUpdater 职责（消费者）**
+
+文件：`services/repository/license.go:62-92`
+```go
+func repoLicenseUpdater(items ...*LicenseUpdaterOptions) []*LicenseUpdaterOptions {
+    ctx := graceful.GetManager().ShutdownContext()
+
+    for _, opts := range items {
+        repo, err := repo_model.GetRepositoryByID(ctx, opts.RepoID)
+        if err != nil {
+            log.Error(...)
+            continue
+        }
+        
+        // ⚠️ 关键：过滤逻辑发生在队列处理层！
+        if repo.IsEmpty {
+            continue  // 跳过空仓库
+        }
+
+        // 打开Git仓库，获取默认分支的最新commit
+        gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+        // ...
+        commit, err := gitRepo.GetBranchCommit(repo.DefaultBranch)
+        // ...
+        
+        // 执行许可证检测和更新
+        if err = UpdateRepoLicenses(ctx, repo, commit); err != nil {
+            log.Error(...)
+        }
+    }
+    return nil
+}
+```
+
+**设计意图**：所有入口点共用同一个过滤逻辑，确保一致性。
+
+**3. 过滤逻辑层级总结**
+
+```
+[调用层] 部分入口点有初步过滤
+    ├─ 迁移导入：if !repo.IsEmpty
+    ├─ 默认分支变更(API)：if !repo.IsEmpty
+    ├─ 仓库编辑(API)：if updateRepoLicense (要求!repo.IsEmpty)
+    ├─ 默认分支Push：if branch == baseRepo.DefaultBranch
+    └─ 镜像同步/定时任务/Private API分支变更：无条件入队
+        ↓
+[队列层] repoLicenseUpdater 统一过滤
+    └─ if repo.IsEmpty { continue }  // 所有入口点最终都会经过这里
+```
+
+> **关键结论**：过滤逻辑最终在 `repoLicenseUpdater` 队列处理层执行，确保即使调用层漏掉检查，空仓库也不会被处理。
 
 ---
 
@@ -833,12 +940,12 @@ if opts.Keyword != "" {
 }
 ```
 
-**搜索逻辑**：
+**搜索逻辑（以 repository 为基表并叠加 topic 子查询过滤）**：
 1. **多标签支持**：关键词按逗号 `,` 分隔
 2. **匹配模式**：
    - `TopicOnly=true`：精确匹配 `topic.name = keyword`
    - `TopicOnly=false`：模糊匹配 `topic.name LIKE %keyword%`
-3. **子查询优化**：通过 `repo_topic` 和 `topic` 关联表查询匹配的仓库ID
+3. **子查询过滤**：以 repository 为基表，通过 `IN (subquery)` 叠加 topic 子查询（INNER JOIN `repo_topic` 和 `topic`）
 4. **结果合并**：非 TopicOnly 模式下，结果合并仓库名称和描述匹配
 
 ### 3.5 "仅显示相关" 过滤器
@@ -1277,17 +1384,18 @@ type CreateRepoOption struct {
     └─ repo_service.InitLicenseClassifier
         └─ licenseclassifier.NewClassifier(.85) + 加载内置许可证模板
     ↓
-[触发检测] 共7个入口点
-    ├─ 1. 默认分支Push         → routers/private/hook_post_receive.go:275
-    ├─ 2. 迁移导入             → services/repository/migrate.go:171
-    ├─ 3. 镜像同步             → services/mirror/mirror_pull.go:417
-    ├─ 4. 定时任务             → services/cron/tasks_basic.go:159 (默认禁用)
-    ├─ 5. 默认分支变更(API)    → services/repository/branch.go:737
-    ├─ 6. 默认分支变更(Private)→ routers/private/default_branch.go:38
-    └─ 7. 仓库编辑(API)        → routers/api/v1/repo/repo.go:734
+[触发检测] 共7个入口点（部分入口点有调用层过滤）
+    ├─ 1. 默认分支Push         → routers/private/hook_post_receive.go:275 (分支检查)
+    ├─ 2. 迁移导入             → services/repository/migrate.go:171 (!repo.IsEmpty)
+    ├─ 3. 镜像同步             → services/mirror/mirror_pull.go:417 (无条件)
+    ├─ 4. 定时任务             → services/cron/tasks_basic.go:159 (默认禁用，遍历所有仓库)
+    ├─ 5. 默认分支变更(API)    → services/repository/branch.go:737 (!repo.IsEmpty)
+    ├─ 6. 默认分支变更(Private)→ routers/private/default_branch.go:38 (无条件)
+    └─ 7. 仓库编辑(API)        → routers/api/v1/repo/repo.go:734 (!repo.IsEmpty)
     ↓
 [异步队列] services/repository/license.go
     └─ licenseUpdaterQueue → repoLicenseUpdater
+        └─ ⚠️ 队列层统一过滤：if repo.IsEmpty { continue }
         ↓
 [检测层] services/repository/license.go
     ├─ UpdateRepoLicenses
@@ -1310,6 +1418,7 @@ type CreateRepoOption struct {
 ```
 
 > **重要区别**：创建仓库时使用用户指定的 license name 直接写入；推送后使用 Google Classifier 自动检测。两者可能不一致！
+> **过滤逻辑**：部分入口点在调用层过滤 `!repo.IsEmpty`，队列层 `repoLicenseUpdater` 统一过滤空仓库。
 
 ---
 
@@ -1324,7 +1433,7 @@ type CreateRepoOption struct {
 | **数据冗余字段** | `repository.topics`（JSON 数组） | 无冗余字段 |
 | **更新方式** | 同步更新 | 创建仓库：同步写入；代码推送：异步队列 |
 | **搜索过滤** | 支持 TopicOnly 精确匹配 + 模糊匹配 | 不支持搜索过滤 |
-| **搜索SQL结构** | 基表 + topic子查询（INNER JOIN repo_topic+topic） | 不适用 |
+| **搜索SQL结构** | 以 repository 为基表，叠加 topic/language 子查询过滤（INNER JOIN repo_topic+topic） | 不适用 |
 | **搜索结果读取** | 直接读取 repository.topics 字段（高性能） | 额外查询 repo_license 表（N+1 问题） |
 | **LoadAttributes加载** | 无需额外加载（冗余字段） | LoadAttributes不加载，延迟到ToRepo |
 | **未实现搜索的原因** | - | 1. 异步识别非实时 2. 无冗余字段需 JOIN 3. 性能考虑 |

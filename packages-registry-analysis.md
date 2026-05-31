@@ -319,38 +319,247 @@ func getStorage(rootCfg ConfigProvider, name, typ string, sec ConfigSection) (*S
 ### 4.1.4 各存储类型配置参数
 
 **本地存储配置**：
-| 参数 | 说明 | 默认值 |
-|-----|------|--------|
-| `STORAGE_TYPE` | 必须为 `local` | `local` |
-| `PATH` | 存储根目录（绝对路径） | `{AppDataPath}/packages/` |
-| `TEMPORARY_PATH` | 临时文件目录 | `{PATH}/tmp` |
+
+**核心配置函数** `getStorageForLocal()` (`modules/setting/storage.go:246-284`)：
+```go
+func getStorageForLocal(targetSec, overrideSec ConfigSection, tp targetSecType, name string) (*Storage, error) {
+    storage := Storage{
+        Type: StorageType(targetSec.Key("STORAGE_TYPE").String()),
+    }
+    
+    // 仅读取 PATH 参数
+    targetPath := ConfigSectionKeyString(targetSec, "PATH", "")
+    
+    // ... 路径计算逻辑 ...
+    
+    if overrideSec == nil {
+        storage.Path = fallbackPath
+    } else {
+        // 覆盖节也仅读取 PATH
+        storage.Path = ConfigSectionKeyString(overrideSec, "PATH", "")
+        // ... 路径计算逻辑 ...
+    }
+    
+    // ⚠️ 注意：未读取 TEMPORARY_PATH 参数
+    // 虽然 Storage 结构体有 TemporaryPath 字段，但此处不解析
+    
+    return &storage, nil
+}
+```
+
+**TemporaryPath 处理链路分析**：
+
+| 环节 | 处理情况 | 代码位置 |
+|-----|---------|---------|
+| 结构体定义 | ✓ 存在 `TemporaryPath` 字段 | `modules/setting/storage.go:85` |
+| 配置解析 | ❌ **未读取** `TEMPORARY_PATH` 参数 | `modules/setting/storage.go:246-284` |
+| 存储初始化 | ✓ 读取 `config.TemporaryPath`，空则使用默认值 | `modules/storage/local.go:38-41` |
+
+**结论**：`TemporaryPath` 虽然在数据结构中定义，但**无法通过配置文件配置**，只能使用默认值。
+
+**NewLocalStorage 初始化逻辑** (`modules/storage/local.go:30-58`)：
+```go
+func NewLocalStorage(ctx context.Context, config *setting.Storage) (ObjectStorage, error) {
+    // 存储根目录
+    storageRoot := util.FilePathJoinAbs(config.Path)
+    
+    // 临时目录：优先使用配置，否则使用 {storageRoot}/tmp
+    storageTmp := config.TemporaryPath
+    if storageTmp == "" {
+        storageTmp = filepath.Join(storageRoot, "tmp")
+    }
+    if !filepath.IsAbs(storageTmp) {
+        return nil, fmt.Errorf("LocalStorage config.TemporaryPath should be an absolute path, but not: %q", config.TemporaryPath)
+    }
+    
+    return &LocalStorage{
+        ctx:    ctx,
+        dir:    storageRoot,
+        tmpdir: storageTmp,
+    }, nil
+}
+```
+
+**本地存储参数表（与代码一致）**：
+
+| 参数 | 配置键名 | 说明 | 默认值 | 可配置 | 代码引用 |
+|-----|---------|------|--------|--------|---------|
+| **STORAGE_TYPE** | `STORAGE_TYPE` | 存储类型，必须为 `local` | `local` | ✓ | `modules/setting/storage.go:248` |
+| **PATH** | `PATH` | 存储根目录（绝对路径）<br>支持目标节和覆盖节双重配置 | `{AppDataPath}/packages/` | ✓ | `modules/setting/storage.go:251,269` |
+| **TemporaryPath** | `TEMPORARY_PATH` | 临时文件目录（用于原子写入） | `{PATH}/tmp` | ❌ | `modules/storage/local.go:38-41` |
+
+**PATH 参数计算逻辑**：
+1. 从**目标节**（targetSec）读取 `PATH`
+2. 从**覆盖节**（overrideSec）读取 `PATH`（优先级更高）
+3. 若均未配置，使用 `filepath.Join(AppDataPath, name)` = `{AppDataPath}/packages/`
+4. 所有相对路径都会转换为绝对路径（基于 `AppDataPath` 或 `targetPath`）
+
+**路径重叠检查** (`modules/setting/storage.go:281`)：
+```go
+checkOverlappedPath("[storage."+name+"].PATH", storage.Path)
+```
+
+**配置示例（仅支持可配置项）** (app.ini)：
+```ini
+# 方案 1：使用全局默认
+[storage]
+STORAGE_TYPE = local
+# PATH 未配置 → 默认 {AppDataPath}/packages/
+
+# 方案 2：全局配置 PATH
+[storage]
+STORAGE_TYPE = local
+PATH = /data/gitea/storage
+# 包存储路径 → /data/gitea/storage/packages/
+
+# 方案 3：包存储独立配置 PATH
+[storage.packages]
+PATH = /data/gitea/packages
+# 包存储路径 → /data/gitea/packages/
+
+# 方案 4：packages 节覆盖 PATH
+[packages]
+STORAGE_TYPE = local
+PATH = /data/my-packages
+# 包存储路径 → /data/my-packages/
+```
+
+> **重要说明**：以上所有方案中，`TEMPORARY_PATH` 均无法通过配置文件修改，始终为 `{PATH}/tmp`。如果需要自定义临时目录，需通过代码修改或环境变量注入。
 
 **MinIO/S3 存储配置**：
-| 参数 | 说明 | 默认值 |
-|-----|------|--------|
-| `STORAGE_TYPE` | 必须为 `minio` | `local` |
-| `MINIO_ENDPOINT` | MinIO 服务器地址 | `localhost:9000` |
-| `MINIO_ACCESS_KEY_ID` | 访问密钥 ID | - |
-| `MINIO_SECRET_ACCESS_KEY` | 秘密访问密钥 | - |
-| `MINIO_BUCKET` | Bucket 名称 | `gitea` |
-| `MINIO_LOCATION` | 区域 | `us-east-1` |
-| `MINIO_BASE_PATH` | 基础路径前缀 | `packages/` |
-| `MINIO_USE_SSL` | 是否使用 SSL | `false` |
-| `MINIO_INSECURE_SKIP_VERIFY` | 跳过证书验证 | `false` |
-| `MINIO_CHECKSUM_ALGORITHM` | 校验算法 | `default` |
-| `MINIO_BUCKET_LOOKUP_TYPE` | Bucket 查找方式 | `auto` |
-| `SERVE_DIRECT` | 是否直接重定向到存储 | `false` |
+
+**核心配置函数** `getStorageForMinio()` (`modules/setting/storage.go:286-313`)：
+```go
+func getStorageForMinio(targetSec, overrideSec ConfigSection, tp targetSecType, name string) (*Storage, error) {
+    var storage Storage
+    storage.Type = StorageType(targetSec.Key("STORAGE_TYPE").String())
+    // 通过 MapTo 批量读取 MinioConfig 所有字段
+    if err := targetSec.MapTo(&storage.MinioConfig); err != nil {
+        return nil, fmt.Errorf("map minio config failed: %v", err)
+    }
+    
+    // 计算 BasePath 默认值
+    var defaultPath string
+    if storage.MinioConfig.BasePath != "" {
+        if tp == targetSecIsStorage || tp == targetSecIsDefault {
+            defaultPath = strings.TrimSuffix(storage.MinioConfig.BasePath, "/") + "/" + name + "/"
+        } else {
+            defaultPath = storage.MinioConfig.BasePath
+        }
+    }
+    if defaultPath == "" {
+        defaultPath = name + "/"
+    }
+    
+    // 覆盖节可覆盖的参数：SERVE_DIRECT, MINIO_BASE_PATH, MINIO_BUCKET
+    if overrideSec != nil {
+        storage.MinioConfig.ServeDirect = ConfigSectionKeyBool(overrideSec, "SERVE_DIRECT", storage.MinioConfig.ServeDirect)
+        storage.MinioConfig.BasePath = ConfigSectionKeyString(overrideSec, "MINIO_BASE_PATH", defaultPath)
+        storage.MinioConfig.Bucket = ConfigSectionKeyString(overrideSec, "MINIO_BUCKET", storage.MinioConfig.Bucket)
+    } else {
+        storage.MinioConfig.BasePath = defaultPath
+    }
+    return &storage, nil
+}
+```
+
+**默认值配置** (`modules/setting/storage.go:104-122`)：
+```go
+func getDefaultStorageSection(rootCfg ConfigProvider) ConfigSection {
+    storageSec := rootCfg.Section(storageSectionName)
+    storageSec.Key("MINIO_ENDPOINT").MustString("localhost:9000")
+    storageSec.Key("MINIO_ACCESS_KEY_ID").MustString("")
+    storageSec.Key("MINIO_SECRET_ACCESS_KEY").MustString("")
+    storageSec.Key("MINIO_BUCKET").MustString("gitea")
+    storageSec.Key("MINIO_LOCATION").MustString("us-east-1")
+    storageSec.Key("MINIO_USE_SSL").MustBool(false)
+    storageSec.Key("MINIO_INSECURE_SKIP_VERIFY").MustBool(false)
+    storageSec.Key("MINIO_CHECKSUM_ALGORITHM").MustString("default")
+    storageSec.Key("MINIO_BUCKET_LOOKUP_TYPE").MustString("auto")
+    // ...
+}
+```
+
+**MinIO/S3 参数表（与代码一致）**：
+
+| 参数 | 配置键名 | 说明 | 默认值 | 可覆盖 | 代码引用 |
+|-----|---------|------|--------|--------|---------|
+| **STORAGE_TYPE** | `STORAGE_TYPE` | 存储类型，必须为 `minio` | `local` | - | `modules/setting/storage.go:288` |
+| **Endpoint** | `MINIO_ENDPOINT` | MinIO/S3 服务器地址 | `localhost:9000` | - | `modules/setting/storage.go:108` |
+| **AccessKeyID** | `MINIO_ACCESS_KEY_ID` | 访问密钥 ID | 空 | - | `modules/setting/storage.go:109` |
+| **SecretAccessKey** | `MINIO_SECRET_ACCESS_KEY` | 秘密访问密钥 | 空 | - | `modules/setting/storage.go:110` |
+| **Bucket** | `MINIO_BUCKET` | Bucket 名称 | `gitea` | ✓ | `modules/setting/storage.go:111,308` |
+| **Location** | `MINIO_LOCATION` | 区域 | `us-east-1` | - | `modules/setting/storage.go:112` |
+| **BasePath** | `MINIO_BASE_PATH` | 基础路径前缀 | `packages/` | ✓ | `modules/setting/storage.go:307` |
+| **UseSSL** | `MINIO_USE_SSL` | 是否使用 SSL | `false` | - | `modules/setting/storage.go:113` |
+| **InsecureSkipVerify** | `MINIO_INSECURE_SKIP_VERIFY` | 跳过证书验证 | `false` | - | `modules/setting/storage.go:114` |
+| **ChecksumAlgorithm** | `MINIO_CHECKSUM_ALGORITHM` | 校验算法 | `default` | - | `modules/setting/storage.go:115` |
+| **BucketLookUpType** | `MINIO_BUCKET_LOOKUP_TYPE` | Bucket 查找方式 | `auto` | - | `modules/setting/storage.go:116` |
+| **ServeDirect** | `SERVE_DIRECT` | 是否直接重定向到存储 | `false` | ✓ | `modules/setting/storage.go:306` |
+
+> **BasePath 计算规则**：
+> - 若 `[storage]` 节配置了 `MINIO_BASE_PATH = /base/`，且目标节类型为全局默认，则包存储路径为 `/base/packages/`
+> - 若未配置 `MINIO_BASE_PATH`，则默认使用 `{name}/` = `packages/`
+> - 覆盖节（如 `[packages]`）可通过 `MINIO_BASE_PATH` 覆盖此值
 
 **Azure Blob 存储配置**：
-| 参数 | 说明 | 默认值 |
-|-----|------|--------|
-| `STORAGE_TYPE` | 必须为 `azureblob` | `local` |
-| `AZURE_BLOB_ENDPOINT` | Azure Blob 端点 | - |
-| `AZURE_BLOB_ACCOUNT_NAME` | 账户名称 | - |
-| `AZURE_BLOB_ACCOUNT_KEY` | 账户密钥 | - |
-| `AZURE_BLOB_CONTAINER` | 容器名称 | `gitea` |
-| `AZURE_BLOB_BASE_PATH` | 基础路径前缀 | `packages/` |
-| `SERVE_DIRECT` | 是否直接重定向到存储 | `false` |
+
+**核心配置函数** `getStorageForAzureBlob()` (`modules/setting/storage.go:315-342`)：
+```go
+func getStorageForAzureBlob(targetSec, overrideSec ConfigSection, tp targetSecType, name string) (*Storage, error) {
+    var storage Storage
+    storage.Type = StorageType(targetSec.Key("STORAGE_TYPE").String())
+    // 通过 MapTo 批量读取 AzureBlobConfig 所有字段
+    if err := targetSec.MapTo(&storage.AzureBlobConfig); err != nil {
+        return nil, fmt.Errorf("map azure blob config failed: %v", err)
+    }
+    
+    // 计算 BasePath 默认值（与 MinIO 逻辑相同）
+    var defaultPath string
+    if storage.AzureBlobConfig.BasePath != "" {
+        if tp == targetSecIsStorage || tp == targetSecIsDefault {
+            defaultPath = strings.TrimSuffix(storage.AzureBlobConfig.BasePath, "/") + "/" + name + "/"
+        } else {
+            defaultPath = storage.AzureBlobConfig.BasePath
+        }
+    }
+    if defaultPath == "" {
+        defaultPath = name + "/"
+    }
+    
+    // 覆盖节可覆盖的参数：SERVE_DIRECT, AZURE_BLOB_BASE_PATH, AZURE_BLOB_CONTAINER
+    if overrideSec != nil {
+        storage.AzureBlobConfig.ServeDirect = ConfigSectionKeyBool(overrideSec, "SERVE_DIRECT", storage.AzureBlobConfig.ServeDirect)
+        storage.AzureBlobConfig.BasePath = ConfigSectionKeyString(overrideSec, "AZURE_BLOB_BASE_PATH", defaultPath)
+        storage.AzureBlobConfig.Container = ConfigSectionKeyString(overrideSec, "AZURE_BLOB_CONTAINER", storage.AzureBlobConfig.Container)
+    } else {
+        storage.AzureBlobConfig.BasePath = defaultPath
+    }
+    return &storage, nil
+}
+```
+
+**默认值配置** (`modules/setting/storage.go:117-121`)：
+```go
+func getDefaultStorageSection(rootCfg ConfigProvider) ConfigSection {
+    storageSec.Key("AZURE_BLOB_ENDPOINT").MustString("")
+    storageSec.Key("AZURE_BLOB_ACCOUNT_NAME").MustString("")
+    storageSec.Key("AZURE_BLOB_ACCOUNT_KEY").MustString("")
+    storageSec.Key("AZURE_BLOB_CONTAINER").MustString("gitea")
+}
+```
+
+**Azure Blob 参数表（与代码一致）**：
+
+| 参数 | 配置键名 | 说明 | 默认值 | 可覆盖 | 代码引用 |
+|-----|---------|------|--------|--------|---------|
+| **STORAGE_TYPE** | `STORAGE_TYPE` | 存储类型，必须为 `azureblob` | `local` | - | `modules/setting/storage.go:317` |
+| **Endpoint** | `AZURE_BLOB_ENDPOINT` | Azure Blob 服务端点 | 空 | - | `modules/setting/storage.go:117` |
+| **AccountName** | `AZURE_BLOB_ACCOUNT_NAME` | 存储账户名称 | 空 | - | `modules/setting/storage.go:118` |
+| **AccountKey** | `AZURE_BLOB_ACCOUNT_KEY` | 存储账户密钥 | 空 | - | `modules/setting/storage.go:119` |
+| **Container** | `AZURE_BLOB_CONTAINER` | 容器名称 | `gitea` | ✓ | `modules/setting/storage.go:120,337` |
+| **BasePath** | `AZURE_BLOB_BASE_PATH` | 基础路径前缀 | `packages/` | ✓ | `modules/setting/storage.go:336` |
+| **ServeDirect** | `SERVE_DIRECT` | 是否直接重定向到存储 | `false` | ✓ | `modules/setting/storage.go:335` |
 
 **MinIO 认证链** (`modules/storage/minio.go:164-193`)：
 ```

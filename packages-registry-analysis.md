@@ -195,9 +195,211 @@ func KeyToRelativePath(key BlobHash256Key) string {
 }
 ```
 
-**支持的存储后端**：
+**支持的存储后端**（通过 `RegisterStorageType` 注册机制动态注册）：
 - **本地文件系统** (`modules/storage/local.go`)
 - **MinIO / S3 兼容** (`modules/storage/minio.go`)
+- **Azure Blob Storage** (`modules/storage/azureblob.go`)
+
+**存储类型常量** (`modules/setting/storage.go:17-23`)：
+```go
+const (
+    LocalStorageType     StorageType = "local"
+    MinioStorageType     StorageType = "minio"
+    AzureBlobStorageType StorageType = "azureblob"
+)
+```
+
+### 4.1.1 存储类型注册机制
+
+**动态注册** (`modules/storage/storage.go:32-34`)：
+```go
+var storageMap = map[Type]NewStorageFunc{}
+
+func RegisterStorageType(typ Type, fn NewStorageFunc) {
+    storageMap[typ] = fn
+}
+```
+
+**各存储类型的 init() 注册**：
+- `modules/storage/local.go:175-177`: `RegisterStorageType(setting.LocalStorageType, NewLocalStorage)`
+- `modules/storage/minio.go:320-322`: `RegisterStorageType(setting.MinioStorageType, NewMinioStorage)`
+- `modules/storage/azureblob.go:344-346`: `RegisterStorageType(setting.AzureBlobStorageType, NewAzureBlobStorage)`
+
+### 4.1.2 存储初始化入口
+
+**全局初始化流程** (`modules/storage/storage.go:167-182`)：
+```go
+func Init() error {
+    for _, f := range []func() error{
+        initAttachments,
+        initAvatars,
+        initRepoAvatars,
+        initLFS,
+        initRepoArchives,
+        initPackages,      // 包存储初始化
+        initActions,
+    } {
+        if err := f(); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+**包存储初始化** (`modules/storage/storage.go:235-243`)：
+```go
+func initPackages() (err error) {
+    if !setting.Packages.Enabled {
+        Packages = discardStorage("Packages isn't enabled")
+        return nil
+    }
+    log.Info("Initialising Packages storage with type: %s", setting.Packages.Storage.Type)
+    Packages, err = NewStorage(setting.Packages.Storage.Type, setting.Packages.Storage)
+    return err
+}
+```
+
+**通用存储工厂** (`modules/storage/storage.go:185-195`)：
+```go
+func NewStorage(typStr Type, cfg *setting.Storage) (ObjectStorage, error) {
+    if len(typStr) == 0 {
+        typStr = setting.LocalStorageType
+    }
+    fn, ok := storageMap[typStr]
+    if !ok {
+        return nil, fmt.Errorf("Unsupported storage type: %s", typStr)
+    }
+    return fn(context.Background(), cfg)
+}
+```
+
+### 4.1.3 配置入口与层次化配置
+
+**配置加载入口** (`modules/setting/packages.go:52-66`)：
+```go
+func loadPackagesFrom(rootCfg ConfigProvider) (err error) {
+    sec, _ := rootCfg.GetSection("packages")
+    if sec == nil {
+        Packages.Storage, err = getStorage(rootCfg, "packages", "", nil)
+        return err
+    }
+    if err = sec.MapTo(&Packages); err != nil {
+        return fmt.Errorf("failed to map Packages settings: %v", err)
+    }
+    Packages.Storage, err = getStorage(rootCfg, "packages", "", sec)
+    return err
+}
+```
+
+**层次化配置优先级**（从低到高）：
+1. **全局默认**：`[storage]` 节，默认 `STORAGE_TYPE = local`
+2. **存储类型默认**：`[storage.local]` / `[storage.minio]` / `[storage.azureblob]` 节
+3. **特定存储命名**：`[storage.packages]` 节（可独立配置包存储）
+4. **业务模块配置**：`[packages]` 节中的存储相关配置（覆盖上层）
+
+**配置解析逻辑** (`modules/setting/storage.go:126-149`)：
+```go
+func getStorage(rootCfg ConfigProvider, name, typ string, sec ConfigSection) (*Storage, error) {
+    targetSec, tp, err := getStorageTargetSection(rootCfg, name, typ, sec)
+    overrideSec := getStorageOverrideSection(rootCfg, sec, tp, name)
+    
+    targetType := targetSec.Key("STORAGE_TYPE").String()
+    switch targetType {
+    case string(LocalStorageType):
+        return getStorageForLocal(targetSec, overrideSec, tp, name)
+    case string(MinioStorageType):
+        return getStorageForMinio(targetSec, overrideSec, tp, name)
+    case string(AzureBlobStorageType):
+        return getStorageForAzureBlob(targetSec, overrideSec, tp, name)
+    }
+}
+```
+
+### 4.1.4 各存储类型配置参数
+
+**本地存储配置**：
+| 参数 | 说明 | 默认值 |
+|-----|------|--------|
+| `STORAGE_TYPE` | 必须为 `local` | `local` |
+| `PATH` | 存储根目录（绝对路径） | `{AppDataPath}/packages/` |
+| `TEMPORARY_PATH` | 临时文件目录 | `{PATH}/tmp` |
+
+**MinIO/S3 存储配置**：
+| 参数 | 说明 | 默认值 |
+|-----|------|--------|
+| `STORAGE_TYPE` | 必须为 `minio` | `local` |
+| `MINIO_ENDPOINT` | MinIO 服务器地址 | `localhost:9000` |
+| `MINIO_ACCESS_KEY_ID` | 访问密钥 ID | - |
+| `MINIO_SECRET_ACCESS_KEY` | 秘密访问密钥 | - |
+| `MINIO_BUCKET` | Bucket 名称 | `gitea` |
+| `MINIO_LOCATION` | 区域 | `us-east-1` |
+| `MINIO_BASE_PATH` | 基础路径前缀 | `packages/` |
+| `MINIO_USE_SSL` | 是否使用 SSL | `false` |
+| `MINIO_INSECURE_SKIP_VERIFY` | 跳过证书验证 | `false` |
+| `MINIO_CHECKSUM_ALGORITHM` | 校验算法 | `default` |
+| `MINIO_BUCKET_LOOKUP_TYPE` | Bucket 查找方式 | `auto` |
+| `SERVE_DIRECT` | 是否直接重定向到存储 | `false` |
+
+**Azure Blob 存储配置**：
+| 参数 | 说明 | 默认值 |
+|-----|------|--------|
+| `STORAGE_TYPE` | 必须为 `azureblob` | `local` |
+| `AZURE_BLOB_ENDPOINT` | Azure Blob 端点 | - |
+| `AZURE_BLOB_ACCOUNT_NAME` | 账户名称 | - |
+| `AZURE_BLOB_ACCOUNT_KEY` | 账户密钥 | - |
+| `AZURE_BLOB_CONTAINER` | 容器名称 | `gitea` |
+| `AZURE_BLOB_BASE_PATH` | 基础路径前缀 | `packages/` |
+| `SERVE_DIRECT` | 是否直接重定向到存储 | `false` |
+
+**MinIO 认证链** (`modules/storage/minio.go:164-193`)：
+```
+1. 静态凭据 (MINIO_ACCESS_KEY_ID + MINIO_SECRET_ACCESS_KEY)
+2. MINIO_ 环境变量
+3. AWS_ 环境变量
+4. MINIO 共享凭据文件
+5. AWS 共享凭据文件
+6. EC2 IAM 角色元数据
+```
+
+**配置示例** (app.ini)：
+```ini
+# 全局存储配置
+[storage]
+STORAGE_TYPE = minio
+MINIO_ENDPOINT = minio.example.com:9000
+MINIO_ACCESS_KEY_ID = my-access-key
+MINIO_SECRET_ACCESS_KEY = my-secret-key
+MINIO_BUCKET = gitea
+MINIO_USE_SSL = true
+
+# 包存储独立配置（可选，覆盖全局）
+[storage.packages]
+MINIO_BASE_PATH = gitea-packages/
+SERVE_DIRECT = true
+
+# 包服务配置
+[packages]
+ENABLED = true
+LIMIT_TOTAL_OWNER_SIZE = 10GB
+```
+
+### 4.1.5 存储接口能力对比
+
+| 能力 | Local | MinIO | Azure Blob |
+|-----|-------|-------|------------|
+| Open/Read | ✓ | ✓ | ✓ |
+| Save/Write | ✓ | ✓ | ✓ |
+| Stat | ✓ | ✓ | ✓ |
+| Delete | ✓ | ✓ | ✓ |
+| IterateObjects | ✓ | ✓ | ✓ |
+| ServeDirectURL | ✗ | ✓ (5分钟预签名) | ✓ (5分钟SAS) |
+| 临时文件写入 | ✓ (原子重命名) | ✓ (流式上传) | ✓ (流式上传) |
+| 自动创建目录 | ✓ (MkdirAll) | ✓ (MakeBucket) | ✓ (CreateContainer) |
+
+> **ServeDirectURL 注意**：生成的 URL 有效期为 5 分钟，允许浏览器直接从对象存储下载文件，绕过 Gitea 服务器，减轻带宽压力。
+
+---
 
 ### 4.2 Blob 去重机制
 
@@ -354,22 +556,242 @@ GET  /{groupIdPath}/{artifactId}/{version}/maven-metadata.xml
 
 #### 5.2.3 npm
 
-**路由** (`routers/api/packages/npm/npm.go`)：
+**路由定义** (`routers/api/packages/api.go:403-446`)：
+
+npm 路由系统采用**双轨设计**，同时支持作用域包和非作用域包，每种都有完整独立的路由组。
+
+##### 5.2.3.1 路由组结构
 
 ```
-# 无作用域包
-GET  /{id}                      # 元数据
-PUT  /{id}                      # 发布
-GET  /-/@{version}/{filename}   # 下载
+/api/packages/{username}/npm
+├─ /@{scope}/{id}              # 作用域包路由组
+│  ├─ GET  ""                  # 获取元数据
+│  ├─ PUT  ""                  # 发布包 (需 Write 权限)
+│  ├─ /-/{version}/{filename}  # 版本文件组
+│  │  ├─ GET  ""               # 下载指定版本文件
+│  │  └─ DELETE /-rev/{revision}  # 删除版本 (需 Write)
+│  ├─ GET  /-/{filename}       # 按文件名自动查找版本下载
+│  └─ /-rev/{revision}         # 修订组 (需 Write)
+│     ├─ DELETE ""             # 删除整个包
+│     └─ PUT    ""             # 删除预览 (空操作)
+│
+├─ /{id}                       # 非作用域包路由组 (与上面对称)
+│  ├─ GET  ""                  # 获取元数据
+│  ├─ PUT  ""                  # 发布包 (需 Write 权限)
+│  ├─ /-/{version}/{filename}  # 版本文件组
+│  │  ├─ GET  ""               # 下载指定版本文件
+│  │  └─ DELETE /-rev/{revision}  # 删除版本 (需 Write)
+│  ├─ GET  /-/{filename}       # 按文件名自动查找版本下载
+│  └─ /-rev/{revision}         # 修订组 (需 Write)
+│     ├─ DELETE ""             # 删除整个包
+│     └─ PUT    ""             # 删除预览 (空操作)
+│
+├─ /-/package/@{scope}/{id}/dist-tags  # 作用域包 dist-tags
+│  ├─ GET  ""                  # 列出所有标签
+│  └─ /{tag}                   # 标签操作 (需 Write)
+│     ├─ PUT  ""               # 添加标签
+│     └─ DELETE ""             # 删除标签
+│
+├─ /-/package/{id}/dist-tags   # 非作用域包 dist-tags
+│  ├─ GET  ""                  # 列出所有标签
+│  └─ /{tag}                   # 标签操作 (需 Write)
+│     ├─ PUT  ""               # 添加标签
+│     └─ DELETE ""             # 删除标签
+│
+└─ /-/v1/search
+   └─ GET  ""                  # 搜索包
+```
 
-# 有作用域包 (@scope/package)
-GET  /@{scope}/{id}
-PUT  /@{scope}/{id}
-GET  /@{scope}/{id}/-/{version}/{filename}
+##### 5.2.3.2 包名解析机制
+
+**核心函数** `packageNameFromParams()` (`routers/api/packages/npm/npm.go:42-51`)：
+
+```go
+// packageNameFromParams gets the package name from the url parameters
+// Variations: /name/, /@scope/name/, /@scope%2Fname/
+func packageNameFromParams(ctx *context.Context) string {
+    scope := ctx.PathParam("scope")
+    id := ctx.PathParam("id")
+    if scope != "" {
+        return fmt.Sprintf("@%s/%s", scope, id)
+    }
+    return id
+}
+```
+
+**三种包名变体**（内部存储格式统一）：
+
+| URL 形式 | 路由参数 | 内部包名 | 说明 |
+|---------|---------|---------|------|
+| `/mypackage` | `scope=""`, `id="mypackage"` | `mypackage` | 非作用域包 |
+| `/@myorg/mypackage` | `scope="myorg"`, `id="mypackage"` | `@myorg/mypackage` | 作用域包（路径分隔） |
+| `/@myorg%2Fmypackage` | 特殊编码 | `@myorg/mypackage` | 作用域包（URL 编码） |
+
+> **注意**：第三种变体 `/@scope%2Fname/` 是为了兼容某些 npm 客户端将 `@scope/name` 作为单个路径段编码的情况，实际路由匹配时由 `/{id}` 组捕获。
+
+##### 5.2.3.3 下载路由详解
+
+npm 提供**两种下载模式**，作用域包和非作用域包均支持：
+
+**模式一：按版本号精确下载**
+
+- **非作用域包**：`GET /{id}/-/{version}/{filename}`
+  - 示例：`/mypackage/-/1.0.0/mypackage-1.0.0.tgz`
+  - 处理函数：`npm.DownloadPackageFile`
+
+- **作用域包**：`GET /@{scope}/{id}/-/{version}/{filename}`
+  - 示例：`/@myorg/mypackage/-/1.0.0/mypackage-1.0.0.tgz`
+  - 处理函数：`npm.DownloadPackageFile`
+
+**处理逻辑** (`routers/api/packages/npm/npm.go:82-110`)：
+```go
+func DownloadPackageFile(ctx *context.Context) {
+    packageName := packageNameFromParams(ctx)  // 解析作用域
+    packageVersion := ctx.PathParam("version")
+    filename := ctx.PathParam("filename")
+    
+    // 按包名+版本精确查找
+    s, u, pf, err := packages_service.OpenFileForDownloadByPackageNameAndVersion(
+        ctx,
+        &packages_service.PackageInfo{
+            Owner:       ctx.Package.Owner,
+            PackageType: packages_model.TypeNpm,
+            Name:        packageName,
+            Version:     packageVersion,
+        },
+        &packages_service.PackageFileInfo{
+            Filename: filename,
+        },
+        ctx.Req.Method,
+    )
+    // ...
+    helper.ServePackageFile(ctx, s, u, pf)
+}
+```
+
+**模式二：按文件名自动查找版本**
+
+- **非作用域包**：`GET /{id}/-/{filename}`
+  - 示例：`/mypackage/-/mypackage-1.0.0.tgz`
+  - 处理函数：`npm.DownloadPackageFileByName`
+
+- **作用域包**：`GET /@{scope}/{id}/-/{filename}`
+  - 示例：`/@myorg/mypackage/-/mypackage-1.0.0.tgz`
+  - 处理函数：`npm.DownloadPackageFileByName`
+
+**处理逻辑** (`routers/api/packages/npm/npm.go:112-153`)：
+```go
+func DownloadPackageFileByName(ctx *context.Context) {
+    filename := ctx.PathParam("filename")
+    
+    // 按包名+文件名搜索，自动匹配版本
+    pvs, _, err := packages_model.SearchVersions(ctx, &packages_model.PackageSearchOptions{
+        OwnerID: ctx.Package.Owner.ID,
+        Type:    packages_model.TypeNpm,
+        Name: packages_model.SearchValue{
+            ExactMatch: true,
+            Value:      packageNameFromParams(ctx),
+        },
+        HasFileWithName: filename,  // 关键：通过文件名反向查找版本
+        IsInternal:      optional.Some(false),
+    })
+    if len(pvs) != 1 {
+        apiError(ctx, http.StatusNotFound, nil)
+        return
+    }
+    // 找到唯一版本后提供下载
+    s, u, pf, err := packages_service.OpenFileForDownloadByPackageVersion(ctx, pvs[0], ...)
+    // ...
+}
+```
+
+**两种下载模式对比**：
+
+| 特性 | 按版本精确下载 | 按文件名自动查找 |
+|-----|--------------|----------------|
+| URL 结构 | `/-/{version}/{filename}` | `/-/{filename}` |
+| 需要参数 | version + filename | filename |
+| 查找方式 | 包名+版本精确匹配 | 包名+文件名搜索 |
+| 性能 | 快（索引直接查询） | 稍慢（需要搜索） |
+| 多版本冲突 | 无（版本唯一） | 需确保文件名唯一（返回 404 如不唯一） |
+| 适用场景 | npm install 标准流程 | 旧版客户端兼容 |
+
+##### 5.2.3.4 dist-tags 路由
+
+**非作用域包**：
+```
+GET  /-/package/{id}/dist-tags            # 列出所有标签
+PUT  /-/package/{id}/dist-tags/{tag}      # 添加标签 (需 Write)
+DELETE /-/package/{id}/dist-tags/{tag}     # 删除标签 (需 Write)
+```
+
+**作用域包**：
+```
+GET  /-/package/@{scope}/{id}/dist-tags   # 列出所有标签
+PUT  /-/package/@{scope}/{id}/dist-tags/{tag}   # 添加标签 (需 Write)
+DELETE /-/package/@{scope}/{id}/dist-tags/{tag}  # 删除标签 (需 Write)
+```
+
+**标签存储机制**：通过 `PackageProperty` 存储，属性名为 `npm.TagProperty`
+- 键：`npm.TagProperty` = `"npm.tag"`
+- 值：标签名（如 `latest`, `beta`, `v1.x`）
+- 关联：`PropertyTypeVersion` + `VersionID`
+
+**标签约束** (`routers/api/packages/npm/npm.go:385-392`)：
+```go
+func setPackageTag(ctx std_ctx.Context, tag string, pv *packages_model.PackageVersion, deleteOnly bool) error {
+    if tag == "" {
+        return errInvalidTagName
+    }
+    // 标签名不能是有效的 SemVer 版本号
+    _, err := version.NewVersion(tag)
+    if err == nil {
+        return errInvalidTagName
+    }
+    // ...
+}
+```
+
+> **标签约束**：标签名不能是空字符串，也不能是有效的 SemVer 版本号（如 `1.0.0` 不能作为标签名）。
+
+##### 5.2.3.5 完整 URL 示例
+
+**非作用域包 `mypackage`**：
+```
+# 元数据
+GET  /api/packages/user1/npm/mypackage
+
+# 发布
+PUT  /api/packages/user1/npm/mypackage
+
+# 下载 (指定版本)
+GET  /api/packages/user1/npm/mypackage/-/1.0.0/mypackage-1.0.0.tgz
+
+# 下载 (自动查找版本)
+GET  /api/packages/user1/npm/mypackage/-/mypackage-1.0.0.tgz
 
 # dist-tags
-GET  /-/package/{id}/dist-tags
-PUT  /-/package/{id}/dist-tags/{tag}
+GET  /api/packages/user1/npm/-/package/mypackage/dist-tags
+PUT  /api/packages/user1/npm/-/package/mypackage/dist-tags/latest
+```
+
+**作用域包 `@myorg/mypackage`**：
+```
+# 元数据
+GET  /api/packages/user1/npm/@myorg/mypackage
+
+# 发布
+PUT  /api/packages/user1/npm/@myorg/mypackage
+
+# 下载 (指定版本)
+GET  /api/packages/user1/npm/@myorg/mypackage/-/1.0.0/mypackage-1.0.0.tgz
+
+# 下载 (自动查找版本)
+GET  /api/packages/user1/npm/@myorg/mypackage/-/mypackage-1.0.0.tgz
+
+# dist-tags
+GET  /api/packages/user1/npm/-/package/@myorg/mypackage/dist-tags
+PUT  /api/packages/user1/npm/-/package/@myorg/mypackage/dist-tags/beta
 ```
 
 #### 5.2.4 Container (OCI)

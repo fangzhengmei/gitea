@@ -382,18 +382,36 @@ func NewLocalStorage(ctx context.Context, config *setting.Storage) (ObjectStorag
 
 **本地存储参数表（与代码一致）**：
 
-| 参数 | 配置键名 | 环境变量键名 | 说明 | 默认值 | 可配置 | 代码引用 |
-|-----|---------|-------------|------|--------|--------|---------|
+| 参数 | 配置键名 | 环境变量键名（仅安装/config 命令生效） | 说明 | 默认值 | 可配置 | 代码引用 |
+|-----|---------|--------------------------------------|------|--------|--------|---------|
 | **STORAGE_TYPE** | `STORAGE_TYPE` | `GITEA__STORAGE__STORAGE_TYPE`<br>`GITEA__STORAGE_0x2E_PACKAGES__STORAGE_TYPE`<br>`GITEA__PACKAGES__STORAGE_TYPE` | 存储类型，必须为 `local` | `local` | ✓ | `modules/setting/storage.go:248` |
 | **PATH** | `PATH` | `GITEA__STORAGE__PATH`<br>`GITEA__STORAGE_0x2E_PACKAGES__PATH`<br>`GITEA__PACKAGES__PATH` | 存储根目录（绝对路径）<br>支持目标节和覆盖节双重配置 | `{AppDataPath}/packages/` | ✓ | `modules/setting/storage.go:251,269` |
 | **TemporaryPath** | `TEMPORARY_PATH` | `GITEA__STORAGE__TEMPORARY_PATH`<br>`GITEA__STORAGE_0x2E_PACKAGES__TEMPORARY_PATH` | 临时文件目录（用于原子写入）<br>⚠️ 配置项存在但解析代码未读取 | `{PATH}/tmp` | ❌ | `modules/storage/local.go:38-41` |
 
-> **环境变量配置说明**：Gitea 支持通过 `GITEA__SECTION__KEY` 格式的环境变量覆盖配置（`modules/setting/config_env.go:98-110`），其中 `_0x2E_` 表示点号（`.`）。例如：
-> - `GITEA__STORAGE__PATH` 对应 `[storage]` 节的 `PATH`
-> - `GITEA__STORAGE_0x2E_PACKAGES__PATH` 对应 `[storage.packages]` 节的 `PATH`
-> - `GITEA__PACKAGES__PATH` 对应 `[packages]` 节的 `PATH`
+> **⚠️ 环境变量生效条件重要说明**：
 > 
-> 即使如此，`TEMPORARY_PATH` 仍无法通过环境变量配置，因为 `getStorageForLocal` 函数根本不读取该配置项。
+> Gitea 的 `GITEA__SECTION__KEY` 格式环境变量（`modules/setting/config_env.go:98-110`，其中 `_0x2E_` 表示点号 `.`）**不会在常规启动流程中自动生效**！
+> 
+> `EnvironmentToConfig()` 函数只在以下场景被调用：
+> 
+> | 场景 | 调用位置 | 行为 | 持久化 |
+> |-----|---------|------|--------|
+> | **安装流程** | `routers/install/install.go:450` | 保存配置前应用环境变量 | ✓ 写入 app.ini |
+> | **config 命令** | `cmd/config.go:144` | `--apply-env` 标志时应用 | ✓ 可选择写入文件 |
+> | **常规启动** | 无 | ❌ 不调用 EnvironmentToConfig | ✗ 不生效 |
+> 
+> 此外，**已安装实例启动时**（`modules/setting/path.go:175-176`）会调用 `ClearEnvConfigKeys()` 清除所有 `GITEA__*` 环境变量，防止传递给子进程。
+> 
+> **使环境变量生效的两种方式**：
+> 1. **首次安装时**：设置环境变量后运行安装，会被持久化到 app.ini
+> 2. **使用 config 命令**：`gitea config --apply-env --in-place` 手动应用并保存
+> 
+> **环境变量键名示例（仅在上述场景生效）**：
+> - `GITEA__STORAGE__PATH` → `[storage]` 节的 `PATH`
+> - `GITEA__STORAGE_0x2E_PACKAGES__PATH` → `[storage.packages]` 节的 `PATH`
+> - `GITEA__PACKAGES__PATH` → `[packages]` 节的 `PATH`
+> 
+> 即使在生效场景下，`TEMPORARY_PATH` 仍无法配置，因为 `getStorageForLocal` 函数根本不读取该配置项。
 
 **PATH 参数计算逻辑**：
 1. 从**目标节**（targetSec）读取 `PATH`
@@ -489,8 +507,8 @@ func getDefaultStorageSection(rootCfg ConfigProvider) ConfigSection {
 
 **MinIO/S3 参数表（与代码一致）**：
 
-| 参数 | 配置键名 | 环境变量键名示例 | 说明 | 默认值 | 可覆盖 | 代码引用 |
-|-----|---------|-----------------|------|--------|--------|---------|
+| 参数 | 配置键名 | 环境变量键名（仅安装/config 命令生效） | 说明 | 默认值 | 可覆盖 | 代码引用 |
+|-----|---------|--------------------------------------|------|--------|--------|---------|
 | **STORAGE_TYPE** | `STORAGE_TYPE` | `GITEA__STORAGE__STORAGE_TYPE` | 存储类型，必须为 `minio` | `local` | - | `modules/setting/storage.go:288` |
 | **Endpoint** | `MINIO_ENDPOINT` | `GITEA__STORAGE__MINIO_ENDPOINT` | MinIO/S3 服务器地址 | `localhost:9000` | - | `modules/setting/storage.go:108` |
 | **AccessKeyID** | `MINIO_ACCESS_KEY_ID` | `GITEA__STORAGE__MINIO_ACCESS_KEY_ID` | 访问密钥 ID | 空 | - | `modules/setting/storage.go:109` |
@@ -558,8 +576,8 @@ func getDefaultStorageSection(rootCfg ConfigProvider) ConfigSection {
 
 **Azure Blob 参数表（与代码一致）**：
 
-| 参数 | 配置键名 | 环境变量键名示例 | 说明 | 默认值 | 可覆盖 | 代码引用 |
-|-----|---------|-----------------|------|--------|--------|---------|
+| 参数 | 配置键名 | 环境变量键名（仅安装/config 命令生效） | 说明 | 默认值 | 可覆盖 | 代码引用 |
+|-----|---------|--------------------------------------|------|--------|--------|---------|
 | **STORAGE_TYPE** | `STORAGE_TYPE` | `GITEA__STORAGE__STORAGE_TYPE` | 存储类型，必须为 `azureblob` | `local` | - | `modules/setting/storage.go:317` |
 | **Endpoint** | `AZURE_BLOB_ENDPOINT` | `GITEA__STORAGE__AZURE_BLOB_ENDPOINT` | Azure Blob 服务端点 | 空 | - | `modules/setting/storage.go:117` |
 | **AccountName** | `AZURE_BLOB_ACCOUNT_NAME` | `GITEA__STORAGE__AZURE_BLOB_ACCOUNT_NAME` | 存储账户名称 | 空 | - | `modules/setting/storage.go:118` |
@@ -577,6 +595,17 @@ func getDefaultStorageSection(rootCfg ConfigProvider) ConfigSection {
 5. AWS 共享凭据文件
 6. EC2 IAM 角色元数据
 ```
+
+> **⚠️ 两种环境变量机制的重要区别**：
+> 
+> MinIO SDK 会**直接读取** `MINIO_ACCESS_KEY`、`AWS_ACCESS_KEY_ID` 等标准环境变量（运行时生效，无需配置持久化），这与 Gitea 的 `GITEA__*` 环境变量机制完全独立：
+> 
+> | 环境变量类型 | 生效时机 | 处理方式 | 示例 |
+> |------------|---------|---------|------|
+> | **GITEA__*** | 安装/config 命令时 | 通过 `EnvironmentToConfig` 解析，持久化到 app.ini | `GITEA__STORAGE__MINIO_ACCESS_KEY_ID` |
+> | **MINIO_ / AWS_** | 每次运行时 | MinIO SDK 直接读取进程环境变量 | `MINIO_ACCESS_KEY`、`AWS_ACCESS_KEY_ID` |
+> 
+> 因此，MinIO 的 `MINIO_ACCESS_KEY`、`AWS_ACCESS_KEY_ID` 等环境变量**可以在常规启动时直接生效**，无需通过 `--apply-env` 处理。
 
 **配置示例** (app.ini)：
 ```ini
